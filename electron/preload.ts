@@ -1,0 +1,53 @@
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
+
+import type { OnamiApi } from '../src/shared/types'
+
+const api: OnamiApi = {
+  decks: {
+    create: (input) => ipcRenderer.invoke('decks:create', input),
+    delete: (deckId) => ipcRenderer.invoke('decks:delete', deckId),
+    resetScheduling: (deckId) => ipcRenderer.invoke('decks:reset-scheduling', deckId),
+    list: () => ipcRenderer.invoke('decks:list'),
+    get: (deckId) => ipcRenderer.invoke('decks:get', deckId),
+    selectApkg: () => ipcRenderer.invoke('decks:select-apkg'),
+    importApkg: (filePath, options) => ipcRenderer.invoke('decks:import-apkg', filePath, options),
+  },
+  cards: {
+    create: (input) => ipcRenderer.invoke('cards:create', input),
+    update: (input) => ipcRenderer.invoke('cards:update', input),
+    delete: (cardId) => ipcRenderer.invoke('cards:delete', cardId),
+  },
+  study: {
+    startSession: (deckId, mode, settings) =>
+      ipcRenderer.invoke('study:start-session', deckId, mode, settings),
+    answer: (input) => ipcRenderer.invoke('study:answer', input),
+  },
+  ai: {
+    getSettings: () => ipcRenderer.invoke('ai:get-settings'),
+    saveSettings: (input) => ipcRenderer.invoke('ai:save-settings', input),
+    generateCards: (input, options) => ipcRenderer.invoke('ai:generate-cards', input, options),
+  },
+  stats: {
+    get: (filter) => ipcRenderer.invoke('stats:get', filter),
+  },
+  settings: {
+    get: () => ipcRenderer.invoke('settings:get'),
+    save: (input) => ipcRenderer.invoke('settings:save', input),
+  },
+  appWindow: {
+    minimize: () => ipcRenderer.invoke('window:minimize'),
+    toggleMaximize: () => ipcRenderer.invoke('window:toggle-maximize'),
+    isMaximized: () => ipcRenderer.invoke('window:is-maximized'),
+    close: () => ipcRenderer.invoke('window:close'),
+    openDevTools: () => ipcRenderer.invoke('window:open-devtools'),
+    onMaximizedChanged: (listener) => {
+      const wrapped = (_event: IpcRendererEvent, isMaximized: boolean) => listener(isMaximized)
+      ipcRenderer.on('window:maximized-changed', wrapped)
+      return () => {
+        ipcRenderer.removeListener('window:maximized-changed', wrapped)
+      }
+    },
+  },
+}
+
+contextBridge.exposeInMainWorld('onami', api)

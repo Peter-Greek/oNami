@@ -1,0 +1,262 @@
+export type StudyMode = 'learn-new' | 'review-due' | 'mixed' | 'unit-test'
+
+export type ReviewRating = 'again' | 'hard' | 'good' | 'easy'
+
+export type ReviewStateName = 'New' | 'Learning' | 'Review' | 'Relearning'
+
+export type NoteTypeName = 'basic' | 'cloze' | 'imported'
+
+export type ThemeMode = 'system' | 'light' | 'dark'
+
+export interface DeckSummary {
+  id: string
+  parentId: string | null
+  name: string
+  source: string
+  totalCards: number
+  newCards: number
+  dueCards: number
+  learningCards: number
+  reviewCards: number
+  successRate: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface DeckDetail extends DeckSummary {
+  cards: CardSummary[]
+}
+
+export interface CardSummary {
+  id: string
+  noteId: string
+  deckId: string
+  deckName: string
+  templateOrd: number
+  frontHtml: string
+  backHtml: string
+  tags: string[]
+  state: ReviewStateName
+  dueAt: string | null
+  reps: number
+  lapses: number
+  successRate: number
+  lastRating: ReviewRating | null
+  lastReviewedAt: string | null
+}
+
+export interface CreateDeckInput {
+  name: string
+  parentId?: string | null
+}
+
+export interface CreateCardInput {
+  deckId: string
+  noteType: NoteTypeName
+  frontHtml: string
+  backHtml: string
+  tags?: string[]
+  fields?: Record<string, string>
+}
+
+export interface UpdateCardInput {
+  id: string
+  deckId?: string
+  frontHtml?: string
+  backHtml?: string
+  tags?: string[]
+}
+
+export interface StudySessionSettings {
+  limit?: number
+  newEvery?: number
+  unitTestEvery?: number
+  unitTestThreshold?: number
+}
+
+export interface StudyCard extends CardSummary {
+  backVisible: boolean
+}
+
+export interface StudySession {
+  id: string
+  mode: StudyMode
+  deckId: string
+  cards: StudyCard[]
+  createdAt: string
+  unitTestThreshold: number
+}
+
+export interface AnswerInput {
+  sessionId: string
+  cardId: string
+  rating: ReviewRating
+  elapsedMs?: number
+  revealMs?: number
+  answerMs?: number
+}
+
+export interface AnswerResult {
+  cardId: string
+  rating: ReviewRating
+  nextDueAt: string | null
+  state: ReviewStateName
+  successRate: number
+  sessionComplete: boolean
+  unitScore: number | null
+  recommendation: string | null
+}
+
+export interface ImportApkgOptions {
+  preserveScheduling: boolean
+}
+
+export interface ImportResult {
+  deckId: string
+  deckName: string
+  importedNotes: number
+  importedCards: number
+  importedMedia: number
+  updatedNotes: number
+  warnings: string[]
+}
+
+export interface AiGenerationOptions {
+  style: 'basic' | 'cloze' | 'mixed'
+  deckId?: string
+  count?: number
+  model?: string
+}
+
+export interface AiDraftCard {
+  frontHtml: string
+  backHtml: string
+  tags: string[]
+  noteType: NoteTypeName
+  rationale?: string
+}
+
+export interface AiGenerationResult {
+  cards: AiDraftCard[]
+  model: string
+}
+
+export interface AiSettings {
+  hasApiKey: boolean
+  model: string
+}
+
+export interface AppSettings {
+  audioVolume: number
+  themeMode: ThemeMode
+}
+
+export interface SaveAiSettingsInput {
+  apiKey?: string
+  model: string
+}
+
+export interface SaveAppSettingsInput {
+  audioVolume?: number
+  themeMode?: ThemeMode
+}
+
+export interface StatsFilterInput {
+  deckId?: string | null
+}
+
+export interface StudyTimeStats {
+  todayMs: number
+  weekMs: number
+  monthMs: number
+  overallMs: number
+}
+
+export interface CompletionStats {
+  completedCards: number
+  totalCards: number
+  completionRatio: number
+  fullyLearned: boolean
+}
+
+export interface HardCardSummary {
+  cardId: string
+  deckId: string
+  deckName: string
+  frontHtml: string
+  state: ReviewStateName
+  dueAt: string | null
+  reps: number
+  lapses: number
+  successRate: number
+  reviewCount: number
+  againCount: number
+  easyCount: number
+  averageReviewMs: number
+  averageRevealMs: number
+  averageAgainToEasyMs: number | null
+  difficultyScore: number
+}
+
+export interface AppStats {
+  scopeDeckId: string | null
+  scopeDeckName: string | null
+  totalDecks: number
+  totalCards: number
+  newCards: number
+  dueCards: number
+  reviewedToday: number
+  reviewedThisWeek: number
+  reviewedThisMonth: number
+  totalReviews: number
+  averageSuccessRate: number
+  streakDays: number
+  longestStreakDays: number
+  studyTime: StudyTimeStats
+  completion: CompletionStats
+  averageReviewMs: number
+  averageRevealMs: number
+  averageAgainToEasyMs: number | null
+  hardestCards: HardCardSummary[]
+}
+
+export interface OnamiApi {
+  decks: {
+    create(input: CreateDeckInput): Promise<DeckSummary>
+    delete(deckId: string): Promise<void>
+    resetScheduling(deckId: string): Promise<void>
+    list(): Promise<DeckSummary[]>
+    get(deckId: string): Promise<DeckDetail>
+    selectApkg(): Promise<string | null>
+    importApkg(filePath: string, options: ImportApkgOptions): Promise<ImportResult>
+  }
+  cards: {
+    create(input: CreateCardInput): Promise<CardSummary>
+    update(input: UpdateCardInput): Promise<CardSummary>
+    delete(cardId: string): Promise<void>
+  }
+  study: {
+    startSession(deckId: string, mode: StudyMode, settings: StudySessionSettings): Promise<StudySession>
+    answer(input: AnswerInput): Promise<AnswerResult>
+  }
+  ai: {
+    getSettings(): Promise<AiSettings>
+    saveSettings(input: SaveAiSettingsInput): Promise<AiSettings>
+    generateCards(input: string, options: AiGenerationOptions): Promise<AiGenerationResult>
+  }
+  settings: {
+    get(): Promise<AppSettings>
+    save(input: SaveAppSettingsInput): Promise<AppSettings>
+  }
+  stats: {
+    get(filter?: StatsFilterInput): Promise<AppStats>
+  }
+  appWindow: {
+    minimize(): Promise<void>
+    toggleMaximize(): Promise<boolean>
+    isMaximized(): Promise<boolean>
+    close(): Promise<void>
+    openDevTools(): Promise<void>
+    onMaximizedChanged(listener: (isMaximized: boolean) => void): () => void
+  }
+}
