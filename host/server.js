@@ -60,6 +60,46 @@ const sha256 = (value) => createHash('sha256').update(value).digest('hex')
 const tokenHash = (token) => sha256(`token:${token}`)
 const codeHash = (code) => sha256(`pairing:${normalizePairingCode(code)}`)
 
+const shouldLogRoute = (pathname) =>
+  pathname.startsWith('/sync/') ||
+  pathname.startsWith('/pairing/') ||
+  pathname.startsWith('/devices/') ||
+  pathname.startsWith('/media')
+
+const createRequestContext = (request) => {
+  const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
+  return {
+    requestId: randomUUID(),
+    method: request.method,
+    path: url.pathname,
+    startedAt: Date.now(),
+    fields: {},
+    shouldLog: shouldLogRoute(url.pathname),
+  }
+}
+
+const addLogFields = (context, fields) => {
+  Object.assign(context.fields, fields)
+}
+
+const logRequest = (context, level, event, fields = {}) => {
+  if (!context.shouldLog) return
+  const entry = {
+    time: nowIso(),
+    level,
+    event,
+    requestId: context.requestId,
+    method: context.method,
+    path: context.path,
+    durationMs: Date.now() - context.startedAt,
+    ...context.fields,
+    ...fields,
+  }
+  const line = JSON.stringify(entry)
+  if (level === 'error') console.error(line)
+  else console.log(line)
+}
+
 const createPairingCode = () => {
   const digits = String(randomBytes(4).readUInt32BE(0) % 1000000).padStart(6, '0')
   return `${digits.slice(0, 3)}-${digits.slice(3)}`
@@ -261,8 +301,9 @@ const send = (response, status, body) => {
   response.end(JSON.stringify(body))
 }
 
-const route = async (request, response) => {
+const route = async (request, response, context) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
+  logRequest(context, 'info', 'request.start')
 
   if (request.method === 'OPTIONS') return send(response, 204, {})
   if (request.method === 'GET' && url.pathname === '/health') {
@@ -277,6 +318,11 @@ const route = async (request, response) => {
       name: requiredString(body, 'name'),
       platform: requiredString(body, 'platform'),
       publicKey: requiredString(body, 'publicKey'),
+    })
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId ?? null })
+    logRequest(context, 'info', 'devices.bootstrap', {
+      paired: Boolean(device.syncGroupId && !device.revokedAt),
+      platform: device.platform,
     })
     return send(response, 200, {
       deviceId: device.id,
@@ -308,6 +354,11 @@ const route = async (request, response) => {
         expiresAt: expiresAt(config.pairingTtlMs),
       },
     })
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId ?? null })
+    logRequest(context, 'info', 'pairing.start', {
+      expiresInMs: config.pairingTtlMs,
+      platform: device.platform,
+    })
 
     return send(response, 200, {
       deviceId: device.id,
@@ -332,6 +383,12 @@ const route = async (request, response) => {
     await prisma.pairingSession.update({
       where: { id: session.id },
       data: { joiningDeviceId: device.id },
+    })
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId ?? null })
+    logRequest(context, 'info', 'pairing.join', {
+      initiatorDeviceId: session.initiatorDeviceId,
+      joiningDeviceId: device.id,
+      platform: device.platform,
     })
 
     return send(response, 200, {
@@ -365,6 +422,13 @@ const route = async (request, response) => {
     }
 
     const result = await completePairingIfReady(session.id)
+    addLogFields(context, { deviceId, syncGroupId: result.syncGroupId })
+    logRequest(context, 'info', 'pairing.confirm', {
+      completed: result.completed,
+      mode,
+      initiatorDeviceId: session.initiatorDeviceId,
+      joiningDeviceId: session.joiningDeviceId,
+    })
     return send(response, 200, {
       completed: result.completed,
       syncGroupId: result.syncGroupId,
@@ -381,11 +445,14 @@ const route = async (request, response) => {
       throw httpError(401, 'Invalid device proof.')
     }
 
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
+    logRequest(context, 'info', 'devices.token', { tokenTtlMs: config.tokenTtlMs })
     return send(response, 200, await issueDeviceToken(deviceId))
   }
 
   if (request.method === 'POST' && url.pathname === '/sync/events') {
     const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
     const body = await readJson(request)
     const events = Array.isArray(body.events) ? body.events : null
     if (!events) throw httpError(400, 'events must be an array.')
@@ -435,11 +502,16 @@ const route = async (request, response) => {
       return highest
     })
 
+    logRequest(context, 'info', 'sync.events.push', {
+      accepted: events.length,
+      highestAcceptedSequence,
+    })
     return send(response, 200, { accepted: events.length, highestAcceptedSequence })
   }
 
   if (request.method === 'GET' && url.pathname === '/sync/events') {
     const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
     const after = Number(url.searchParams.get('after') ?? 0)
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 100), 1), 1000)
     const includeSelf = url.searchParams.get('includeSelf') === 'true'
@@ -452,6 +524,14 @@ const route = async (request, response) => {
       },
       orderBy: { id: 'asc' },
       take: limit,
+    })
+    const nextCursor = rows.length ? rows[rows.length - 1].id : after
+    logRequest(context, 'info', 'sync.events.pull', {
+      after,
+      limit,
+      includeSelf,
+      returned: rows.length,
+      nextCursor,
     })
 
     return send(response, 200, {
@@ -466,12 +546,13 @@ const route = async (request, response) => {
         payload: row.payloadJson,
         createdAt: row.createdAt.toISOString(),
       })),
-      nextCursor: rows.length ? rows[rows.length - 1].id : after,
+      nextCursor,
     })
   }
 
   if (request.method === 'POST' && url.pathname === '/sync/ack') {
     const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
     const body = await readJson(request)
     const lastEventId = Number(body.lastEventId)
     if (!Number.isInteger(lastEventId) || lastEventId < 0) {
@@ -487,11 +568,13 @@ const route = async (request, response) => {
       update: { lastEventId: Math.max(existing?.lastEventId ?? 0, lastEventId) },
     })
 
+    logRequest(context, 'info', 'sync.ack', { lastEventId })
     return send(response, 200, { ok: true })
   }
 
   if (request.method === 'POST' && url.pathname === '/media') {
     const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
     const body = await readJson(request, config.maxBlobBytes)
     const sha256 = sanitizeSha256(requiredString(body, 'sha256'))
     const mimeType = requiredString(body, 'mimeType')
@@ -515,11 +598,17 @@ const route = async (request, response) => {
       update: { byteSize: data.length, mimeType, storageKey: sha256 },
     })
 
+    logRequest(context, 'info', 'media.upload', {
+      sha256: sha256.slice(0, 12),
+      byteSize: data.length,
+      mimeType,
+    })
     return send(response, 200, { sha256, byteSize: data.length })
   }
 
   if (request.method === 'GET' && url.pathname.startsWith('/media/')) {
     const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
     const sha256 = sanitizeSha256(decodeURIComponent(url.pathname.slice('/media/'.length)))
     const object = await prisma.mediaObject.findUnique({
       where: { syncGroupId_sha256: { syncGroupId: device.syncGroupId, sha256 } },
@@ -527,6 +616,11 @@ const route = async (request, response) => {
     const blobPath = mediaBlobPath(sha256)
     if (!object || !fs.existsSync(blobPath)) throw httpError(404, 'Media not found.')
 
+    logRequest(context, 'info', 'media.download', {
+      sha256: sha256.slice(0, 12),
+      byteSize: object.byteSize,
+      mimeType: object.mimeType,
+    })
     return send(response, 200, {
       sha256,
       mimeType: object.mimeType,
@@ -536,6 +630,7 @@ const route = async (request, response) => {
 
   if (request.method === 'POST' && url.pathname === '/sync/snapshot') {
     const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
     const body = await readJson(request, config.maxBlobBytes)
     const snapshot = body.snapshot
     if (!snapshot || typeof snapshot !== 'object') throw httpError(400, 'snapshot object is required.')
@@ -550,20 +645,40 @@ const route = async (request, response) => {
       update: { sourceDeviceId: device.id, payloadJson: snapshot },
     })
 
+    logRequest(context, 'info', 'sync.snapshot.upload', {
+      decks: Array.isArray(snapshot.decks) ? snapshot.decks.length : 0,
+      cards: Array.isArray(snapshot.cards) ? snapshot.cards.length : 0,
+      reviewLogs: Array.isArray(snapshot.reviewLogs) ? snapshot.reviewLogs.length : 0,
+      media: Array.isArray(snapshot.media) ? snapshot.media.length : 0,
+      sourceDeviceId: device.id,
+    })
     return send(response, 200, { ok: true })
   }
 
   if (request.method === 'GET' && url.pathname === '/sync/snapshot') {
     const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
     const snapshot = await prisma.syncSnapshot.findUnique({
       where: { syncGroupId: device.syncGroupId },
     })
 
     // A device never consumes its own snapshot.
     if (!snapshot || snapshot.sourceDeviceId === device.id) {
+      logRequest(context, 'info', 'sync.snapshot.pull', {
+        found: false,
+        sourceDeviceId: snapshot?.sourceDeviceId ?? null,
+      })
       return send(response, 200, { snapshot: null, sourceDeviceId: null })
     }
 
+    logRequest(context, 'info', 'sync.snapshot.pull', {
+      found: true,
+      sourceDeviceId: snapshot.sourceDeviceId,
+      decks: Array.isArray(snapshot.payloadJson?.decks) ? snapshot.payloadJson.decks.length : 0,
+      cards: Array.isArray(snapshot.payloadJson?.cards) ? snapshot.payloadJson.cards.length : 0,
+      reviewLogs: Array.isArray(snapshot.payloadJson?.reviewLogs) ? snapshot.payloadJson.reviewLogs.length : 0,
+      media: Array.isArray(snapshot.payloadJson?.media) ? snapshot.payloadJson.media.length : 0,
+    })
     return send(response, 200, {
       snapshot: snapshot.payloadJson,
       sourceDeviceId: snapshot.sourceDeviceId,
@@ -572,6 +687,7 @@ const route = async (request, response) => {
 
   if (request.method === 'POST' && url.pathname === '/sync/snapshot/ack') {
     const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
     const snapshot = await prisma.syncSnapshot.findUnique({
       where: { syncGroupId: device.syncGroupId },
     })
@@ -599,6 +715,16 @@ const route = async (request, response) => {
           // Best-effort blob cleanup; the DB row is already gone.
         }
       }
+      logRequest(context, 'info', 'sync.snapshot.ack', {
+        cleared: true,
+        sourceDeviceId: snapshot.sourceDeviceId,
+        mediaDeleted: hashes.length,
+      })
+    } else {
+      logRequest(context, 'info', 'sync.snapshot.ack', {
+        cleared: false,
+        sourceDeviceId: snapshot?.sourceDeviceId ?? null,
+      })
     }
 
     return send(response, 200, { ok: true })
@@ -608,9 +734,16 @@ const route = async (request, response) => {
 }
 
 const server = http.createServer((request, response) => {
-  route(request, response).catch((error) => {
+  const context = createRequestContext(request)
+  response.setHeader('x-request-id', context.requestId)
+  route(request, response, context).catch((error) => {
     const status = Number(error.status ?? 500)
     const message = status >= 500 ? 'Internal server error.' : error.message
+    logRequest(context, 'error', 'request.error', {
+      status,
+      error: message,
+      errorDetail: error.message,
+    })
     if (status >= 500) console.error(error)
     send(response, status, { error: message })
   })

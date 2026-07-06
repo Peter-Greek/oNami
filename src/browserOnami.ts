@@ -37,6 +37,7 @@ import type {
   SyncJoinPairingResult,
   SyncMediaBlob,
   SyncMediaRecord,
+  SyncProgressEvent,
   SyncReviewAnswerPayload,
   SyncReviewLogRecord,
   SyncRunResult,
@@ -141,6 +142,7 @@ const STORAGE_KEY = 'onami.android.mvp.v1'
 const SYNC_SETTINGS_KEY = 'onami.sync.settings'
 const SYNC_OUTBOX_KEY = 'onami.sync.outbox'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
+const syncProgressListeners = new Set<(event: SyncProgressEvent) => void>()
 
 const defaultAppSettings: AppSettings = {
   audioVolume: 0.8,
@@ -281,6 +283,10 @@ const readSyncOutbox = (): SyncEventRecord[] => {
 
 const writeSyncOutbox = (events: SyncEventRecord[]) => {
   localStorage.setItem(SYNC_OUTBOX_KEY, JSON.stringify(events))
+}
+
+const emitSyncProgress = (event: SyncProgressEvent) => {
+  for (const listener of syncProgressListeners) listener(event)
 }
 
 const syncStatusFromSettings = (settings: BrowserSyncSettings) => ({
@@ -1054,6 +1060,13 @@ const pushPendingSyncEvents = async (token: string): Promise<number> => {
       .slice(0, 100)
     if (pending.length === 0) break
 
+    emitSyncProgress({
+      stage: 'push',
+      message: `Uploading local events ${pushedEvents + 1}-${pushedEvents + pending.length}.`,
+      current: pushedEvents,
+      total: pushedEvents + pending.length,
+      itemType: 'event',
+    })
     await syncHostRequest<{ accepted: number; highestAcceptedSequence: number }>('/sync/events', {
       method: 'POST',
       token,
@@ -1061,6 +1074,13 @@ const pushPendingSyncEvents = async (token: string): Promise<number> => {
     })
     markSyncEventsPushed(pending.map((event) => event.eventId))
     pushedEvents += pending.length
+    emitSyncProgress({
+      stage: 'push',
+      message: `Uploaded ${pushedEvents} local event${pushedEvents === 1 ? '' : 's'}.`,
+      current: pushedEvents,
+      total: pushedEvents + readSyncOutbox().length,
+      itemType: 'event',
+    })
   }
   return pushedEvents
 }
@@ -1072,8 +1092,23 @@ const uploadFullSnapshot = async (): Promise<void> => {
   const token = await getValidSyncDeviceToken()
   const state = readState()
   const snapshot = buildSnapshot(state)
+  const totalItems = snapshot.decks.length + snapshot.cards.length + snapshot.reviewLogs.length + snapshot.media.length
+  emitSyncProgress({
+    stage: 'snapshot-upload',
+    message: `Preparing full snapshot with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
+    current: 0,
+    total: totalItems,
+  })
 
-  for (const media of state.media) {
+  for (const [index, media] of state.media.entries()) {
+    emitSyncProgress({
+      stage: 'snapshot-upload',
+      message: `Uploading media ${index + 1}/${state.media.length}.`,
+      current: index + 1,
+      total: state.media.length,
+      itemType: 'media',
+      itemName: media.originalName,
+    })
     await syncHostRequest('/media', {
       method: 'POST',
       token,
@@ -1081,6 +1116,12 @@ const uploadFullSnapshot = async (): Promise<void> => {
     })
   }
 
+  emitSyncProgress({
+    stage: 'snapshot-upload',
+    message: `Uploading full snapshot ${totalItems}/${totalItems}.`,
+    current: totalItems,
+    total: totalItems,
+  })
   await syncHostRequest('/sync/snapshot', { method: 'POST', token, body: { snapshot } })
 }
 
@@ -1098,6 +1139,7 @@ const maybeSeedSnapshot = async (): Promise<void> => {
 const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
   let response: SyncSnapshotResponse
   try {
+    emitSyncProgress({ stage: 'snapshot-download', message: 'Checking for initial content snapshot.' })
     response = await syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', { method: 'GET', token })
   } catch {
     // A host without snapshot support falls back to event-only sync.
@@ -1105,9 +1147,29 @@ const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
   }
   if (!response.snapshot) return false
 
+  const totalItems =
+    response.snapshot.decks.length +
+    response.snapshot.cards.length +
+    response.snapshot.reviewLogs.length +
+    response.snapshot.media.length
+  emitSyncProgress({
+    stage: 'snapshot-download',
+    message: `Downloading initial snapshot with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
+    current: 0,
+    total: totalItems,
+  })
+
   const state = readState()
-  for (const media of response.snapshot.media) {
+  for (const [index, media] of response.snapshot.media.entries()) {
     if (state.media.some((item) => item.sha256 === media.sha256)) continue
+    emitSyncProgress({
+      stage: 'snapshot-download',
+      message: `Downloading media ${index + 1}/${response.snapshot.media.length}.`,
+      current: index + 1,
+      total: response.snapshot.media.length,
+      itemType: 'media',
+      itemName: media.originalName,
+    })
     const blob = await syncHostRequest<SyncMediaBlob>(`/media/${media.sha256}`, { method: 'GET', token })
     state.media.push({
       id: media.id,
@@ -1117,11 +1179,41 @@ const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
       dataBase64: blob.dataBase64,
     })
   }
+  for (const [index, deck] of response.snapshot.decks.entries()) {
+    emitSyncProgress({
+      stage: 'apply',
+      message: `Applying deck ${index + 1}/${response.snapshot.decks.length}: ${deck.name}.`,
+      current: index + 1,
+      total: response.snapshot.decks.length,
+      itemType: 'deck',
+      itemName: deck.name,
+    })
+  }
+  for (const [index, card] of response.snapshot.cards.entries()) {
+    emitSyncProgress({
+      stage: 'apply',
+      message: `Applying card ${index + 1}/${response.snapshot.cards.length}.`,
+      current: index + 1,
+      total: response.snapshot.cards.length,
+      itemType: 'card',
+      itemName: card.card.id,
+    })
+  }
+  if (response.snapshot.reviewLogs.length > 0) {
+    emitSyncProgress({
+      stage: 'apply',
+      message: `Applying ${response.snapshot.reviewLogs.length} review history entr${response.snapshot.reviewLogs.length === 1 ? 'y' : 'ies'}.`,
+      current: response.snapshot.reviewLogs.length,
+      total: response.snapshot.reviewLogs.length,
+      itemType: 'review',
+    })
+  }
 
   applySnapshotBundle(state, response.snapshot)
   writeState(state)
 
   // Confirm receipt so the host clears the snapshot bundle and its media.
+  emitSyncProgress({ stage: 'ack', message: 'Acknowledging initial snapshot.' })
   await syncHostRequest('/sync/snapshot/ack', { method: 'POST', token, body: {} })
   return true
 }
@@ -1474,6 +1566,10 @@ export const installBrowserOnami = () => {
       },
       confirmPairing: async (input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult> => {
         const device = await ensureSyncDevice()
+        if (input.mode === 'copy-phone-to-desktop') {
+          writeSyncSettings({ ...readSyncSettings(), seedSnapshotPending: true })
+        }
+
         const result = await syncHostRequest<SyncConfirmPairingResult>('/pairing/confirm', {
           method: 'POST',
           body: {
@@ -1490,13 +1586,7 @@ export const installBrowserOnami = () => {
             deviceToken: token.token,
             deviceTokenExpiresAt: token.expiresAt,
           })
-          // The phone only acts as the snapshot source for an explicit
-          // phone-to-desktop copy; otherwise the desktop is the source and this
-          // device hydrates from its snapshot on the next syncNow.
-          if (input.mode === 'copy-phone-to-desktop') {
-            writeSyncSettings({ ...readSyncSettings(), seedSnapshotPending: true })
-            await maybeSeedSnapshot()
-          }
+          if (input.mode === 'copy-phone-to-desktop') await maybeSeedSnapshot()
         }
         return result
       },
@@ -1505,6 +1595,7 @@ export const installBrowserOnami = () => {
         if (!settings.syncGroupId) throw new Error('Pair this device before syncing.')
 
         const token = await getValidSyncDeviceToken()
+        emitSyncProgress({ stage: 'pairing', message: 'Sync device is paired.' })
 
         // Seed the snapshot if this phone is the source (retry after a failed
         // confirm-time upload); otherwise hydrate from the source's one-time
@@ -1518,6 +1609,12 @@ export const installBrowserOnami = () => {
         let cursor = readSyncSettings().lastHostCursor
 
         while (true) {
+          emitSyncProgress({
+            stage: 'pull',
+            message: `Checking host updates after cursor ${cursor}.`,
+            current: pulledEvents,
+            itemType: 'event',
+          })
           const result = await syncHostRequest<{ events: RemoteSyncEvent[]; nextCursor: number }>(
             `/sync/events?after=${cursor}&limit=100`,
             { method: 'GET', token }
@@ -1527,6 +1624,14 @@ export const installBrowserOnami = () => {
           if (result.events.length > 0) {
             const state = readState()
             for (const event of result.events) {
+              emitSyncProgress({
+                stage: 'apply',
+                message: `Applying ${event.eventType} update.`,
+                current: appliedEvents + 1,
+                total: pulledEvents,
+                itemType: event.entityType,
+                itemName: event.entityId,
+              })
               if (applyRemoteSyncEvent(state, event)) appliedEvents += 1
             }
             writeState(state)
@@ -1538,6 +1643,7 @@ export const installBrowserOnami = () => {
           if (result.events.length < 100) break
         }
 
+        emitSyncProgress({ stage: 'ack', message: `Acknowledging host cursor ${cursor}.`, current: cursor })
         await syncHostRequest<{ ok: boolean }>('/sync/ack', {
           method: 'POST',
           token,
@@ -1545,6 +1651,10 @@ export const installBrowserOnami = () => {
         })
 
         if (appliedEvents > 0 || hydratedFromSnapshot) sessions.clear()
+        emitSyncProgress({
+          stage: 'complete',
+          message: `Sync complete. Sent ${pushedEvents}, received ${pulledEvents}, applied ${appliedEvents}.`,
+        })
 
         return {
           pushedEvents,
@@ -1554,6 +1664,12 @@ export const installBrowserOnami = () => {
           lastHostCursor: cursor,
           backedUpEvents: readSyncSettings().backedUpEvents,
           lastBackedUpAt: readSyncSettings().lastBackedUpAt,
+        }
+      },
+      onProgress: (listener) => {
+        syncProgressListeners.add(listener)
+        return () => {
+          syncProgressListeners.delete(listener)
         }
       },
     },

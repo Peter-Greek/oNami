@@ -50,6 +50,7 @@ import type {
   StudySession,
   SyncHealthResult,
   SyncPairingMode,
+  SyncProgressEvent,
   SyncRunResult,
   SyncStartPairingResult,
   SyncStatus,
@@ -1417,6 +1418,7 @@ function SettingsView({
   const [starterReadyToConfirm, setStarterReadyToConfirm] = useState(false)
   const [syncRun, setSyncRun] = useState<SyncRunResult | null>(null)
   const [syncMessage, setSyncMessage] = useState('')
+  const [syncProgress, setSyncProgress] = useState<SyncProgressEvent[]>([])
   const BackupIcon =
     syncStatus?.backupState === 'backed-up'
       ? CloudCheck
@@ -1455,6 +1457,14 @@ function SettingsView({
   useEffect(() => {
     setAudioVolume(appSettings.audioVolume)
   }, [appSettings.audioVolume])
+
+  useEffect(() => {
+    return window.onami.sync.onProgress((event) => {
+      setBusyLabel(event.message)
+      setSyncMessage(event.message)
+      setSyncProgress((current) => [event, ...current].slice(0, 12))
+    })
+  }, [setBusyLabel])
 
   const save = () =>
     runBusy(async () => {
@@ -1514,6 +1524,7 @@ function SettingsView({
     setPairing(null)
     setJoinCode('')
     setStarterReadyToConfirm(false)
+    setSyncProgress([])
     setBusyLabel('Syncing content with host...')
     setSyncMessage('Pairing complete. Syncing content with host...')
     try {
@@ -1538,9 +1549,13 @@ function SettingsView({
       if (!pairingCode.trim()) throw new Error('Pairing code is required.')
       let result = await window.onami.sync.confirmPairing({ pairingCode, mode: pairingMode })
       setSyncStatus(await window.onami.sync.getStatus())
-      if (!result.completed && pairingFlow === 'join') {
-        setBusyLabel('Waiting for starter to finish pairing...')
-        setSyncMessage('Waiting for the starter device to finish pairing...')
+      if (!result.completed) {
+        const waitingMessage =
+          pairingFlow === 'start'
+            ? 'Waiting for the other device to confirm pairing...'
+            : 'Waiting for the starter device to finish pairing...'
+        setBusyLabel(waitingMessage)
+        setSyncMessage(waitingMessage)
         for (let attempt = 0; attempt < 30; attempt += 1) {
           await wait(2000)
           result = await window.onami.sync.confirmPairing({ pairingCode, mode: pairingMode })
@@ -1567,6 +1582,7 @@ function SettingsView({
 
   const syncNow = () =>
     runBusy(async () => {
+      setSyncProgress([])
       setSyncMessage('Syncing local changes to host...')
       const result = await window.onami.sync.syncNow()
       setSyncRun(result)
@@ -1736,6 +1752,21 @@ function SettingsView({
         {syncRun && (
           <div className="settings-note">
             Last sync pushed {syncRun.pushedEvents}, pulled {syncRun.pulledEvents}, applied {syncRun.appliedEvents}.
+          </div>
+        )}
+        {syncProgress.length > 0 && (
+          <div className="sync-progress-list" aria-label="Sync progress">
+            {syncProgress.map((event, index) => (
+              <div key={`${event.stage}-${index}`} className="sync-progress-row">
+                <span>{event.stage}</span>
+                <strong>{event.message}</strong>
+                {event.current !== undefined && event.total !== undefined && (
+                  <small>
+                    {event.current}/{event.total}
+                  </small>
+                )}
+              </div>
+            ))}
           </div>
         )}
         {syncMessage && <div className="settings-note">{syncMessage}</div>}

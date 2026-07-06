@@ -471,6 +471,36 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
+.sync-progress-list {
+  display: grid;
+  gap: 6px;
+}
+
+.sync-progress-row {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.sync-progress-row span,
+.sync-progress-row small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.sync-progress-row strong {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
 .backup-state {
   justify-content: flex-start;
   padding: 0 11px;

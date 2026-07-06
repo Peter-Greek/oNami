@@ -423,6 +423,26 @@ export interface SyncRunResult {
   lastBackedUpAt: string | null
 }
 
+export type SyncProgressStage =
+  | 'pairing'
+  | 'snapshot-upload'
+  | 'snapshot-download'
+  | 'push'
+  | 'pull'
+  | 'apply'
+  | 'ack'
+  | 'complete'
+  | 'error'
+
+export interface SyncProgressEvent {
+  stage: SyncProgressStage
+  message: string
+  current?: number
+  total?: number
+  itemType?: 'deck' | 'card' | 'review' | 'media' | 'event'
+  itemName?: string
+}
+
 export interface OnamiApi {
   decks: {
     create(input: CreateDeckInput): Promise<DeckSummary>
@@ -459,6 +479,7 @@ export interface OnamiApi {
     joinPairing(input: SyncJoinPairingInput): Promise<SyncJoinPairingResult>
     confirmPairing(input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult>
     syncNow(): Promise<SyncRunResult>
+    onProgress(listener: (event: SyncProgressEvent) => void): () => void
   }
   stats: {
     get(filter?: StatsFilterInput): Promise<AppStats>

@@ -41,6 +41,7 @@ import type {
   SyncJoinPairingResult,
   SyncMediaBlob,
   SyncMediaRecord,
+  SyncProgressEvent,
   SyncRunResult,
   SyncSnapshotResponse,
   ThemeMode,
@@ -48,6 +49,8 @@ import type {
   SyncStatus,
   UpdateCardInput,
 } from '../../src/shared/types'
+
+type SyncProgressReporter = (event: SyncProgressEvent) => void
 
 interface StoredAiSettings {
   encryptedApiKey: string | null
@@ -485,6 +488,13 @@ export class AppServices {
 
   async confirmSyncPairing(input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult> {
     const device = this.ensureSyncDevice()
+    if (input.mode !== 'copy-phone-to-desktop') {
+      this.saveStoredSyncSettings({
+        ...this.getStoredSyncSettings(),
+        seedSnapshotPending: true,
+      })
+    }
+
     const result = await this.syncHostRequest<SyncConfirmPairingResult>('/pairing/confirm', {
       method: 'POST',
       body: {
@@ -502,39 +512,37 @@ export class AppServices {
         deviceToken: token.token,
         deviceTokenExpiresAt: token.expiresAt,
       })
-      // The desktop is the snapshot source for every mode except an explicit
-      // phone-to-desktop copy. Mark this device as the source of a one-time
-      // full-data bundle (decks, cards, review-log history for stats/streak, and
-      // media) and try to seed it now; a failure is retried on the next sync.
-      if (input.mode !== 'copy-phone-to-desktop') {
-        this.saveStoredSyncSettings({
-          ...this.getStoredSyncSettings(),
-          seedSnapshotPending: true,
-        })
-        await this.maybeSeedSnapshot()
-      }
+      if (input.mode !== 'copy-phone-to-desktop') await this.maybeSeedSnapshot()
     }
 
     return result
   }
 
-  async syncNow(): Promise<SyncRunResult> {
+  async syncNow(onProgress?: SyncProgressReporter): Promise<SyncRunResult> {
     const stored = this.getStoredSyncSettings()
     if (!stored.syncGroupId) throw new Error('Pair this device before syncing.')
 
     const token = await this.getValidSyncDeviceToken()
+    onProgress?.({ stage: 'pairing', message: 'Sync device is paired.' })
 
     // If this device is the snapshot source, (re)seed the one-time bundle. If it
     // is a fresh device, hydrate from the source's snapshot. These are mutually
     // exclusive in practice — a source has no snapshot to pull, a target has no
     // pending seed — so ordering is safe.
-    await this.maybeSeedSnapshot()
-    const hydratedFromSnapshot = await this.hydrateFromSnapshot(token)
+    await this.maybeSeedSnapshot(onProgress)
+    const hydratedFromSnapshot = await this.hydrateFromSnapshot(token, onProgress)
 
     let pushedEvents = 0
     while (true) {
       const pending = this.database.listPendingSyncEvents(100)
       if (pending.length === 0) break
+      onProgress?.({
+        stage: 'push',
+        message: `Uploading local events ${pushedEvents + 1}-${pushedEvents + pending.length}.`,
+        current: pushedEvents,
+        total: pushedEvents + pending.length,
+        itemType: 'event',
+      })
       await this.syncHostRequest<{ accepted: number; highestAcceptedSequence: number }>('/sync/events', {
         method: 'POST',
         token,
@@ -542,6 +550,13 @@ export class AppServices {
       })
       this.database.markSyncEventsPushed(pending.map((event) => event.eventId))
       pushedEvents += pending.length
+      onProgress?.({
+        stage: 'push',
+        message: `Uploaded ${pushedEvents} local event${pushedEvents === 1 ? '' : 's'}.`,
+        current: pushedEvents,
+        total: pushedEvents + this.database.getPendingSyncEventCount(),
+        itemType: 'event',
+      })
     }
 
     let pulledEvents = 0
@@ -549,6 +564,12 @@ export class AppServices {
     let cursor = this.database.getSyncHostCursor()
 
     while (true) {
+      onProgress?.({
+        stage: 'pull',
+        message: `Checking host updates after cursor ${cursor}.`,
+        current: pulledEvents,
+        itemType: 'event',
+      })
       const result = await this.syncHostRequest<{
         events: RemoteSyncEvent[]
         nextCursor: number
@@ -559,6 +580,14 @@ export class AppServices {
 
       pulledEvents += result.events.length
       for (const event of result.events) {
+        onProgress?.({
+          stage: 'apply',
+          message: `Applying ${event.eventType} update.`,
+          current: appliedEvents + 1,
+          total: pulledEvents,
+          itemType: event.entityType,
+          itemName: event.entityId,
+        })
         if (this.database.applyRemoteSyncEvent(event)) appliedEvents += 1
       }
       cursor = result.nextCursor
@@ -567,6 +596,7 @@ export class AppServices {
       if (result.events.length < 100) break
     }
 
+    onProgress?.({ stage: 'ack', message: `Acknowledging host cursor ${cursor}.`, current: cursor })
     await this.syncHostRequest<{ ok: boolean }>('/sync/ack', {
       method: 'POST',
       token,
@@ -574,6 +604,10 @@ export class AppServices {
     })
 
     if (appliedEvents > 0 || hydratedFromSnapshot) this.sessions.clear()
+    onProgress?.({
+      stage: 'complete',
+      message: `Sync complete. Sent ${pushedEvents}, received ${pulledEvents}, applied ${appliedEvents}.`,
+    })
 
     return {
       pushedEvents,
@@ -585,11 +619,11 @@ export class AppServices {
     }
   }
 
-  private async maybeSeedSnapshot(): Promise<void> {
+  private async maybeSeedSnapshot(onProgress?: SyncProgressReporter): Promise<void> {
     const stored = this.getStoredSyncSettings()
     if (!stored.seedSnapshotPending || !stored.syncGroupId) return
     try {
-      await this.uploadFullSnapshot()
+      await this.uploadFullSnapshot(onProgress)
       this.saveStoredSyncSettings({
         ...this.getStoredSyncSettings(),
         seedSnapshotPending: false,
@@ -599,18 +633,39 @@ export class AppServices {
     }
   }
 
-  private async uploadFullSnapshot(): Promise<void> {
+  private async uploadFullSnapshot(onProgress?: SyncProgressReporter): Promise<void> {
     const stored = this.getStoredSyncSettings()
     if (!stored.deviceId || !stored.syncGroupId) return
 
     const token = await this.getValidSyncDeviceToken()
     const snapshot = this.database.buildFullSnapshot()
+    const totalItems = snapshot.decks.length + snapshot.cards.length + snapshot.reviewLogs.length + snapshot.media.length
+    onProgress?.({
+      stage: 'snapshot-upload',
+      message: `Preparing full snapshot with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
+      current: 0,
+      total: totalItems,
+    })
 
     // Upload blobs first so the target can resolve every media reference.
-    for (const media of snapshot.media) {
+    for (const [index, media] of snapshot.media.entries()) {
+      onProgress?.({
+        stage: 'snapshot-upload',
+        message: `Uploading media ${index + 1}/${snapshot.media.length}.`,
+        current: index + 1,
+        total: snapshot.media.length,
+        itemType: 'media',
+        itemName: media.originalName,
+      })
       await this.uploadMediaBlob(media, token)
     }
 
+    onProgress?.({
+      stage: 'snapshot-upload',
+      message: `Uploading full snapshot ${totalItems}/${totalItems}.`,
+      current: totalItems,
+      total: totalItems,
+    })
     await this.syncHostRequest<{ ok: boolean }>('/sync/snapshot', {
       method: 'POST',
       token,
@@ -618,9 +673,10 @@ export class AppServices {
     })
   }
 
-  private async hydrateFromSnapshot(token: string): Promise<boolean> {
+  private async hydrateFromSnapshot(token: string, onProgress?: SyncProgressReporter): Promise<boolean> {
     let response: SyncSnapshotResponse
     try {
+      onProgress?.({ stage: 'snapshot-download', message: 'Checking for initial content snapshot.' })
       response = await this.syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', {
         method: 'GET',
         token,
@@ -631,12 +687,62 @@ export class AppServices {
     }
     if (!response.snapshot) return false
 
-    for (const media of response.snapshot.media) {
+    const totalItems =
+      response.snapshot.decks.length +
+      response.snapshot.cards.length +
+      response.snapshot.reviewLogs.length +
+      response.snapshot.media.length
+    onProgress?.({
+      stage: 'snapshot-download',
+      message: `Downloading initial snapshot with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
+      current: 0,
+      total: totalItems,
+    })
+
+    for (const [index, media] of response.snapshot.media.entries()) {
+      onProgress?.({
+        stage: 'snapshot-download',
+        message: `Downloading media ${index + 1}/${response.snapshot.media.length}.`,
+        current: index + 1,
+        total: response.snapshot.media.length,
+        itemType: 'media',
+        itemName: media.originalName,
+      })
       await this.downloadMediaBlob(media, token)
+    }
+    for (const [index, deck] of response.snapshot.decks.entries()) {
+      onProgress?.({
+        stage: 'apply',
+        message: `Applying deck ${index + 1}/${response.snapshot.decks.length}: ${deck.name}.`,
+        current: index + 1,
+        total: response.snapshot.decks.length,
+        itemType: 'deck',
+        itemName: deck.name,
+      })
+    }
+    for (const [index, card] of response.snapshot.cards.entries()) {
+      onProgress?.({
+        stage: 'apply',
+        message: `Applying card ${index + 1}/${response.snapshot.cards.length}.`,
+        current: index + 1,
+        total: response.snapshot.cards.length,
+        itemType: 'card',
+        itemName: card.card.id,
+      })
+    }
+    if (response.snapshot.reviewLogs.length > 0) {
+      onProgress?.({
+        stage: 'apply',
+        message: `Applying ${response.snapshot.reviewLogs.length} review history entr${response.snapshot.reviewLogs.length === 1 ? 'y' : 'ies'}.`,
+        current: response.snapshot.reviewLogs.length,
+        total: response.snapshot.reviewLogs.length,
+        itemType: 'review',
+      })
     }
     this.database.applySnapshot(response.snapshot)
 
     // Confirm receipt so the host can clean up the snapshot bundle and its media.
+    onProgress?.({ stage: 'ack', message: 'Acknowledging initial snapshot.' })
     await this.syncHostRequest<{ ok: boolean }>('/sync/snapshot/ack', {
       method: 'POST',
       token,
