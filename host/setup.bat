@@ -13,13 +13,13 @@ echo.
 echo const c = require("crypto"^);
 echo const mode = process.argv[2];
 echo if (mode === "pass"^) console.log(c.randomBytes(24^).toString("hex"^)^);
-) > _onami_gen.js
+) > _onami_gen.cjs
 
 echo [1/5] Checking Node.js ...
 where node >nul 2>&1
 if errorlevel 1 (
   echo [ERROR] Node.js not found on PATH.
-  del /q _onami_gen.js >nul 2>&1
+  del /q _onami_gen.cjs >nul 2>&1
   pause
   exit /b 1
 )
@@ -48,7 +48,7 @@ for %%d in (
 )
 
 echo [ERROR] PostgreSQL psql.exe was not found.
-del /q _onami_gen.js >nul 2>&1
+del /q _onami_gen.cjs >nul 2>&1
 pause
 exit /b 1
 
@@ -62,14 +62,26 @@ set "PGPASSWORD=%PG_SUPER_PASS%"
 "%PSQL_CMD%" -U postgres -h localhost -c "SELECT 1;" >nul 2>&1
 if errorlevel 1 (
   echo [ERROR] Could not connect to PostgreSQL as postgres.
-  del /q _onami_gen.js >nul 2>&1
+  del /q _onami_gen.cjs >nul 2>&1
   pause
   exit /b 1
 )
 
 echo [4/5] Creating oNami database/user ...
-for /f "tokens=*" %%p in ('node _onami_gen.js pass') do set "ONAMI_DB_PASS=%%p"
-del /q _onami_gen.js >nul 2>&1
+for /f "tokens=*" %%p in ('node _onami_gen.cjs pass') do set "ONAMI_DB_PASS=%%p"
+if errorlevel 1 (
+  echo [ERROR] Could not generate database password.
+  del /q _onami_gen.cjs >nul 2>&1
+  pause
+  exit /b 1
+)
+if "%ONAMI_DB_PASS%"=="" (
+  echo [ERROR] Generated database password was empty.
+  del /q _onami_gen.cjs >nul 2>&1
+  pause
+  exit /b 1
+)
+del /q _onami_gen.cjs >nul 2>&1
 
 "%PSQL_CMD%" -U postgres -h localhost -c "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'onami_user') THEN CREATE ROLE onami_user WITH LOGIN PASSWORD '%ONAMI_DB_PASS%'; ELSE ALTER ROLE onami_user WITH LOGIN PASSWORD '%ONAMI_DB_PASS%'; END IF; END $$;" >nul 2>&1
 if errorlevel 1 (
