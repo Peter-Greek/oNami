@@ -16,6 +16,7 @@ importTest
 android/.gradle
 android/app/build
 android/app/src/main/assets/public
+host/data
 *.local
 
 # Editor directories and files

@@ -16,6 +16,8 @@
     "build:electron": "tsup",
     "android:sync-assets": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"New-Item -ItemType Directory -Force android/app/src/main/assets/public | Out-Null; Copy-Item -Recurse -Force dist/* android/app/src/main/assets/public\"",
     "android:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1",
+    "host": "node host/server.js",
+    "host:pm2": "pm2 start host/ecosystem.config.cjs --only onami-host --update-env",
     "rebuild:electron": "electron-rebuild -f -w better-sqlite3",
     "rebuild:native": "npm rebuild better-sqlite3",
     "build:win": "npm run build && npm run rebuild:electron && electron-builder --win --x64 && npm run rebuild:native",
