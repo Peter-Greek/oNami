@@ -34,6 +34,14 @@ const api: OnamiApi = {
     get: () => ipcRenderer.invoke('settings:get'),
     save: (input) => ipcRenderer.invoke('settings:save', input),
   },
+  sync: {
+    getStatus: () => ipcRenderer.invoke('sync:get-status'),
+    saveSettings: (input) => ipcRenderer.invoke('sync:save-settings', input),
+    checkHealth: () => ipcRenderer.invoke('sync:check-health'),
+    startPairing: () => ipcRenderer.invoke('sync:start-pairing'),
+    joinPairing: (input) => ipcRenderer.invoke('sync:join-pairing', input),
+    confirmPairing: (input) => ipcRenderer.invoke('sync:confirm-pairing', input),
+  },
   appWindow: {
     minimize: () => ipcRenderer.invoke('window:minimize'),
     toggleMaximize: () => ipcRenderer.invoke('window:toggle-maximize'),

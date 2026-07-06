@@ -1,6 +1,7 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import OpenAI from 'openai'
 import { safeStorage } from 'electron'
 import { z } from 'zod'
@@ -25,10 +26,18 @@ import type {
   SaveAiSettingsInput,
   SaveAppSettingsInput,
   StatsFilterInput,
+  SaveSyncSettingsInput,
   StudyMode,
   StudySession,
   StudySessionSettings,
+  SyncConfirmPairingInput,
+  SyncConfirmPairingResult,
+  SyncHealthResult,
+  SyncJoinPairingInput,
+  SyncJoinPairingResult,
   ThemeMode,
+  SyncStartPairingResult,
+  SyncStatus,
   UpdateCardInput,
 } from '../../src/shared/types'
 
@@ -37,9 +46,22 @@ interface StoredAiSettings {
   model: string
 }
 
+interface StoredSyncSettings {
+  hostUrl: string
+  deviceId: string | null
+  deviceName: string | null
+  publicKey: string | null
+  privateKey: string | null
+  syncGroupId: string | null
+  deviceToken: string | null
+  deviceTokenExpiresAt: string | null
+}
+
 const AI_SETTINGS_KEY = 'ai.settings'
 const APP_SETTINGS_KEY = 'app.settings'
+const SYNC_SETTINGS_KEY = 'sync.settings'
 const DEFAULT_AI_MODEL = 'gpt-4o-mini'
+const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
 const DEFAULT_APP_SETTINGS: AppSettings = {
   audioVolume: 0.8,
   themeMode: 'system',
@@ -334,6 +356,102 @@ export class AppServices {
     return this.getAppSettings()
   }
 
+  getSyncStatus(): SyncStatus {
+    const stored = this.getStoredSyncSettings()
+    return {
+      hostUrl: stored.hostUrl,
+      deviceId: stored.deviceId,
+      deviceName: stored.deviceName,
+      syncGroupId: stored.syncGroupId,
+      paired: Boolean(stored.syncGroupId),
+    }
+  }
+
+  saveSyncSettings(input: SaveSyncSettingsInput): SyncStatus {
+    const current = this.getStoredSyncSettings()
+    const hostUrl = this.normalizeHostUrl(input.hostUrl)
+    this.saveStoredSyncSettings({
+      ...current,
+      hostUrl,
+      deviceToken: hostUrl === current.hostUrl ? current.deviceToken : null,
+      deviceTokenExpiresAt: hostUrl === current.hostUrl ? current.deviceTokenExpiresAt : null,
+    })
+    return this.getSyncStatus()
+  }
+
+  async checkSyncHealth(): Promise<SyncHealthResult> {
+    const stored = this.getStoredSyncSettings()
+    try {
+      const result = await this.syncHostRequest<{ ok?: boolean; service?: string; time?: string }>('/health', {
+        method: 'GET',
+      })
+      return {
+        ok: result.ok === true,
+        service: result.service ?? null,
+        time: result.time ?? null,
+        error: null,
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        service: null,
+        time: null,
+        error: error instanceof Error ? error.message : `Could not reach ${stored.hostUrl}.`,
+      }
+    }
+  }
+
+  async startSyncPairing(): Promise<SyncStartPairingResult> {
+    const device = this.ensureSyncDevice()
+    return this.syncHostRequest<SyncStartPairingResult>('/pairing/start', {
+      method: 'POST',
+      body: {
+        deviceId: device.deviceId,
+        name: device.deviceName,
+        platform: 'desktop',
+        publicKey: device.publicKey,
+      },
+    })
+  }
+
+  async joinSyncPairing(input: SyncJoinPairingInput): Promise<SyncJoinPairingResult> {
+    const device = this.ensureSyncDevice()
+    return this.syncHostRequest<SyncJoinPairingResult>('/pairing/join', {
+      method: 'POST',
+      body: {
+        pairingCode: input.pairingCode,
+        deviceId: device.deviceId,
+        name: device.deviceName,
+        platform: 'desktop',
+        publicKey: device.publicKey,
+      },
+    })
+  }
+
+  async confirmSyncPairing(input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult> {
+    const device = this.ensureSyncDevice()
+    const result = await this.syncHostRequest<SyncConfirmPairingResult>('/pairing/confirm', {
+      method: 'POST',
+      body: {
+        pairingCode: input.pairingCode,
+        deviceId: device.deviceId,
+        mode: input.mode,
+      },
+    })
+
+    if (result.completed && result.syncGroupId) {
+      const token = await this.requestSyncDeviceToken()
+      this.saveStoredSyncSettings({
+        ...this.getStoredSyncSettings(),
+        syncGroupId: result.syncGroupId,
+        deviceToken: token.token,
+        deviceTokenExpiresAt: token.expiresAt,
+      })
+    }
+
+    return result
+  }
+
   private rewriteMedia(html: string, mediaIdByName: Map<string, string>): string {
     let rewritten = html.replace(/\[sound:([^\]]+)]/g, (_match, name: string) => {
       const id = mediaIdByName.get(name)
@@ -368,5 +486,124 @@ export class AppServices {
     if (!stored.encryptedApiKey) return null
     if (!safeStorage.isEncryptionAvailable()) return null
     return safeStorage.decryptString(Buffer.from(stored.encryptedApiKey, 'base64'))
+  }
+
+  private getStoredSyncSettings(): StoredSyncSettings {
+    return this.database.getSettingsValue<StoredSyncSettings>(SYNC_SETTINGS_KEY, {
+      hostUrl: DEFAULT_SYNC_HOST_URL,
+      deviceId: null,
+      deviceName: null,
+      publicKey: null,
+      privateKey: null,
+      syncGroupId: null,
+      deviceToken: null,
+      deviceTokenExpiresAt: null,
+    })
+  }
+
+  private saveStoredSyncSettings(settings: StoredSyncSettings): void {
+    this.database.setSettingsValue(SYNC_SETTINGS_KEY, {
+      ...settings,
+      hostUrl: this.normalizeHostUrl(settings.hostUrl),
+    })
+  }
+
+  private ensureSyncDevice(): StoredSyncSettings & {
+    deviceId: string
+    deviceName: string
+    publicKey: string
+    privateKey: string
+  } {
+    const stored = this.getStoredSyncSettings()
+    if (stored.deviceId && stored.deviceName && stored.publicKey && stored.privateKey) {
+      return {
+        ...stored,
+        deviceId: stored.deviceId,
+        deviceName: stored.deviceName,
+        publicKey: stored.publicKey,
+        privateKey: stored.privateKey,
+      }
+    }
+
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519')
+    const deviceId = randomUUID()
+    const deviceName = `${os.hostname()} desktop`
+    const publicKeyPem = String(publicKey.export({ type: 'spki', format: 'pem' }))
+    const privateKeyPem = String(privateKey.export({ type: 'pkcs8', format: 'pem' }))
+    const next: StoredSyncSettings = {
+      ...stored,
+      deviceId,
+      deviceName,
+      publicKey: publicKeyPem,
+      privateKey: privateKeyPem,
+    }
+    this.saveStoredSyncSettings(next)
+
+    return {
+      ...next,
+      deviceId,
+      deviceName,
+      publicKey: publicKeyPem,
+      privateKey: privateKeyPem,
+    }
+  }
+
+  private normalizeHostUrl(hostUrl: string): string {
+    const trimmed = hostUrl.trim().replace(/\/+$/, '')
+    if (!trimmed) return DEFAULT_SYNC_HOST_URL
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('Sync host URL must start with http:// or https://.')
+    }
+    return parsed.toString().replace(/\/+$/, '')
+  }
+
+  private async syncHostRequest<T>(
+    path: string,
+    options: { method: 'GET' | 'POST'; body?: unknown; token?: string }
+  ): Promise<T> {
+    const stored = this.getStoredSyncSettings()
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 10_000)
+
+    try {
+      const response = await fetch(`${stored.hostUrl}${path}`, {
+        method: options.method,
+        headers: {
+          ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+        },
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal: controller.signal,
+      })
+      const text = await response.text()
+      const parsed = text ? (JSON.parse(text) as T & { error?: string }) : ({} as T & { error?: string })
+      if (!response.ok) {
+        throw new Error(parsed.error || `Sync host returned HTTP ${response.status}.`)
+      }
+      return parsed
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Timed out connecting to ${stored.hostUrl}.`)
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  private async requestSyncDeviceToken(): Promise<{ token: string; expiresAt: string }> {
+    const device = this.ensureSyncDevice()
+    const timestamp = new Date().toISOString()
+    const signature = sign(null, Buffer.from(`${device.deviceId}.${timestamp}`), device.privateKey).toString('base64')
+
+    return this.syncHostRequest<{ token: string; expiresAt: string }>('/devices/token', {
+      method: 'POST',
+      body: {
+        deviceId: device.deviceId,
+        timestamp,
+        signature,
+      },
+    })
   }
 }

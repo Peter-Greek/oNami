@@ -220,6 +220,55 @@ export interface AppStats {
   hardestCards: HardCardSummary[]
 }
 
+export type SyncPairingMode = 'merge' | 'copy-desktop-to-phone' | 'copy-phone-to-desktop'
+
+export interface SyncStatus {
+  hostUrl: string
+  deviceId: string | null
+  deviceName: string | null
+  syncGroupId: string | null
+  paired: boolean
+}
+
+export interface SaveSyncSettingsInput {
+  hostUrl: string
+}
+
+export interface SyncHealthResult {
+  ok: boolean
+  service: string | null
+  time: string | null
+  error: string | null
+}
+
+export interface SyncStartPairingResult {
+  deviceId: string
+  pairingCode: string
+  confirmationCode: string
+  expiresInMs: number
+}
+
+export interface SyncJoinPairingInput {
+  pairingCode: string
+}
+
+export interface SyncJoinPairingResult {
+  deviceId: string
+  confirmationCode: string
+  expiresAt: string
+}
+
+export interface SyncConfirmPairingInput {
+  pairingCode: string
+  mode: SyncPairingMode
+}
+
+export interface SyncConfirmPairingResult {
+  completed: boolean
+  syncGroupId: string | null
+  mode: SyncPairingMode
+}
+
 export interface OnamiApi {
   decks: {
     create(input: CreateDeckInput): Promise<DeckSummary>
@@ -247,6 +296,14 @@ export interface OnamiApi {
   settings: {
     get(): Promise<AppSettings>
     save(input: SaveAppSettingsInput): Promise<AppSettings>
+  }
+  sync: {
+    getStatus(): Promise<SyncStatus>
+    saveSettings(input: SaveSyncSettingsInput): Promise<SyncStatus>
+    checkHealth(): Promise<SyncHealthResult>
+    startPairing(): Promise<SyncStartPairingResult>
+    joinPairing(input: SyncJoinPairingInput): Promise<SyncJoinPairingResult>
+    confirmPairing(input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult>
   }
   stats: {
     get(filter?: StatsFilterInput): Promise<AppStats>

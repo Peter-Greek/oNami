@@ -12,9 +12,12 @@ import type {
   ImportApkgOptions,
   SaveAppSettingsInput,
   SaveAiSettingsInput,
+  SaveSyncSettingsInput,
   StatsFilterInput,
   StudyMode,
   StudySessionSettings,
+  SyncConfirmPairingInput,
+  SyncJoinPairingInput,
   UpdateCardInput,
 } from '../src/shared/types'
 import type { AppServices } from './domain/appServices'
@@ -168,6 +171,19 @@ const registerIpc = (): void => {
   ipcMain.handle('settings:get', () => getServices().getAppSettings())
   ipcMain.handle('settings:save', (_event, input: SaveAppSettingsInput) =>
     getServices().saveAppSettings(input)
+  )
+
+  ipcMain.handle('sync:get-status', () => getServices().getSyncStatus())
+  ipcMain.handle('sync:save-settings', (_event, input: SaveSyncSettingsInput) =>
+    getServices().saveSyncSettings(input)
+  )
+  ipcMain.handle('sync:check-health', () => getServices().checkSyncHealth())
+  ipcMain.handle('sync:start-pairing', () => getServices().startSyncPairing())
+  ipcMain.handle('sync:join-pairing', (_event, input: SyncJoinPairingInput) =>
+    getServices().joinSyncPairing(input)
+  )
+  ipcMain.handle('sync:confirm-pairing', (_event, input: SyncConfirmPairingInput) =>
+    getServices().confirmSyncPairing(input)
   )
 
   ipcMain.handle('window:minimize', (event) => {

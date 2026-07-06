@@ -671,6 +671,55 @@ export const installBrowserOnami = () => {
           return state.appSettings
         }),
     },
+    sync: {
+      getStatus: async () => ({
+        hostUrl: localStorage.getItem('onami.sync.hostUrl') || 'http://147.135.31.128:41729',
+        deviceId: null,
+        deviceName: null,
+        syncGroupId: null,
+        paired: false,
+      }),
+      saveSettings: async (input) => {
+        const hostUrl = input.hostUrl.trim().replace(/\/+$/, '') || 'http://147.135.31.128:41729'
+        localStorage.setItem('onami.sync.hostUrl', hostUrl)
+        return {
+          hostUrl,
+          deviceId: null,
+          deviceName: null,
+          syncGroupId: null,
+          paired: false,
+        }
+      },
+      checkHealth: async () => {
+        const hostUrl = localStorage.getItem('onami.sync.hostUrl') || 'http://147.135.31.128:41729'
+        try {
+          const response = await fetch(`${hostUrl}/health`)
+          const body = (await response.json()) as { ok?: boolean; service?: string; time?: string; error?: string }
+          return {
+            ok: response.ok && body.ok === true,
+            service: body.service ?? null,
+            time: body.time ?? null,
+            error: response.ok ? null : body.error ?? `Sync host returned HTTP ${response.status}.`,
+          }
+        } catch (error) {
+          return {
+            ok: false,
+            service: null,
+            time: null,
+            error: error instanceof Error ? error.message : 'Could not reach sync host.',
+          }
+        }
+      },
+      startPairing: async () => {
+        throw new Error('Device pairing is only available in the desktop app for this beta.')
+      },
+      joinPairing: async () => {
+        throw new Error('Device pairing is only available in the desktop app for this beta.')
+      },
+      confirmPairing: async () => {
+        throw new Error('Device pairing is only available in the desktop app for this beta.')
+      },
+    },
     stats: {
       get: async (filter?: StatsFilterInput) => getStats(readState(), filter),
     },

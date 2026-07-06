@@ -45,6 +45,10 @@ import type {
   ReviewRating,
   StudyMode,
   StudySession,
+  SyncHealthResult,
+  SyncPairingMode,
+  SyncStartPairingResult,
+  SyncStatus,
   ThemeMode,
 } from './shared/types'
 import './App.css'
@@ -1372,11 +1376,22 @@ function SettingsView({
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('gpt-4o-mini')
   const [audioVolume, setAudioVolume] = useState(appSettings.audioVolume)
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
+  const [syncHostUrl, setSyncHostUrl] = useState('')
+  const [syncHealth, setSyncHealth] = useState<SyncHealthResult | null>(null)
+  const [pairing, setPairing] = useState<SyncStartPairingResult | null>(null)
+  const [joinCode, setJoinCode] = useState('')
+  const [pairingMode, setPairingMode] = useState<SyncPairingMode>('merge')
+  const [syncMessage, setSyncMessage] = useState('')
 
   useEffect(() => {
     window.onami.ai.getSettings().then((next) => {
       setAiSettings(next)
       setModel(next.model)
+    })
+    window.onami.sync.getStatus().then((next) => {
+      setSyncStatus(next)
+      setSyncHostUrl(next.hostUrl)
     })
   }, [])
 
@@ -1393,6 +1408,52 @@ function SettingsView({
       setAiSettings(nextAiSettings)
       onAppSettingsChanged(nextAppSettings)
       setApiKey('')
+    })
+
+  const saveSyncHost = () =>
+    runBusy(async () => {
+      const next = await window.onami.sync.saveSettings({ hostUrl: syncHostUrl })
+      setSyncStatus(next)
+      setSyncHostUrl(next.hostUrl)
+      setSyncMessage('Sync host saved.')
+    })
+
+  const checkSyncHost = () =>
+    runBusy(async () => {
+      const result = await window.onami.sync.checkHealth()
+      setSyncHealth(result)
+      setSyncMessage(result.ok ? 'Sync host is reachable.' : result.error ?? 'Sync host is not reachable.')
+    })
+
+  const startPairing = () =>
+    runBusy(async () => {
+      const result = await window.onami.sync.startPairing()
+      setPairing(result)
+      setJoinCode(result.pairingCode)
+      setSyncStatus(await window.onami.sync.getStatus())
+      setSyncMessage('Pairing code created.')
+    })
+
+  const joinPairing = () =>
+    runBusy(async () => {
+      const result = await window.onami.sync.joinPairing({ pairingCode: joinCode })
+      setPairing({
+        deviceId: result.deviceId,
+        pairingCode: joinCode,
+        confirmationCode: result.confirmationCode,
+        expiresInMs: Math.max(0, Date.parse(result.expiresAt) - Date.now()),
+      })
+      setSyncStatus(await window.onami.sync.getStatus())
+      setSyncMessage('Pairing code joined.')
+    })
+
+  const confirmPairing = () =>
+    runBusy(async () => {
+      const pairingCode = pairing?.pairingCode || joinCode
+      if (!pairingCode.trim()) throw new Error('Pairing code is required.')
+      const result = await window.onami.sync.confirmPairing({ pairingCode, mode: pairingMode })
+      setSyncStatus(await window.onami.sync.getStatus())
+      setSyncMessage(result.completed ? 'Device paired.' : 'Waiting for the other device.')
     })
 
   return (
@@ -1428,6 +1489,59 @@ function SettingsView({
         <span>Model</span>
         <input value={model} onChange={(event) => setModel(event.target.value)} />
       </label>
+      <div className="settings-group">
+        <div className="settings-state">
+          <CheckCircle2 size={18} />
+          <span>{syncStatus?.paired ? 'Sync device is paired.' : 'Sync device is not paired.'}</span>
+        </div>
+        <label className="field">
+          <span>Sync host</span>
+          <input value={syncHostUrl} onChange={(event) => setSyncHostUrl(event.target.value)} />
+        </label>
+        <div className="button-row">
+          <button className="secondary-action" onClick={saveSyncHost}>
+            Save host
+          </button>
+          <button className="secondary-action" onClick={checkSyncHost}>
+            Check host
+          </button>
+        </div>
+        {syncHealth && (
+          <div className="settings-note">
+            {syncHealth.ok ? `${syncHealth.service ?? 'Sync host'} online` : syncHealth.error}
+          </div>
+        )}
+        <div className="button-row">
+          <button className="secondary-action" onClick={startPairing}>
+            Start pairing
+          </button>
+          <button className="secondary-action" onClick={joinPairing}>
+            Join pairing
+          </button>
+        </div>
+        <label className="field">
+          <span>Pairing code</span>
+          <input value={joinCode} onChange={(event) => setJoinCode(event.target.value)} placeholder="123-456" />
+        </label>
+        {pairing && (
+          <div className="pairing-code-panel">
+            <span>Code {pairing.pairingCode}</span>
+            <strong>{pairing.confirmationCode}</strong>
+          </div>
+        )}
+        <label className="field">
+          <span>Pairing mode</span>
+          <select value={pairingMode} onChange={(event) => setPairingMode(event.target.value as SyncPairingMode)}>
+            <option value="merge">Merge devices</option>
+            <option value="copy-desktop-to-phone">Copy desktop to phone</option>
+            <option value="copy-phone-to-desktop">Copy phone to desktop</option>
+          </select>
+        </label>
+        <button className="primary-action" onClick={confirmPairing}>
+          Confirm pairing
+        </button>
+        {syncMessage && <div className="settings-note">{syncMessage}</div>}
+      </div>
       <button
         className="secondary-action"
         onClick={() => {
