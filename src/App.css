@@ -216,6 +216,15 @@ h2 {
   color: var(--danger-ink);
 }
 
+.browser-shell .topbar {
+  padding-top: max(18px, env(safe-area-inset-top));
+  -webkit-app-region: no-drag;
+}
+
+.browser-shell .window-controls {
+  display: none;
+}
+
 button {
   border: 0;
   font: inherit;

@@ -13,6 +13,9 @@ dist-electron
 release
 dist-ssr
 importTest
+android/.gradle
+android/app/build
+android/app/src/main/assets/public
 *.local
 
 # Editor directories and files

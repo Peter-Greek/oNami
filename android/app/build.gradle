@@ -1,0 +1,17 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'app.onami.flashcards'
+    compileSdk 30
+    buildToolsVersion '30.0.2'
+
+    defaultConfig {
+        applicationId 'app.onami.flashcards'
+        minSdk 23
+        targetSdk 30
+        versionCode 1
+        versionName '0.1.0'
+    }
+}
