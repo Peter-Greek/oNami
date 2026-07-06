@@ -29,6 +29,7 @@ start-host.bat
 ```
 
 The script deletes any old `onami-host` PM2 process, starts the current host through `ecosystem.config.cjs`, and saves the PM2 process list.
+It also checks `http://127.0.0.1:41729/health` before reporting success.
 
 To stop:
 
@@ -38,7 +39,7 @@ stop-host.bat
 
 ## Port Forwarding
 
-The host binds to `127.0.0.1:41729` by default. To expose a public port on Windows with `netsh portproxy`, run `start-host.bat` from an elevated prompt with:
+The host binds to `127.0.0.1:41729` by default. To expose a public port on Windows with `netsh portproxy`, run `start-host.bat` from an elevated administrator prompt with:
 
 ```bat
 set ONAMI_ENABLE_PORTPROXY=1
@@ -51,6 +52,16 @@ This resets:
 
 ```text
 0.0.0.0:41729 -> 127.0.0.1:41729
+```
+
+If `netsh` says the requested operation requires elevation, close the prompt and reopen Command Prompt with "Run as administrator".
+
+If PM2 says the process is online but health fails, run:
+
+```bat
+pm2 logs onami-host --lines 80 --nostream
+netstat -ano | findstr ":41729"
+powershell -NoProfile -Command "Invoke-RestMethod http://127.0.0.1:41729/health"
 ```
 
 For production, put HTTPS in front of the host. Portproxy is useful for a simple OVH Windows setup, but TLS should be handled by a reverse proxy or edge service before real data is synced.
