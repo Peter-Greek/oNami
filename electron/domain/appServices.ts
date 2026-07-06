@@ -32,6 +32,7 @@ import type {
   StudySessionSettings,
   SyncConfirmPairingInput,
   SyncConfirmPairingResult,
+  SyncBackupState,
   SyncEntityType,
   SyncEventPayload,
   SyncEventType,
@@ -392,14 +393,26 @@ export class AppServices {
 
   getSyncStatus(): SyncStatus {
     const stored = this.getStoredSyncSettings()
+    const pendingEvents = this.database.getPendingSyncEventCount()
+    const lastHostCursor = this.database.getSyncHostCursor()
+    const backup = this.database.getSyncBackupSummary()
+    const paired = Boolean(stored.syncGroupId)
     return {
       hostUrl: stored.hostUrl,
       deviceId: stored.deviceId,
       deviceName: stored.deviceName,
       syncGroupId: stored.syncGroupId,
-      paired: Boolean(stored.syncGroupId),
-      pendingEvents: this.database.getPendingSyncEventCount(),
-      lastHostCursor: this.database.getSyncHostCursor(),
+      paired,
+      pendingEvents,
+      lastHostCursor,
+      backedUpEvents: backup.backedUpEvents,
+      lastBackedUpAt: backup.lastBackedUpAt,
+      backupState: this.getSyncBackupState({
+        paired,
+        pendingEvents,
+        backedUpEvents: backup.backedUpEvents,
+        lastHostCursor,
+      }),
     }
   }
 
@@ -546,6 +559,7 @@ export class AppServices {
       appliedEvents,
       pendingEvents: this.database.getPendingSyncEventCount(),
       lastHostCursor: this.database.getSyncHostCursor(),
+      ...this.database.getSyncBackupSummary(),
     }
   }
 
@@ -680,6 +694,18 @@ export class AppServices {
       eventType,
       payload,
     })
+  }
+
+  private getSyncBackupState(input: {
+    paired: boolean
+    pendingEvents: number
+    backedUpEvents: number
+    lastHostCursor: number
+  }): SyncBackupState {
+    if (!input.paired) return 'not-paired'
+    if (input.pendingEvents > 0) return 'needs-sync'
+    if (input.backedUpEvents > 0 || input.lastHostCursor > 0) return 'backed-up'
+    return 'no-data'
   }
 
   private normalizeHostUrl(hostUrl: string): string {

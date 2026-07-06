@@ -16,6 +16,9 @@ import {
   Check,
   CheckCircle2,
   Clock3,
+  CloudCheck,
+  CloudOff,
+  CloudUpload,
   FileUp,
   Flame,
   Layers3,
@@ -73,6 +76,18 @@ const tabs: Array<{ id: View; label: string; icon: typeof BookOpen }> = [
   { id: 'stats', label: 'Stats', icon: BarChart3 },
   { id: 'settings', label: 'Settings', icon: Settings },
 ]
+
+const formatSyncTimestamp = (value: string | null): string | null => {
+  if (!value) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(date)
+}
 
 const viewTitle: Record<View, string> = {
   study: 'Study',
@@ -1385,6 +1400,29 @@ function SettingsView({
   const [pairingMode, setPairingMode] = useState<SyncPairingMode>('merge')
   const [syncRun, setSyncRun] = useState<SyncRunResult | null>(null)
   const [syncMessage, setSyncMessage] = useState('')
+  const BackupIcon =
+    syncStatus?.backupState === 'backed-up'
+      ? CloudCheck
+      : syncStatus?.backupState === 'needs-sync'
+        ? CloudUpload
+        : CloudOff
+  const backupTitle =
+    syncStatus?.backupState === 'backed-up'
+      ? 'Structured data backed up'
+      : syncStatus?.backupState === 'needs-sync'
+        ? 'Backup pending'
+        : syncStatus?.backupState === 'no-data'
+          ? 'No study data uploaded yet'
+          : 'Host backup off'
+  const backupTime = formatSyncTimestamp(syncStatus?.lastBackedUpAt ?? null)
+  const backupDetail =
+    syncStatus?.backupState === 'backed-up'
+      ? `Host stores synced deck, card, and review events${backupTime ? ` as of ${backupTime}` : ''}. Media file backup is not enabled yet.`
+      : syncStatus?.backupState === 'needs-sync'
+        ? `${syncStatus.pendingEvents} local changes need Sync now before the host is current.`
+        : syncStatus?.backupState === 'no-data'
+          ? 'Run Sync now after adding or importing cards. The host stores synced events; it is not only a wireless gateway.'
+          : 'Pair this device to back up structured study data to the host.'
 
   useEffect(() => {
     window.onami.ai.getSettings().then((next) => {
@@ -1507,9 +1545,18 @@ function SettingsView({
           <span>{syncStatus?.paired ? 'Sync device is paired.' : 'Sync device is not paired.'}</span>
         </div>
         {syncStatus && (
-          <div className="settings-note">
-            Pending {syncStatus.pendingEvents} / Cursor {syncStatus.lastHostCursor}
-          </div>
+          <>
+            <div className={`settings-state backup-state ${syncStatus.backupState}`}>
+              <BackupIcon size={18} />
+              <span>{backupTitle}</span>
+            </div>
+            <div className="settings-note">
+              {backupDetail}
+              <br />
+              Uploaded {syncStatus.backedUpEvents} / Pending {syncStatus.pendingEvents} / Cursor{' '}
+              {syncStatus.lastHostCursor}
+            </div>
+          </>
         )}
         <label className="field">
           <span>Sync host</span>

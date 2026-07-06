@@ -471,6 +471,29 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
+.backup-state {
+  justify-content: flex-start;
+  padding: 0 11px;
+}
+
+.backup-state.backed-up {
+  border-color: rgba(47, 112, 108, 0.22);
+  background: var(--teal-soft);
+  color: var(--teal-ink);
+}
+
+.backup-state.needs-sync {
+  border-color: rgba(213, 161, 67, 0.34);
+  background: var(--notice-bg);
+  color: var(--notice-ink);
+}
+
+.backup-state.no-data,
+.backup-state.not-paired {
+  background: var(--surface);
+  color: var(--muted);
+}
+
 .pairing-code-panel {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

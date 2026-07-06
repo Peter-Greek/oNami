@@ -101,6 +101,11 @@ export interface RemoteSyncEvent extends SyncEventRecord {
   hostEventId: number
 }
 
+export interface SyncBackupSummary {
+  backedUpEvents: number
+  lastBackedUpAt: string | null
+}
+
 const nowIso = () => new Date().toISOString()
 
 const json = <T>(value: T): string => JSON.stringify(value)
@@ -736,6 +741,20 @@ export class OnamiDatabase {
       .prepare('SELECT COUNT(*) AS count FROM sync_outbox WHERE pushed_at IS NULL')
       .get() as Row
     return toNumber(row.count)
+  }
+
+  getSyncBackupSummary(): SyncBackupSummary {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS backed_up_events, MAX(pushed_at) AS last_backed_up_at
+         FROM sync_outbox
+         WHERE pushed_at IS NOT NULL`
+      )
+      .get() as Row
+    return {
+      backedUpEvents: toNumber(row.backed_up_events),
+      lastBackedUpAt: row.last_backed_up_at ? toStringValue(row.last_backed_up_at) : null,
+    }
   }
 
   getSyncHostCursor(): number {

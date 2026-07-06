@@ -680,6 +680,9 @@ export const installBrowserOnami = () => {
         paired: false,
         pendingEvents: 0,
         lastHostCursor: 0,
+        backedUpEvents: 0,
+        lastBackedUpAt: null,
+        backupState: 'not-paired',
       }),
       saveSettings: async (input) => {
         const hostUrl = input.hostUrl.trim().replace(/\/+$/, '') || 'http://147.135.31.128:41729'
@@ -692,6 +695,9 @@ export const installBrowserOnami = () => {
           paired: false,
           pendingEvents: 0,
           lastHostCursor: 0,
+          backedUpEvents: 0,
+          lastBackedUpAt: null,
+          backupState: 'not-paired',
         }
       },
       checkHealth: async () => {

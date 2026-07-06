@@ -222,6 +222,8 @@ export interface AppStats {
 
 export type SyncPairingMode = 'merge' | 'copy-desktop-to-phone' | 'copy-phone-to-desktop'
 
+export type SyncBackupState = 'not-paired' | 'no-data' | 'needs-sync' | 'backed-up'
+
 export type SyncEntityType = 'deck' | 'card' | 'review'
 
 export type SyncEventType = 'deck.upsert' | 'deck.delete' | 'card.upsert' | 'card.delete' | 'review.answer'
@@ -322,6 +324,9 @@ export interface SyncStatus {
   paired: boolean
   pendingEvents: number
   lastHostCursor: number
+  backedUpEvents: number
+  lastBackedUpAt: string | null
+  backupState: SyncBackupState
 }
 
 export interface SaveSyncSettingsInput {
@@ -369,6 +374,8 @@ export interface SyncRunResult {
   appliedEvents: number
   pendingEvents: number
   lastHostCursor: number
+  backedUpEvents: number
+  lastBackedUpAt: string | null
 }
 
 export interface OnamiApi {
