@@ -10,6 +10,14 @@ if "%ONAMI_PUBLIC_PORT%"=="" set "ONAMI_PUBLIC_PORT=41729"
 if "%ONAMI_PUBLIC_LISTEN%"=="" set "ONAMI_PUBLIC_LISTEN=0.0.0.0"
 if "%ONAMI_ENABLE_PORTPROXY%"=="" set "ONAMI_ENABLE_PORTPROXY=0"
 
+if "%ONAMI_ENABLE_PORTPROXY%"=="1" if "%ONAMI_HOST_BIND%"=="127.0.0.1" if "%ONAMI_HOST_PORT%"=="%ONAMI_PUBLIC_PORT%" (
+  echo Portproxy cannot forward %ONAMI_PUBLIC_PORT% to 127.0.0.1:%ONAMI_HOST_PORT%; that creates a loop.
+  echo Use a different internal host port, for example:
+  echo   set ONAMI_PUBLIC_PORT=41729
+  echo   set ONAMI_HOST_PORT=41730
+  exit /b 1
+)
+
 where pm2 >nul 2>nul
 if errorlevel 1 (
   echo pm2 was not found on PATH.

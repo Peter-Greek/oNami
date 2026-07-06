@@ -44,15 +44,17 @@ The host binds to `127.0.0.1:41729` by default. To expose a public port on Windo
 ```bat
 set ONAMI_ENABLE_PORTPROXY=1
 set ONAMI_PUBLIC_PORT=41729
-set ONAMI_HOST_PORT=41729
+set ONAMI_HOST_PORT=41730
 start-host.bat
 ```
 
 This resets:
 
 ```text
-0.0.0.0:41729 -> 127.0.0.1:41729
+0.0.0.0:41729 -> 127.0.0.1:41730
 ```
+
+Do not forward `41729` to `127.0.0.1:41729`. On Windows that can create a portproxy loop where requests connect, immediately close, and fill `netstat` with thousands of `TIME_WAIT` rows.
 
 If `netsh` says the requested operation requires elevation, close the prompt and reopen Command Prompt with "Run as administrator".
 
@@ -60,8 +62,8 @@ If PM2 says the process is online but health fails, run:
 
 ```bat
 pm2 logs onami-host --lines 80 --nostream
-netstat -ano | findstr ":41729"
-powershell -NoProfile -Command "Invoke-RestMethod http://127.0.0.1:41729/health"
+netstat -ano | findstr ":41730"
+powershell -NoProfile -Command "Invoke-RestMethod http://127.0.0.1:41730/health"
 ```
 
 For production, put HTTPS in front of the host. Portproxy is useful for a simple OVH Windows setup, but TLS should be handled by a reverse proxy or edge service before real data is synced.
