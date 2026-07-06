@@ -98,7 +98,11 @@ DATABASE_URL=postgresql://onami_user:<password>@localhost:5432/onami_sync?schema
 ONAMI_PAIRING_TTL_MS=600000
 ONAMI_DEVICE_TOKEN_TTL_MS=604800000
 ONAMI_MAX_JSON_BYTES=1048576
+ONAMI_MAX_BLOB_BYTES=67108864
+ONAMI_MEDIA_DIR=./media-store
 ```
+
+`ONAMI_MAX_BLOB_BYTES` caps a single full-data snapshot or media upload; `ONAMI_MEDIA_DIR` is where content-addressed media blobs are written on disk.
 
 ## API Shape
 
@@ -112,9 +116,14 @@ POST /devices/token
 GET  /sync/events?after=<cursor>&limit=<n>
 POST /sync/events
 POST /sync/ack
+POST /sync/snapshot
+GET  /sync/snapshot
+POST /sync/snapshot/ack
+POST /media
+GET  /media/:sha256
 ```
 
-`/sync/*` endpoints require:
+`/sync/*` and `/media` endpoints require:
 
 ```text
 Authorization: Bearer <device token>
@@ -137,6 +146,21 @@ The host verifies the signature against the paired device's stored public key.
 5. Host creates or updates the sync group.
 6. Each device requests a device token.
 7. Devices push local outbox events, pull remote events, and ack the cursor.
+
+## Full Snapshot Handoff
+
+When a fresh device pairs, the source device uploads a one-time full-data bundle
+(decks, cards with their current review state, the entire review-log history that
+drives stats/streak, and media metadata) via `POST /sync/snapshot`, and uploads
+each referenced media blob via `POST /media` (content-addressed by SHA-256). The
+fresh device pulls the bundle with `GET /sync/snapshot`, downloads blobs with
+`GET /media/:sha256`, then calls `POST /sync/snapshot/ack`, which deletes the
+snapshot row **and its media blobs** from the host. All later changes flow through
+the incremental `/sync/events` log. There is one pending snapshot per sync group;
+a device never receives its own snapshot.
+
+Redeploying with `start-host.bat` runs `prisma generate` + `prisma db push`, which
+creates the new `sync_snapshots` table automatically — no manual migration needed.
 
 ## Data
 

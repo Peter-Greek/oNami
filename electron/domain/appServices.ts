@@ -39,7 +39,10 @@ import type {
   SyncHealthResult,
   SyncJoinPairingInput,
   SyncJoinPairingResult,
+  SyncMediaBlob,
+  SyncMediaRecord,
   SyncRunResult,
+  SyncSnapshotResponse,
   ThemeMode,
   SyncStartPairingResult,
   SyncStatus,
@@ -60,6 +63,9 @@ interface StoredSyncSettings {
   syncGroupId: string | null
   deviceToken: string | null
   deviceTokenExpiresAt: string | null
+  // Set when this device becomes the snapshot source; cleared once a full
+  // snapshot upload succeeds. Persisted so a failed seed is retried on next sync.
+  seedSnapshotPending: boolean
 }
 
 const AI_SETTINGS_KEY = 'ai.settings'
@@ -496,8 +502,16 @@ export class AppServices {
         deviceToken: token.token,
         deviceTokenExpiresAt: token.expiresAt,
       })
+      // The desktop is the snapshot source for every mode except an explicit
+      // phone-to-desktop copy. Mark this device as the source of a one-time
+      // full-data bundle (decks, cards, review-log history for stats/streak, and
+      // media) and try to seed it now; a failure is retried on the next sync.
       if (input.mode !== 'copy-phone-to-desktop') {
-        this.queueFullSyncSnapshot()
+        this.saveStoredSyncSettings({
+          ...this.getStoredSyncSettings(),
+          seedSnapshotPending: true,
+        })
+        await this.maybeSeedSnapshot()
       }
     }
 
@@ -509,6 +523,14 @@ export class AppServices {
     if (!stored.syncGroupId) throw new Error('Pair this device before syncing.')
 
     const token = await this.getValidSyncDeviceToken()
+
+    // If this device is the snapshot source, (re)seed the one-time bundle. If it
+    // is a fresh device, hydrate from the source's snapshot. These are mutually
+    // exclusive in practice — a source has no snapshot to pull, a target has no
+    // pending seed — so ordering is safe.
+    await this.maybeSeedSnapshot()
+    const hydratedFromSnapshot = await this.hydrateFromSnapshot(token)
+
     let pushedEvents = 0
     while (true) {
       const pending = this.database.listPendingSyncEvents(100)
@@ -551,7 +573,7 @@ export class AppServices {
       body: { lastEventId: cursor },
     })
 
-    if (appliedEvents > 0) this.sessions.clear()
+    if (appliedEvents > 0 || hydratedFromSnapshot) this.sessions.clear()
 
     return {
       pushedEvents,
@@ -561,6 +583,85 @@ export class AppServices {
       lastHostCursor: this.database.getSyncHostCursor(),
       ...this.database.getSyncBackupSummary(),
     }
+  }
+
+  private async maybeSeedSnapshot(): Promise<void> {
+    const stored = this.getStoredSyncSettings()
+    if (!stored.seedSnapshotPending || !stored.syncGroupId) return
+    try {
+      await this.uploadFullSnapshot()
+      this.saveStoredSyncSettings({
+        ...this.getStoredSyncSettings(),
+        seedSnapshotPending: false,
+      })
+    } catch {
+      // Leave the flag set so the next sync retries seeding the snapshot.
+    }
+  }
+
+  private async uploadFullSnapshot(): Promise<void> {
+    const stored = this.getStoredSyncSettings()
+    if (!stored.deviceId || !stored.syncGroupId) return
+
+    const token = await this.getValidSyncDeviceToken()
+    const snapshot = this.database.buildFullSnapshot()
+
+    // Upload blobs first so the target can resolve every media reference.
+    for (const media of snapshot.media) {
+      await this.uploadMediaBlob(media, token)
+    }
+
+    await this.syncHostRequest<{ ok: boolean }>('/sync/snapshot', {
+      method: 'POST',
+      token,
+      body: { snapshot },
+    })
+  }
+
+  private async hydrateFromSnapshot(token: string): Promise<boolean> {
+    let response: SyncSnapshotResponse
+    try {
+      response = await this.syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', {
+        method: 'GET',
+        token,
+      })
+    } catch {
+      // A host without snapshot support falls back to event-only sync.
+      return false
+    }
+    if (!response.snapshot) return false
+
+    for (const media of response.snapshot.media) {
+      await this.downloadMediaBlob(media, token)
+    }
+    this.database.applySnapshot(response.snapshot)
+
+    // Confirm receipt so the host can clean up the snapshot bundle and its media.
+    await this.syncHostRequest<{ ok: boolean }>('/sync/snapshot/ack', {
+      method: 'POST',
+      token,
+      body: {},
+    })
+    return true
+  }
+
+  private async uploadMediaBlob(media: SyncMediaRecord, token: string): Promise<void> {
+    const data = this.database.readMediaBytesByHash(media.sha256)
+    if (!data) return
+    await this.syncHostRequest<{ sha256: string }>('/media', {
+      method: 'POST',
+      token,
+      body: { sha256: media.sha256, mimeType: media.mimeType, dataBase64: data.toString('base64') },
+    })
+  }
+
+  private async downloadMediaBlob(media: SyncMediaRecord, token: string): Promise<void> {
+    if (this.database.hasMediaHash(media.sha256)) return
+    const blob = await this.syncHostRequest<SyncMediaBlob>(`/media/${media.sha256}`, {
+      method: 'GET',
+      token,
+    })
+    this.database.saveMediaBlob(media, Buffer.from(blob.dataBase64, 'base64'))
   }
 
   private rewriteMedia(html: string, mediaIdByName: Map<string, string>): string {
@@ -609,6 +710,7 @@ export class AppServices {
       syncGroupId: null,
       deviceToken: null,
       deviceTokenExpiresAt: null,
+      seedSnapshotPending: false,
     })
   }
 

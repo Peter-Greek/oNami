@@ -305,6 +305,51 @@ export interface SyncReviewAnswerPayload {
 
 export type SyncEventPayload = SyncDeckUpsertPayload | SyncCardUpsertPayload | SyncReviewAnswerPayload | Record<string, never>
 
+export interface SyncReviewLogRecord {
+  id: string
+  cardId: string
+  reviewedAt: string
+  rating: ReviewRating
+  elapsedMs: number
+  revealMs: number
+  answerMs: number
+  previousDueAt: string | null
+  nextDueAt: string | null
+}
+
+export interface SyncMediaRecord {
+  id: string
+  sha256: string
+  mimeType: string
+  byteSize: number
+  originalName: string
+}
+
+/**
+ * A one-time full-data bundle used to hydrate a fresh device (decks, cards with
+ * their current review state, the full review-log history for stats/streak, and
+ * media metadata). Media blobs are transferred separately, content-addressed by
+ * sha256. Delivered through the host and cleaned up once the target device acks.
+ */
+export interface SyncSnapshotBundle {
+  version: 1
+  decks: SyncDeckRecord[]
+  cards: SyncCardUpsertPayload[]
+  reviewLogs: SyncReviewLogRecord[]
+  media: SyncMediaRecord[]
+}
+
+export interface SyncSnapshotResponse {
+  snapshot: SyncSnapshotBundle | null
+  sourceDeviceId: string | null
+}
+
+export interface SyncMediaBlob {
+  sha256: string
+  mimeType: string
+  dataBase64: string
+}
+
 export interface SyncEventRecord {
   eventId: string
   sourceDeviceId: string

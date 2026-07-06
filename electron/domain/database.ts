@@ -21,7 +21,10 @@ import type {
   SyncEventPayload,
   SyncEventRecord,
   SyncEventType,
+  SyncMediaRecord,
   SyncReviewAnswerPayload,
+  SyncReviewLogRecord,
+  SyncSnapshotBundle,
   UpdateCardInput,
 } from '../../src/shared/types'
 
@@ -898,6 +901,128 @@ export class OnamiDatabase {
 
     tx()
     return true
+  }
+
+  listReviewLogRecords(): SyncReviewLogRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, card_id, reviewed_at, rating, elapsed_ms,
+          COALESCE(reveal_ms, 0) AS reveal_ms, COALESCE(answer_ms, 0) AS answer_ms,
+          previous_due_at, next_due_at
+         FROM review_log
+         ORDER BY reviewed_at`
+      )
+      .all() as Row[]
+    return rows.map((row) => ({
+      id: toStringValue(row.id),
+      cardId: toStringValue(row.card_id),
+      reviewedAt: toStringValue(row.reviewed_at),
+      rating: toStringValue(row.rating) as ReviewRating,
+      elapsedMs: toNumber(row.elapsed_ms),
+      revealMs: toNumber(row.reveal_ms),
+      answerMs: toNumber(row.answer_ms),
+      previousDueAt: row.previous_due_at ? toStringValue(row.previous_due_at) : null,
+      nextDueAt: row.next_due_at ? toStringValue(row.next_due_at) : null,
+    }))
+  }
+
+  insertReviewLogRecord(record: SyncReviewLogRecord): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO review_log
+          (id, card_id, reviewed_at, rating, elapsed_ms, reveal_ms, answer_ms, previous_due_at, next_due_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        record.id,
+        record.cardId,
+        record.reviewedAt,
+        record.rating,
+        record.elapsedMs,
+        record.revealMs,
+        record.answerMs,
+        record.previousDueAt,
+        record.nextDueAt
+      )
+  }
+
+  listMediaRecords(): SyncMediaRecord[] {
+    const rows = this.db.prepare('SELECT * FROM media').all() as Row[]
+    const records: SyncMediaRecord[] = []
+    for (const row of rows) {
+      const storedPath = toStringValue(row.stored_path)
+      if (!fs.existsSync(storedPath)) continue
+      records.push({
+        id: toStringValue(row.id),
+        sha256: toStringValue(row.hash),
+        mimeType: toStringValue(row.mime_type),
+        byteSize: fs.statSync(storedPath).size,
+        originalName: toStringValue(row.original_name),
+      })
+    }
+    return records
+  }
+
+  readMediaBytesByHash(hash: string): Buffer | null {
+    const row = this.db.prepare('SELECT stored_path FROM media WHERE hash = ?').get(hash) as Row | undefined
+    if (!row) return null
+    const storedPath = toStringValue(row.stored_path)
+    return fs.existsSync(storedPath) ? fs.readFileSync(storedPath) : null
+  }
+
+  hasMediaHash(hash: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM media WHERE hash = ?').get(hash))
+  }
+
+  /** Persist a media blob received from another device, preserving its media id so card references resolve. */
+  saveMediaBlob(record: SyncMediaRecord, data: Buffer): void {
+    const ext =
+      path.extname(record.originalName) || `.${mime.extension(record.mimeType || '') || 'bin'}`
+    const storedPath = path.join(this.mediaDir, `${record.sha256}${ext.toLowerCase()}`)
+    if (!fs.existsSync(storedPath)) fs.writeFileSync(storedPath, data)
+
+    const byId = this.db.prepare('SELECT id FROM media WHERE id = ?').get(record.id) as Row | undefined
+    if (byId) {
+      this.db
+        .prepare('UPDATE media SET stored_path = ?, mime_type = ?, original_name = ? WHERE id = ?')
+        .run(storedPath, record.mimeType, record.originalName, record.id)
+      return
+    }
+    // A different id already owns this content-addressed blob — nothing more to store.
+    if (this.hasMediaHash(record.sha256)) return
+
+    this.db
+      .prepare(
+        `INSERT INTO media (id, original_name, stored_path, mime_type, hash, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(record.id, record.originalName, storedPath, record.mimeType, record.sha256, nowIso())
+  }
+
+  buildFullSnapshot(): SyncSnapshotBundle {
+    return {
+      version: 1,
+      decks: this.listSyncDeckPayloads().map((payload) => payload.deck),
+      cards: this.listSyncCardPayloads(),
+      reviewLogs: this.listReviewLogRecords(),
+      media: this.listMediaRecords(),
+    }
+  }
+
+  /** Apply a full-data snapshot (decks, cards, review-log history). Media blobs are stored separately via saveMediaBlob. */
+  applySnapshot(bundle: SyncSnapshotBundle): void {
+    const tx = this.db.transaction(() => {
+      for (const deck of bundle.decks) {
+        this.applyDeckUpsert({ version: 1, deck })
+      }
+      for (const card of bundle.cards) {
+        this.applyCardUpsert(card)
+      }
+      for (const log of bundle.reviewLogs) {
+        if (this.hasCard(log.cardId)) this.insertReviewLogRecord(log)
+      }
+    })
+    tx()
   }
 
   getStats(deckId?: string | null): AppStats {

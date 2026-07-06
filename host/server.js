@@ -30,12 +30,26 @@ const config = {
   pairingTtlMs: Number(process.env.ONAMI_PAIRING_TTL_MS ?? 10 * 60 * 1000),
   tokenTtlMs: Number(process.env.ONAMI_DEVICE_TOKEN_TTL_MS ?? 7 * 24 * 60 * 60 * 1000),
   maxJsonBytes: Number(process.env.ONAMI_MAX_JSON_BYTES ?? 1024 * 1024),
+  // Full-data snapshots and single media blobs are much larger than incremental events.
+  maxBlobBytes: Number(process.env.ONAMI_MAX_BLOB_BYTES ?? 64 * 1024 * 1024),
+  mediaDir: process.env.ONAMI_MEDIA_DIR ?? path.join(__dirname, 'media-store'),
 }
 
 if (!process.env.DATABASE_URL) {
   console.error('DATABASE_URL is required. Run host/setup.bat or create host/.env.')
   process.exit(1)
 }
+
+fs.mkdirSync(config.mediaDir, { recursive: true })
+
+const sanitizeSha256 = (value) => {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/i.test(value)) {
+    throw httpError(400, 'sha256 must be a 64-character hex string.')
+  }
+  return value.toLowerCase()
+}
+
+const mediaBlobPath = (sha256) => path.join(config.mediaDir, sanitizeSha256(sha256))
 
 const prisma = new PrismaClient()
 
@@ -205,13 +219,13 @@ const authenticate = async (request) => {
   return device
 }
 
-const readJson = async (request) => {
+const readJson = async (request, maxBytes = config.maxJsonBytes) => {
   const chunks = []
   let size = 0
 
   for await (const chunk of request) {
     size += chunk.length
-    if (size > config.maxJsonBytes) throw httpError(413, 'Request body is too large.')
+    if (size > maxBytes) throw httpError(413, 'Request body is too large.')
     chunks.push(chunk)
   }
 
@@ -459,6 +473,120 @@ const route = async (request, response) => {
       create: { syncGroupId: device.syncGroupId, deviceId: device.id, lastEventId },
       update: { lastEventId: Math.max(existing?.lastEventId ?? 0, lastEventId) },
     })
+
+    return send(response, 200, { ok: true })
+  }
+
+  if (request.method === 'POST' && url.pathname === '/media') {
+    const device = await authenticate(request)
+    const body = await readJson(request, config.maxBlobBytes)
+    const sha256 = sanitizeSha256(requiredString(body, 'sha256'))
+    const mimeType = requiredString(body, 'mimeType')
+    const dataBase64 = requiredString(body, 'dataBase64')
+    const data = Buffer.from(dataBase64, 'base64')
+
+    if (createHash('sha256').update(data).digest('hex') !== sha256) {
+      throw httpError(400, 'Uploaded media does not match its sha256.')
+    }
+
+    fs.writeFileSync(mediaBlobPath(sha256), data)
+    await prisma.mediaObject.upsert({
+      where: { syncGroupId_sha256: { syncGroupId: device.syncGroupId, sha256 } },
+      create: {
+        syncGroupId: device.syncGroupId,
+        sha256,
+        byteSize: data.length,
+        mimeType,
+        storageKey: sha256,
+      },
+      update: { byteSize: data.length, mimeType, storageKey: sha256 },
+    })
+
+    return send(response, 200, { sha256, byteSize: data.length })
+  }
+
+  if (request.method === 'GET' && url.pathname.startsWith('/media/')) {
+    const device = await authenticate(request)
+    const sha256 = sanitizeSha256(decodeURIComponent(url.pathname.slice('/media/'.length)))
+    const object = await prisma.mediaObject.findUnique({
+      where: { syncGroupId_sha256: { syncGroupId: device.syncGroupId, sha256 } },
+    })
+    const blobPath = mediaBlobPath(sha256)
+    if (!object || !fs.existsSync(blobPath)) throw httpError(404, 'Media not found.')
+
+    return send(response, 200, {
+      sha256,
+      mimeType: object.mimeType,
+      dataBase64: fs.readFileSync(blobPath).toString('base64'),
+    })
+  }
+
+  if (request.method === 'POST' && url.pathname === '/sync/snapshot') {
+    const device = await authenticate(request)
+    const body = await readJson(request, config.maxBlobBytes)
+    const snapshot = body.snapshot
+    if (!snapshot || typeof snapshot !== 'object') throw httpError(400, 'snapshot object is required.')
+
+    await prisma.syncSnapshot.upsert({
+      where: { syncGroupId: device.syncGroupId },
+      create: {
+        syncGroupId: device.syncGroupId,
+        sourceDeviceId: device.id,
+        payloadJson: snapshot,
+      },
+      update: { sourceDeviceId: device.id, payloadJson: snapshot },
+    })
+
+    return send(response, 200, { ok: true })
+  }
+
+  if (request.method === 'GET' && url.pathname === '/sync/snapshot') {
+    const device = await authenticate(request)
+    const snapshot = await prisma.syncSnapshot.findUnique({
+      where: { syncGroupId: device.syncGroupId },
+    })
+
+    // A device never consumes its own snapshot.
+    if (!snapshot || snapshot.sourceDeviceId === device.id) {
+      return send(response, 200, { snapshot: null, sourceDeviceId: null })
+    }
+
+    return send(response, 200, {
+      snapshot: snapshot.payloadJson,
+      sourceDeviceId: snapshot.sourceDeviceId,
+    })
+  }
+
+  if (request.method === 'POST' && url.pathname === '/sync/snapshot/ack') {
+    const device = await authenticate(request)
+    const snapshot = await prisma.syncSnapshot.findUnique({
+      where: { syncGroupId: device.syncGroupId },
+    })
+
+    // Only a non-source device confirming receipt clears the snapshot + its media.
+    if (snapshot && snapshot.sourceDeviceId !== device.id) {
+      const media = Array.isArray(snapshot.payloadJson?.media) ? snapshot.payloadJson.media : []
+      const hashes = [...new Set(media.map((item) => item?.sha256).filter((value) => typeof value === 'string'))]
+
+      await prisma.$transaction([
+        prisma.syncSnapshot.delete({ where: { syncGroupId: device.syncGroupId } }),
+        ...(hashes.length
+          ? [
+              prisma.mediaObject.deleteMany({
+                where: { syncGroupId: device.syncGroupId, sha256: { in: hashes } },
+              }),
+            ]
+          : []),
+      ])
+
+      for (const sha256 of hashes) {
+        try {
+          fs.rmSync(mediaBlobPath(sha256), { force: true })
+        } catch {
+          // Best-effort blob cleanup; the DB row is already gone.
+        }
+      }
+    }
 
     return send(response, 200, { ok: true })
   }

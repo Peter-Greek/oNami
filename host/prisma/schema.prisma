@@ -16,6 +16,7 @@ model SyncGroup {
   events       SyncEvent[]
   cursors      DeviceCursor[]
   mediaObjects MediaObject[]
+  snapshot     SyncSnapshot?
 
   @@map("sync_groups")
 }
@@ -108,6 +109,22 @@ model MediaObject {
 
   @@unique([syncGroupId, sha256])
   @@map("media_objects")
+}
+
+/// One-time full-data bundle uploaded by a source device to hydrate a freshly
+/// paired device. One pending snapshot per sync group; deleted (with its media)
+/// once a non-source device acknowledges receipt.
+model SyncSnapshot {
+  id             String   @id @default(uuid()) @db.Uuid
+  syncGroupId    String   @unique @map("sync_group_id") @db.Uuid
+  sourceDeviceId String   @map("source_device_id") @db.Uuid
+  payloadJson    Json     @map("payload_json")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  syncGroup SyncGroup @relation(fields: [syncGroupId], references: [id], onDelete: Cascade)
+
+  @@map("sync_snapshots")
 }
 
 model DeviceToken {
