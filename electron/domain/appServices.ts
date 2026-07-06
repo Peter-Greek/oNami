@@ -7,7 +7,7 @@ import { safeStorage } from 'electron'
 import { z } from 'zod'
 
 import { ApkgImporter } from './apkgImporter'
-import { OnamiDatabase } from './database'
+import { OnamiDatabase, type RemoteSyncEvent } from './database'
 import { SchedulerService, selectCardsForMode, type StudySessionRuntime } from './scheduler'
 import type {
   AiGenerationOptions,
@@ -32,9 +32,13 @@ import type {
   StudySessionSettings,
   SyncConfirmPairingInput,
   SyncConfirmPairingResult,
+  SyncEntityType,
+  SyncEventPayload,
+  SyncEventType,
   SyncHealthResult,
   SyncJoinPairingInput,
   SyncJoinPairingResult,
+  SyncRunResult,
   ThemeMode,
   SyncStartPairingResult,
   SyncStatus,
@@ -101,15 +105,21 @@ export class AppServices {
   }
 
   createDeck(input: CreateDeckInput): DeckSummary {
-    return this.database.createDeck(input)
+    const deck = this.database.createDeck(input)
+    this.queueDeckUpsert(deck.id)
+    return deck
   }
 
   deleteDeck(deckId: string): void {
     this.database.deleteDeck(deckId)
+    this.queueSyncEvent('deck', deckId, 'deck.delete', {})
   }
 
   resetDeckScheduling(deckId: string): void {
     this.database.resetDeckScheduling(deckId)
+    for (const card of this.database.listCards(deckId)) {
+      this.queueCardUpsert(card.id)
+    }
     this.sessions.clear()
   }
 
@@ -122,15 +132,20 @@ export class AppServices {
   }
 
   createCard(input: CreateCardInput) {
-    return this.database.createCard(input)
+    const card = this.database.createCard(input)
+    this.queueCardUpsert(card.id)
+    return card
   }
 
   updateCard(input: UpdateCardInput) {
-    return this.database.updateCard(input)
+    const card = this.database.updateCard(input)
+    this.queueCardUpsert(card.id)
+    return card
   }
 
   deleteCard(cardId: string): void {
     this.database.deleteCard(cardId)
+    this.queueSyncEvent('card', cardId, 'card.delete', {})
   }
 
   importApkg(filePath: string, options: ImportApkgOptions): ImportResult {
@@ -234,6 +249,7 @@ export class AppServices {
 
       const resultDeckId = firstDeckId || firstCardDeckId || fallbackDeckId
       const deckName = resultDeckId ? this.database.getDeckSummary(resultDeckId).name : parsed.rootDeckName
+      this.queueFullSyncSnapshot()
       return {
         deckId: resultDeckId,
         deckName,
@@ -274,7 +290,25 @@ export class AppServices {
   answer(input: AnswerInput): AnswerResult {
     const session = this.sessions.get(input.sessionId)
     if (!session) throw new Error('Study session not found.')
-    return this.scheduler.answer(input, session)
+    const previous = this.database.getReviewState(input.cardId)
+    const result = this.scheduler.answer(input, session)
+    const reviewedAt = this.database.getReviewState(input.cardId)?.lastReviewedAt ?? new Date().toISOString()
+    this.queueSyncEvent(
+      'review',
+      input.cardId,
+      'review.answer',
+      this.database.buildReviewAnswerSyncPayload({
+        cardId: input.cardId,
+        reviewedAt,
+        rating: input.rating,
+        elapsedMs: input.elapsedMs ?? 0,
+        revealMs: input.revealMs ?? 0,
+        answerMs: input.answerMs ?? 0,
+        previousDueAt: previous?.dueAt ?? null,
+        nextDueAt: result.nextDueAt,
+      })
+    )
+    return result
   }
 
   getAiSettings(): AiSettings {
@@ -364,6 +398,8 @@ export class AppServices {
       deviceName: stored.deviceName,
       syncGroupId: stored.syncGroupId,
       paired: Boolean(stored.syncGroupId),
+      pendingEvents: this.database.getPendingSyncEventCount(),
+      lastHostCursor: this.database.getSyncHostCursor(),
     }
   }
 
@@ -447,9 +483,70 @@ export class AppServices {
         deviceToken: token.token,
         deviceTokenExpiresAt: token.expiresAt,
       })
+      if (input.mode !== 'copy-phone-to-desktop') {
+        this.queueFullSyncSnapshot()
+      }
     }
 
     return result
+  }
+
+  async syncNow(): Promise<SyncRunResult> {
+    const stored = this.getStoredSyncSettings()
+    if (!stored.syncGroupId) throw new Error('Pair this device before syncing.')
+
+    const token = await this.getValidSyncDeviceToken()
+    let pushedEvents = 0
+    while (true) {
+      const pending = this.database.listPendingSyncEvents(100)
+      if (pending.length === 0) break
+      await this.syncHostRequest<{ accepted: number; highestAcceptedSequence: number }>('/sync/events', {
+        method: 'POST',
+        token,
+        body: { events: pending },
+      })
+      this.database.markSyncEventsPushed(pending.map((event) => event.eventId))
+      pushedEvents += pending.length
+    }
+
+    let pulledEvents = 0
+    let appliedEvents = 0
+    let cursor = this.database.getSyncHostCursor()
+
+    while (true) {
+      const result = await this.syncHostRequest<{
+        events: RemoteSyncEvent[]
+        nextCursor: number
+      }>(`/sync/events?after=${cursor}&limit=100`, {
+        method: 'GET',
+        token,
+      })
+
+      pulledEvents += result.events.length
+      for (const event of result.events) {
+        if (this.database.applyRemoteSyncEvent(event)) appliedEvents += 1
+      }
+      cursor = result.nextCursor
+      this.database.setSyncHostCursor(cursor)
+
+      if (result.events.length < 100) break
+    }
+
+    await this.syncHostRequest<{ ok: boolean }>('/sync/ack', {
+      method: 'POST',
+      token,
+      body: { lastEventId: cursor },
+    })
+
+    if (appliedEvents > 0) this.sessions.clear()
+
+    return {
+      pushedEvents,
+      pulledEvents,
+      appliedEvents,
+      pendingEvents: this.database.getPendingSyncEventCount(),
+      lastHostCursor: this.database.getSyncHostCursor(),
+    }
   }
 
   private rewriteMedia(html: string, mediaIdByName: Map<string, string>): string {
@@ -548,6 +645,43 @@ export class AppServices {
     }
   }
 
+  private queueDeckUpsert(deckId: string): void {
+    this.queueSyncEvent('deck', deckId, 'deck.upsert', this.database.buildDeckSyncPayload(deckId))
+  }
+
+  private queueCardUpsert(cardId: string): void {
+    this.queueSyncEvent('card', cardId, 'card.upsert', this.database.buildCardSyncPayload(cardId))
+  }
+
+  private queueFullSyncSnapshot(): void {
+    const stored = this.getStoredSyncSettings()
+    if (!stored.deviceId || !stored.syncGroupId) return
+
+    for (const deck of this.database.listSyncDeckPayloads()) {
+      this.queueSyncEvent('deck', deck.deck.id, 'deck.upsert', deck)
+    }
+    for (const card of this.database.listSyncCardPayloads()) {
+      this.queueSyncEvent('card', card.card.id, 'card.upsert', card)
+    }
+  }
+
+  private queueSyncEvent(
+    entityType: SyncEntityType,
+    entityId: string,
+    eventType: SyncEventType,
+    payload: SyncEventPayload
+  ): void {
+    const stored = this.getStoredSyncSettings()
+    if (!stored.deviceId || !stored.syncGroupId) return
+    this.database.enqueueSyncEvent({
+      deviceId: stored.deviceId,
+      entityType,
+      entityId,
+      eventType,
+      payload,
+    })
+  }
+
   private normalizeHostUrl(hostUrl: string): string {
     const trimmed = hostUrl.trim().replace(/\/+$/, '')
     if (!trimmed) return DEFAULT_SYNC_HOST_URL
@@ -556,6 +690,25 @@ export class AppServices {
       throw new Error('Sync host URL must start with http:// or https://.')
     }
     return parsed.toString().replace(/\/+$/, '')
+  }
+
+  private async getValidSyncDeviceToken(): Promise<string> {
+    const stored = this.getStoredSyncSettings()
+    if (
+      stored.deviceToken &&
+      stored.deviceTokenExpiresAt &&
+      Date.parse(stored.deviceTokenExpiresAt) - Date.now() > 5 * 60 * 1000
+    ) {
+      return stored.deviceToken
+    }
+
+    const token = await this.requestSyncDeviceToken()
+    this.saveStoredSyncSettings({
+      ...this.getStoredSyncSettings(),
+      deviceToken: token.token,
+      deviceTokenExpiresAt: token.expiresAt,
+    })
+    return token.token
   }
 
   private async syncHostRequest<T>(

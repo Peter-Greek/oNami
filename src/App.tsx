@@ -47,6 +47,7 @@ import type {
   StudySession,
   SyncHealthResult,
   SyncPairingMode,
+  SyncRunResult,
   SyncStartPairingResult,
   SyncStatus,
   ThemeMode,
@@ -1382,6 +1383,7 @@ function SettingsView({
   const [pairing, setPairing] = useState<SyncStartPairingResult | null>(null)
   const [joinCode, setJoinCode] = useState('')
   const [pairingMode, setPairingMode] = useState<SyncPairingMode>('merge')
+  const [syncRun, setSyncRun] = useState<SyncRunResult | null>(null)
   const [syncMessage, setSyncMessage] = useState('')
 
   useEffect(() => {
@@ -1456,6 +1458,16 @@ function SettingsView({
       setSyncMessage(result.completed ? 'Device paired.' : 'Waiting for the other device.')
     })
 
+  const syncNow = () =>
+    runBusy(async () => {
+      const result = await window.onami.sync.syncNow()
+      setSyncRun(result)
+      setSyncStatus(await window.onami.sync.getStatus())
+      setSyncMessage(
+        `Synced ${result.pushedEvents} local, ${result.appliedEvents}/${result.pulledEvents} remote.`
+      )
+    })
+
   return (
     <section className="view-stack">
       <div className="settings-state">
@@ -1494,6 +1506,11 @@ function SettingsView({
           <CheckCircle2 size={18} />
           <span>{syncStatus?.paired ? 'Sync device is paired.' : 'Sync device is not paired.'}</span>
         </div>
+        {syncStatus && (
+          <div className="settings-note">
+            Pending {syncStatus.pendingEvents} / Cursor {syncStatus.lastHostCursor}
+          </div>
+        )}
         <label className="field">
           <span>Sync host</span>
           <input value={syncHostUrl} onChange={(event) => setSyncHostUrl(event.target.value)} />
@@ -1540,6 +1557,14 @@ function SettingsView({
         <button className="primary-action" onClick={confirmPairing}>
           Confirm pairing
         </button>
+        <button className="secondary-action" onClick={syncNow} disabled={!syncStatus?.paired}>
+          Sync now
+        </button>
+        {syncRun && (
+          <div className="settings-note">
+            Last sync pushed {syncRun.pushedEvents}, pulled {syncRun.pulledEvents}, applied {syncRun.appliedEvents}.
+          </div>
+        )}
         {syncMessage && <div className="settings-note">{syncMessage}</div>}
       </div>
       <button

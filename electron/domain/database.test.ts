@@ -244,3 +244,140 @@ describe('OnamiDatabase.getStats', () => {
     }
   })
 })
+
+describe('OnamiDatabase sync events', () => {
+  it('queues local events and marks them pushed', () => {
+    const { db, dir } = createTestDatabase()
+
+    try {
+      const deck = db.createDeck({ name: 'Sync source' })
+      const event = db.enqueueSyncEvent({
+        deviceId: 'desktop-device',
+        entityType: 'deck',
+        entityId: deck.id,
+        eventType: 'deck.upsert',
+        payload: db.buildDeckSyncPayload(deck.id),
+      })
+
+      expect(event.sequence).toBe(1)
+      expect(db.getPendingSyncEventCount()).toBe(1)
+      expect(db.listPendingSyncEvents()).toHaveLength(1)
+
+      db.markSyncEventsPushed([event.eventId])
+
+      expect(db.getPendingSyncEventCount()).toBe(0)
+    } finally {
+      db.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('applies remote deck, card, and review events once', () => {
+    const source = createTestDatabase()
+    const target = createTestDatabase()
+
+    try {
+      const deck = source.db.createDeck({ name: 'Remote deck' })
+      const card = source.db.createCard({
+        deckId: deck.id,
+        noteType: 'basic',
+        frontHtml: 'kaze',
+        backHtml: 'wind',
+        tags: ['noun'],
+      })
+
+      const deckApplied = target.db.applyRemoteSyncEvent({
+        hostEventId: 1,
+        eventId: 'event-deck',
+        sourceDeviceId: 'phone-device',
+        sequence: 1,
+        entityType: 'deck',
+        entityId: deck.id,
+        eventType: 'deck.upsert',
+        payload: source.db.buildDeckSyncPayload(deck.id),
+        createdAt: new Date().toISOString(),
+      })
+      const cardApplied = target.db.applyRemoteSyncEvent({
+        hostEventId: 2,
+        eventId: 'event-card',
+        sourceDeviceId: 'phone-device',
+        sequence: 2,
+        entityType: 'card',
+        entityId: card.id,
+        eventType: 'card.upsert',
+        payload: source.db.buildCardSyncPayload(card.id),
+        createdAt: new Date().toISOString(),
+      })
+
+      source.db.upsertReviewState(card.id, {
+        dueAt: '2026-07-07T00:00:00.000Z',
+        state: 'Review',
+        stability: 3,
+        difficulty: 5,
+        elapsedDays: 1,
+        scheduledDays: 1,
+        learningSteps: 0,
+        reps: 1,
+        lapses: 0,
+        successRate: 1,
+        lastRating: 'good',
+        lastReviewedAt: '2026-07-06T12:00:00.000Z',
+      })
+      const reviewApplied = target.db.applyRemoteSyncEvent({
+        hostEventId: 3,
+        eventId: 'event-review',
+        sourceDeviceId: 'phone-device',
+        sequence: 3,
+        entityType: 'review',
+        entityId: card.id,
+        eventType: 'review.answer',
+        payload: source.db.buildReviewAnswerSyncPayload({
+          cardId: card.id,
+          reviewedAt: '2026-07-06T12:00:00.000Z',
+          rating: 'good',
+          elapsedMs: 1200,
+          revealMs: 500,
+          answerMs: 700,
+          previousDueAt: null,
+          nextDueAt: '2026-07-07T00:00:00.000Z',
+        }),
+        createdAt: new Date().toISOString(),
+      })
+
+      expect(deckApplied).toBe(true)
+      expect(cardApplied).toBe(true)
+      expect(reviewApplied).toBe(true)
+      expect(target.db.getDeckSummary(deck.id).name).toBe('Remote deck')
+      expect(target.db.getCard(card.id).frontHtml).toBe('kaze')
+      expect(target.db.getReviewState(card.id)?.reps).toBe(1)
+
+      expect(
+        target.db.applyRemoteSyncEvent({
+          hostEventId: 3,
+          eventId: 'event-review',
+          sourceDeviceId: 'phone-device',
+          sequence: 3,
+          entityType: 'review',
+          entityId: card.id,
+          eventType: 'review.answer',
+          payload: source.db.buildReviewAnswerSyncPayload({
+            cardId: card.id,
+            reviewedAt: '2026-07-06T12:00:00.000Z',
+            rating: 'good',
+            elapsedMs: 1200,
+            revealMs: 500,
+            answerMs: 700,
+            previousDueAt: null,
+            nextDueAt: '2026-07-07T00:00:00.000Z',
+          }),
+          createdAt: new Date().toISOString(),
+        })
+      ).toBe(false)
+    } finally {
+      source.db.close()
+      target.db.close()
+      fs.rmSync(source.dir, { recursive: true, force: true })
+      fs.rmSync(target.dir, { recursive: true, force: true })
+    }
+  })
+})

@@ -222,12 +222,106 @@ export interface AppStats {
 
 export type SyncPairingMode = 'merge' | 'copy-desktop-to-phone' | 'copy-phone-to-desktop'
 
+export type SyncEntityType = 'deck' | 'card' | 'review'
+
+export type SyncEventType = 'deck.upsert' | 'deck.delete' | 'card.upsert' | 'card.delete' | 'review.answer'
+
+export interface SyncReviewStatePayload {
+  dueAt: string | null
+  state: ReviewStateName
+  stability: number
+  difficulty: number
+  elapsedDays: number
+  scheduledDays: number
+  learningSteps: number
+  reps: number
+  lapses: number
+  successRate: number
+  lastRating: ReviewRating | null
+  lastReviewedAt: string | null
+}
+
+export interface SyncDeckRecord {
+  id: string
+  parentId: string | null
+  name: string
+  source: string
+  sourceId: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface SyncNoteRecord {
+  id: string
+  deckId: string
+  noteType: string
+  fields: Record<string, string>
+  tags: string[]
+  sourceGuid: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface SyncCardRecord {
+  id: string
+  noteId: string
+  deckId: string
+  templateOrd: number
+  frontHtml: string
+  backHtml: string
+  mediaRefs: string[]
+  sourceCardId: string | null
+  statsResetAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface SyncDeckUpsertPayload {
+  version: 1
+  deck: SyncDeckRecord
+}
+
+export interface SyncCardUpsertPayload {
+  version: 1
+  note: SyncNoteRecord
+  card: SyncCardRecord
+  reviewState: SyncReviewStatePayload
+}
+
+export interface SyncReviewAnswerPayload {
+  version: 1
+  cardId: string
+  reviewedAt: string
+  rating: ReviewRating
+  elapsedMs: number
+  revealMs: number
+  answerMs: number
+  previousDueAt: string | null
+  nextDueAt: string | null
+  reviewState: SyncReviewStatePayload
+}
+
+export type SyncEventPayload = SyncDeckUpsertPayload | SyncCardUpsertPayload | SyncReviewAnswerPayload | Record<string, never>
+
+export interface SyncEventRecord {
+  eventId: string
+  sourceDeviceId: string
+  sequence: number
+  entityType: SyncEntityType
+  entityId: string
+  eventType: SyncEventType
+  payload: SyncEventPayload
+  createdAt: string
+}
+
 export interface SyncStatus {
   hostUrl: string
   deviceId: string | null
   deviceName: string | null
   syncGroupId: string | null
   paired: boolean
+  pendingEvents: number
+  lastHostCursor: number
 }
 
 export interface SaveSyncSettingsInput {
@@ -269,6 +363,14 @@ export interface SyncConfirmPairingResult {
   mode: SyncPairingMode
 }
 
+export interface SyncRunResult {
+  pushedEvents: number
+  pulledEvents: number
+  appliedEvents: number
+  pendingEvents: number
+  lastHostCursor: number
+}
+
 export interface OnamiApi {
   decks: {
     create(input: CreateDeckInput): Promise<DeckSummary>
@@ -304,6 +406,7 @@ export interface OnamiApi {
     startPairing(): Promise<SyncStartPairingResult>
     joinPairing(input: SyncJoinPairingInput): Promise<SyncJoinPairingResult>
     confirmPairing(input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult>
+    syncNow(): Promise<SyncRunResult>
   }
   stats: {
     get(filter?: StatsFilterInput): Promise<AppStats>

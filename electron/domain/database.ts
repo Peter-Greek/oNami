@@ -14,6 +14,14 @@ import type {
   HardCardSummary,
   ReviewRating,
   ReviewStateName,
+  SyncCardUpsertPayload,
+  SyncDeckUpsertPayload,
+  SyncDeckRecord,
+  SyncEntityType,
+  SyncEventPayload,
+  SyncEventRecord,
+  SyncEventType,
+  SyncReviewAnswerPayload,
   UpdateCardInput,
 } from '../../src/shared/types'
 
@@ -87,6 +95,10 @@ export interface MediaRecord {
   storedPath: string
   mimeType: string
   hash: string
+}
+
+export interface RemoteSyncEvent extends SyncEventRecord {
+  hostEventId: number
 }
 
 const nowIso = () => new Date().toISOString()
@@ -655,6 +667,220 @@ export class OnamiDatabase {
       .run(key, json(value), nowIso())
   }
 
+  enqueueSyncEvent(input: {
+    deviceId: string
+    entityType: SyncEntityType
+    entityId: string
+    eventType: SyncEventType
+    payload: SyncEventPayload
+  }): SyncEventRecord {
+    const timestamp = nowIso()
+    const eventId = randomUUID()
+    const row = this.db
+      .prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM sync_outbox WHERE device_id = ?')
+      .get(input.deviceId) as Row
+    const sequence = toNumber(row.next_sequence, 1)
+
+    this.db
+      .prepare(
+        `INSERT INTO sync_outbox
+          (event_id, device_id, sequence, entity_type, entity_id, event_type, payload_json, created_at, pushed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      )
+      .run(
+        eventId,
+        input.deviceId,
+        sequence,
+        input.entityType,
+        input.entityId,
+        input.eventType,
+        json(input.payload),
+        timestamp
+      )
+
+    return {
+      eventId,
+      sourceDeviceId: input.deviceId,
+      sequence,
+      entityType: input.entityType,
+      entityId: input.entityId,
+      eventType: input.eventType,
+      payload: input.payload,
+      createdAt: timestamp,
+    }
+  }
+
+  listPendingSyncEvents(limit = 100): SyncEventRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM sync_outbox
+         WHERE pushed_at IS NULL
+         ORDER BY sequence
+         LIMIT ?`
+      )
+      .all(limit) as Row[]
+    return rows.map((row) => this.rowToSyncEvent(row))
+  }
+
+  markSyncEventsPushed(eventIds: string[]): void {
+    if (eventIds.length === 0) return
+    const placeholders = eventIds.map(() => '?').join(',')
+    this.db
+      .prepare(`UPDATE sync_outbox SET pushed_at = ? WHERE event_id IN (${placeholders})`)
+      .run(nowIso(), ...eventIds)
+  }
+
+  getPendingSyncEventCount(): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS count FROM sync_outbox WHERE pushed_at IS NULL')
+      .get() as Row
+    return toNumber(row.count)
+  }
+
+  getSyncHostCursor(): number {
+    const row = this.db
+      .prepare("SELECT last_host_event_id FROM sync_cursor WHERE id = 'host'")
+      .get() as Row | undefined
+    return row ? toNumber(row.last_host_event_id) : 0
+  }
+
+  setSyncHostCursor(cursor: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO sync_cursor (id, last_host_event_id, updated_at)
+         VALUES ('host', ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+          last_host_event_id = MAX(sync_cursor.last_host_event_id, excluded.last_host_event_id),
+          updated_at = excluded.updated_at`
+      )
+      .run(cursor, nowIso())
+  }
+
+  buildDeckSyncPayload(deckId: string): SyncDeckUpsertPayload {
+    const row = this.db.prepare('SELECT * FROM decks WHERE id = ?').get(deckId) as Row | undefined
+    if (!row) throw new Error('Deck not found.')
+    return {
+      version: 1,
+      deck: this.rowToSyncDeckRecord(row),
+    }
+  }
+
+  buildCardSyncPayload(cardId: string): SyncCardUpsertPayload {
+    const row = this.db
+      .prepare(
+        `SELECT
+          c.*,
+          n.deck_id AS note_deck_id,
+          n.note_type,
+          n.fields_json,
+          n.tags_json,
+          n.source_guid,
+          n.created_at AS note_created_at,
+          n.updated_at AS note_updated_at
+         FROM cards c
+         JOIN notes n ON n.id = c.note_id
+         WHERE c.id = ?`
+      )
+      .get(cardId) as Row | undefined
+    if (!row) throw new Error('Card not found.')
+    return {
+      version: 1,
+      note: {
+        id: toStringValue(row.note_id),
+        deckId: toStringValue(row.note_deck_id),
+        noteType: toStringValue(row.note_type),
+        fields: parseJson<Record<string, string>>(row.fields_json, {}),
+        tags: parseJson<string[]>(row.tags_json, []),
+        sourceGuid: row.source_guid ? toStringValue(row.source_guid) : null,
+        createdAt: toStringValue(row.note_created_at),
+        updatedAt: toStringValue(row.note_updated_at),
+      },
+      card: {
+        id: toStringValue(row.id),
+        noteId: toStringValue(row.note_id),
+        deckId: toStringValue(row.deck_id),
+        templateOrd: toNumber(row.template_ord),
+        frontHtml: toStringValue(row.front_html),
+        backHtml: toStringValue(row.back_html),
+        mediaRefs: parseJson<string[]>(row.media_refs_json, []),
+        sourceCardId: row.source_card_id ? toStringValue(row.source_card_id) : null,
+        statsResetAt: row.stats_reset_at ? toStringValue(row.stats_reset_at) : null,
+        createdAt: toStringValue(row.created_at),
+        updatedAt: toStringValue(row.updated_at),
+      },
+      reviewState: this.getReviewState(cardId) ?? createDefaultReviewState(),
+    }
+  }
+
+  buildReviewAnswerSyncPayload(input: {
+    cardId: string
+    reviewedAt: string
+    rating: ReviewRating
+    elapsedMs: number
+    revealMs: number
+    answerMs: number
+    previousDueAt: string | null
+    nextDueAt: string | null
+  }): SyncReviewAnswerPayload {
+    return {
+      version: 1,
+      cardId: input.cardId,
+      reviewedAt: input.reviewedAt,
+      rating: input.rating,
+      elapsedMs: input.elapsedMs,
+      revealMs: input.revealMs,
+      answerMs: input.answerMs,
+      previousDueAt: input.previousDueAt,
+      nextDueAt: input.nextDueAt,
+      reviewState: this.getReviewState(input.cardId) ?? createDefaultReviewState(),
+    }
+  }
+
+  listSyncDeckPayloads(): SyncDeckUpsertPayload[] {
+    const rows = this.db.prepare('SELECT * FROM decks ORDER BY created_at, name').all() as Row[]
+    return rows.map((row) => ({
+      version: 1,
+      deck: this.rowToSyncDeckRecord(row),
+    }))
+  }
+
+  listSyncCardPayloads(deckId?: string): SyncCardUpsertPayload[] {
+    const cards = deckId ? this.listCards(deckId) : this.listCards()
+    return cards.map((card) => this.buildCardSyncPayload(card.id))
+  }
+
+  applyRemoteSyncEvent(event: RemoteSyncEvent): boolean {
+    const existing = this.db.prepare('SELECT event_id FROM sync_inbox WHERE event_id = ?').get(event.eventId) as
+      | Row
+      | undefined
+    if (existing) return false
+
+    const tx = this.db.transaction(() => {
+      if (event.eventType === 'deck.upsert') {
+        this.applyDeckUpsert(event.payload as SyncDeckUpsertPayload)
+      } else if (event.eventType === 'deck.delete') {
+        this.deleteDeckIfPresent(event.entityId)
+      } else if (event.eventType === 'card.upsert') {
+        this.applyCardUpsert(event.payload as SyncCardUpsertPayload)
+      } else if (event.eventType === 'card.delete') {
+        this.deleteCardIfPresent(event.entityId)
+      } else if (event.eventType === 'review.answer') {
+        this.applyReviewAnswer(event.eventId, event.payload as SyncReviewAnswerPayload)
+      }
+
+      this.db
+        .prepare(
+          `INSERT INTO sync_inbox (event_id, source_device_id, host_event_id, applied_at)
+           VALUES (?, ?, ?, ?)`
+        )
+        .run(event.eventId, event.sourceDeviceId, event.hostEventId, nowIso())
+    })
+
+    tx()
+    return true
+  }
+
   getStats(deckId?: string | null): AppStats {
     const allDecks = this.listDecks()
     const scopeDeckIds = deckId ? this.getDeckTreeIds(deckId) : allDecks.map((deck) => deck.id)
@@ -835,11 +1061,39 @@ export class OnamiDatabase {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS sync_outbox (
+        event_id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        pushed_at TEXT,
+        UNIQUE(device_id, sequence)
+      );
+
+      CREATE TABLE IF NOT EXISTS sync_inbox (
+        event_id TEXT PRIMARY KEY,
+        source_device_id TEXT NOT NULL,
+        host_event_id INTEGER NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS sync_cursor (
+        id TEXT PRIMARY KEY,
+        last_host_event_id INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_cards_deck ON cards(deck_id);
       CREATE INDEX IF NOT EXISTS idx_notes_source ON notes(source_guid);
       CREATE INDEX IF NOT EXISTS idx_review_state_due ON review_state(due_at, state);
       CREATE INDEX IF NOT EXISTS idx_review_log_card ON review_log(card_id);
       CREATE INDEX IF NOT EXISTS idx_review_log_reviewed_at ON review_log(reviewed_at);
+      CREATE INDEX IF NOT EXISTS idx_sync_outbox_pending ON sync_outbox(pushed_at, sequence);
+      CREATE INDEX IF NOT EXISTS idx_sync_inbox_host_event ON sync_inbox(host_event_id);
     `)
 
     this.ensureColumn('cards', 'stats_reset_at', 'TEXT')
@@ -1169,6 +1423,168 @@ export class OnamiDatabase {
        GROUP BY d.id
        ORDER BY d.name COLLATE NOCASE`
     )
+  }
+
+  private rowToSyncEvent(row: Row): SyncEventRecord {
+    return {
+      eventId: toStringValue(row.event_id),
+      sourceDeviceId: toStringValue(row.device_id),
+      sequence: toNumber(row.sequence),
+      entityType: toStringValue(row.entity_type) as SyncEntityType,
+      entityId: toStringValue(row.entity_id),
+      eventType: toStringValue(row.event_type) as SyncEventType,
+      payload: parseJson<SyncEventPayload>(row.payload_json, {}),
+      createdAt: toStringValue(row.created_at),
+    }
+  }
+
+  private rowToSyncDeckRecord(row: Row): SyncDeckRecord {
+    return {
+      id: toStringValue(row.id),
+      parentId: row.parent_id ? toStringValue(row.parent_id) : null,
+      name: toStringValue(row.name),
+      source: toStringValue(row.source),
+      sourceId: row.source_id ? toStringValue(row.source_id) : null,
+      createdAt: toStringValue(row.created_at),
+      updatedAt: toStringValue(row.updated_at),
+    }
+  }
+
+  private applyDeckUpsert(payload: SyncDeckUpsertPayload): void {
+    const deck = payload.deck
+    const parentId = deck.parentId && this.hasDeck(deck.parentId) ? deck.parentId : null
+    this.db
+      .prepare(
+        `INSERT INTO decks (id, parent_id, name, source, source_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+          parent_id = excluded.parent_id,
+          name = excluded.name,
+          source = excluded.source,
+          source_id = excluded.source_id,
+          updated_at = excluded.updated_at`
+      )
+      .run(deck.id, parentId, deck.name, deck.source, deck.sourceId, deck.createdAt, deck.updatedAt)
+  }
+
+  private applyCardUpsert(payload: SyncCardUpsertPayload): void {
+    const note = payload.note
+    const card = payload.card
+    const noteDeckId = this.resolveDeckId(note.deckId)
+    const cardDeckId = this.resolveDeckId(card.deckId)
+
+    this.db
+      .prepare(
+        `INSERT INTO notes
+          (id, deck_id, note_type, fields_json, tags_json, source_guid, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+          deck_id = excluded.deck_id,
+          note_type = excluded.note_type,
+          fields_json = excluded.fields_json,
+          tags_json = excluded.tags_json,
+          source_guid = excluded.source_guid,
+          updated_at = excluded.updated_at`
+      )
+      .run(
+        note.id,
+        noteDeckId,
+        note.noteType,
+        json(note.fields),
+        json(note.tags),
+        note.sourceGuid,
+        note.createdAt,
+        note.updatedAt
+      )
+
+    this.db
+      .prepare(
+        `INSERT INTO cards
+          (id, note_id, deck_id, template_ord, front_html, back_html, media_refs_json,
+           source_card_id, created_at, updated_at, stats_reset_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+          note_id = excluded.note_id,
+          deck_id = excluded.deck_id,
+          template_ord = excluded.template_ord,
+          front_html = excluded.front_html,
+          back_html = excluded.back_html,
+          media_refs_json = excluded.media_refs_json,
+          source_card_id = excluded.source_card_id,
+          updated_at = excluded.updated_at,
+          stats_reset_at = excluded.stats_reset_at`
+      )
+      .run(
+        card.id,
+        note.id,
+        cardDeckId,
+        card.templateOrd,
+        card.frontHtml,
+        card.backHtml,
+        json(card.mediaRefs),
+        card.sourceCardId,
+        card.createdAt,
+        card.updatedAt,
+        card.statsResetAt
+      )
+
+    this.upsertReviewStateSeed(card.id, payload.reviewState)
+    this.upsertReviewState(card.id, payload.reviewState)
+  }
+
+  private applyReviewAnswer(eventId: string, payload: SyncReviewAnswerPayload): void {
+    if (!this.hasCard(payload.cardId)) return
+    this.upsertReviewState(payload.cardId, payload.reviewState)
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO review_log
+          (id, card_id, reviewed_at, rating, elapsed_ms, reveal_ms, answer_ms, previous_due_at, next_due_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        eventId,
+        payload.cardId,
+        payload.reviewedAt,
+        payload.rating,
+        payload.elapsedMs,
+        payload.revealMs,
+        payload.answerMs,
+        payload.previousDueAt,
+        payload.nextDueAt
+      )
+  }
+
+  private deleteDeckIfPresent(deckId: string): void {
+    this.db.prepare('DELETE FROM decks WHERE id = ?').run(deckId)
+    this.ensureDefaultDeck()
+  }
+
+  private deleteCardIfPresent(cardId: string): void {
+    const row = this.db.prepare('SELECT note_id FROM cards WHERE id = ?').get(cardId) as Row | undefined
+    if (!row) return
+    const noteId = toStringValue(row.note_id)
+    this.db.prepare('DELETE FROM cards WHERE id = ?').run(cardId)
+    const remaining = this.db.prepare('SELECT id FROM cards WHERE note_id = ? LIMIT 1').get(noteId) as
+      | Row
+      | undefined
+    if (!remaining) this.db.prepare('DELETE FROM notes WHERE id = ?').run(noteId)
+  }
+
+  private hasDeck(deckId: string): boolean {
+    const row = this.db.prepare('SELECT id FROM decks WHERE id = ?').get(deckId) as Row | undefined
+    return Boolean(row)
+  }
+
+  private hasCard(cardId: string): boolean {
+    const row = this.db.prepare('SELECT id FROM cards WHERE id = ?').get(cardId) as Row | undefined
+    return Boolean(row)
+  }
+
+  private resolveDeckId(deckId: string): string {
+    if (this.hasDeck(deckId)) return deckId
+    this.ensureDefaultDeck()
+    const row = this.db.prepare('SELECT id FROM decks ORDER BY created_at LIMIT 1').get() as Row
+    return toStringValue(row.id)
   }
 
   private rowToDeckSummary(row: Row): DeckSummary {

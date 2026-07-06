@@ -678,6 +678,8 @@ export const installBrowserOnami = () => {
         deviceName: null,
         syncGroupId: null,
         paired: false,
+        pendingEvents: 0,
+        lastHostCursor: 0,
       }),
       saveSettings: async (input) => {
         const hostUrl = input.hostUrl.trim().replace(/\/+$/, '') || 'http://147.135.31.128:41729'
@@ -688,6 +690,8 @@ export const installBrowserOnami = () => {
           deviceName: null,
           syncGroupId: null,
           paired: false,
+          pendingEvents: 0,
+          lastHostCursor: 0,
         }
       },
       checkHealth: async () => {
@@ -718,6 +722,9 @@ export const installBrowserOnami = () => {
       },
       confirmPairing: async () => {
         throw new Error('Device pairing is only available in the desktop app for this beta.')
+      },
+      syncNow: async () => {
+        throw new Error('Host sync is only available in the desktop app for this beta.')
       },
     },
     stats: {

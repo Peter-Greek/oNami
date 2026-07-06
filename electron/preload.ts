@@ -41,6 +41,7 @@ const api: OnamiApi = {
     startPairing: () => ipcRenderer.invoke('sync:start-pairing'),
     joinPairing: (input) => ipcRenderer.invoke('sync:join-pairing', input),
     confirmPairing: (input) => ipcRenderer.invoke('sync:confirm-pairing', input),
+    syncNow: () => ipcRenderer.invoke('sync:sync-now'),
   },
   appWindow: {
     minimize: () => ipcRenderer.invoke('window:minimize'),

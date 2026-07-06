@@ -185,6 +185,7 @@ const registerIpc = (): void => {
   ipcMain.handle('sync:confirm-pairing', (_event, input: SyncConfirmPairingInput) =>
     getServices().confirmSyncPairing(input)
   )
+  ipcMain.handle('sync:sync-now', () => getServices().syncNow())
 
   ipcMain.handle('window:minimize', (event) => {
     BrowserWindow.fromWebContents(event.sender)?.minimize()
