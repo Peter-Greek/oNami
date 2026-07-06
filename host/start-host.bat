@@ -4,7 +4,7 @@ setlocal
 cd /d "%~dp0"
 
 if "%ONAMI_PM2_NAME%"=="" set "ONAMI_PM2_NAME=onami-host"
-if "%ONAMI_HOST_PORT%"=="" set "ONAMI_HOST_PORT=41729"
+if "%ONAMI_HOST_PORT%"=="" set "ONAMI_HOST_PORT=41730"
 if "%ONAMI_HOST_BIND%"=="" set "ONAMI_HOST_BIND=127.0.0.1"
 if "%ONAMI_PUBLIC_PORT%"=="" set "ONAMI_PUBLIC_PORT=41729"
 if "%ONAMI_PUBLIC_LISTEN%"=="" set "ONAMI_PUBLIC_LISTEN=0.0.0.0"
@@ -24,6 +24,32 @@ if errorlevel 1 (
   echo Install it with: npm install -g pm2
   exit /b 1
 )
+
+if not exist ".env" (
+  echo No .env file found. Running setup.bat first...
+  call setup.bat
+  if errorlevel 1 exit /b 1
+)
+
+if not exist "node_modules" (
+  echo Installing host dependencies...
+  call npm install --include=dev
+  if errorlevel 1 exit /b 1
+)
+
+if not exist "node_modules\.bin\prisma.cmd" (
+  echo Prisma CLI missing. Installing host dev dependencies...
+  call npm install --include=dev
+  if errorlevel 1 exit /b 1
+)
+
+echo Generating Prisma client...
+call npm run prisma:generate
+if errorlevel 1 exit /b 1
+
+echo Applying Prisma schema to oNami database...
+call npm run prisma:push -- --accept-data-loss
+if errorlevel 1 exit /b 1
 
 echo Stopping old %ONAMI_PM2_NAME% process if it exists...
 call pm2 delete "%ONAMI_PM2_NAME%" >nul 2>nul

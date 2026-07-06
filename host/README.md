@@ -2,25 +2,45 @@
 
 Small Node.js relay service for paired-device sync. It does not require phone numbers, Google sign-in, or user accounts. Devices pair into a sync group, prove possession of their local device key, then push and pull event batches.
 
+The host uses the same deployment style as Orbit Server: Node.js, Prisma, and PostgreSQL. It uses its own database (`onami_sync`) and database user (`onami_user`), separate from Orbit.
+
 ## Run Locally
 
 ```powershell
-npm run host
+cd host
+npm install --include=dev
+npm run prisma:generate
+npm run prisma:push -- --accept-data-loss
+npm start
 ```
 
-Default URL:
+Default URL after `setup.bat`:
 
 ```text
-http://127.0.0.1:41729
+http://127.0.0.1:41730
 ```
 
 Health check:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:41729/health
+Invoke-RestMethod http://127.0.0.1:41730/health
 ```
 
 ## PM2 on the Server
+
+First run setup once:
+
+```bat
+setup.bat
+```
+
+That creates:
+
+```text
+database: onami_sync
+user:     onami_user
+env:      host/.env
+```
 
 From this folder:
 
@@ -29,7 +49,7 @@ start-host.bat
 ```
 
 The script deletes any old `onami-host` PM2 process, starts the current host through `ecosystem.config.cjs`, and saves the PM2 process list.
-It also checks `http://127.0.0.1:41729/health` before reporting success.
+It also installs host dependencies if needed, runs Prisma generate/db push, and checks `http://127.0.0.1:<ONAMI_HOST_PORT>/health` before reporting success.
 
 To stop:
 
@@ -39,7 +59,7 @@ stop-host.bat
 
 ## Port Forwarding
 
-The host binds to `127.0.0.1:41729` by default. To expose a public port on Windows with `netsh portproxy`, run `start-host.bat` from an elevated administrator prompt with:
+The host binds to `127.0.0.1:41730` after `setup.bat`. To expose public `41729` on Windows with `netsh portproxy`, run `start-host.bat` from an elevated administrator prompt with:
 
 ```bat
 set ONAMI_ENABLE_PORTPROXY=1
@@ -72,9 +92,9 @@ For production, put HTTPS in front of the host. Portproxy is useful for a simple
 
 ```text
 ONAMI_HOST_BIND=127.0.0.1
-ONAMI_HOST_PORT=41729
-ONAMI_HOST_DATA_DIR=./data
+ONAMI_HOST_PORT=41730
 ONAMI_HOST_CORS_ORIGIN=*
+DATABASE_URL=postgresql://onami_user:<password>@localhost:5432/onami_sync?schema=public
 ONAMI_PAIRING_TTL_MS=600000
 ONAMI_DEVICE_TOKEN_TTL_MS=604800000
 ONAMI_MAX_JSON_BYTES=1048576
@@ -120,10 +140,11 @@ The host verifies the signature against the paired device's stored public key.
 
 ## Data
 
-SQLite data is stored in:
+State is stored in PostgreSQL:
 
 ```text
-host/data/onami-host.sqlite
+database: onami_sync
+schema:   public
 ```
 
-Back this directory up if the host has real synced events. The app remains local-first, but the host is the relay for newly paired devices and cross-device delivery.
+Back up the `onami_sync` database if the host has real synced events. The app remains local-first, but the host is the relay for newly paired devices and cross-device delivery.

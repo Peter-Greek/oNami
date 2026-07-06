@@ -1,0 +1,124 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model SyncGroup {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  devices      Device[]
+  events       SyncEvent[]
+  cursors      DeviceCursor[]
+  mediaObjects MediaObject[]
+
+  @@map("sync_groups")
+}
+
+model Device {
+  id          String    @id @db.Uuid
+  syncGroupId String?   @map("sync_group_id") @db.Uuid
+  name        String
+  platform    String
+  publicKey   String    @map("public_key")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  lastSeenAt  DateTime  @default(now()) @map("last_seen_at")
+  revokedAt   DateTime? @map("revoked_at")
+
+  syncGroup SyncGroup? @relation(fields: [syncGroupId], references: [id], onDelete: SetNull)
+
+  initiatedPairings PairingSession[] @relation("InitiatorPairings")
+  joinedPairings    PairingSession[] @relation("JoiningPairings")
+  sourceEvents      SyncEvent[]
+  cursors           DeviceCursor[]
+  tokens            DeviceToken[]
+
+  @@index([syncGroupId])
+  @@map("devices")
+}
+
+model PairingSession {
+  id                  String    @id @default(uuid()) @db.Uuid
+  initiatorDeviceId   String    @map("initiator_device_id") @db.Uuid
+  joiningDeviceId     String?   @map("joining_device_id") @db.Uuid
+  codeHash            String    @unique @map("code_hash")
+  confirmationCode    String    @map("confirmation_code")
+  mode                String?
+  initiatorConfirmedAt DateTime? @map("initiator_confirmed_at")
+  joinerConfirmedAt   DateTime? @map("joiner_confirmed_at")
+  completedAt         DateTime? @map("completed_at")
+  expiresAt           DateTime  @map("expires_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  initiator Device  @relation("InitiatorPairings", fields: [initiatorDeviceId], references: [id], onDelete: Cascade)
+  joiner    Device? @relation("JoiningPairings", fields: [joiningDeviceId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("pairing_sessions")
+}
+
+model SyncEvent {
+  id             Int      @id @default(autoincrement())
+  eventId        String   @unique @map("event_id") @db.Uuid
+  syncGroupId    String   @map("sync_group_id") @db.Uuid
+  sourceDeviceId String   @map("source_device_id") @db.Uuid
+  sequence       Int
+  entityType     String   @map("entity_type")
+  entityId       String   @map("entity_id")
+  eventType      String   @map("event_type")
+  payloadJson    Json     @map("payload_json")
+  createdAt      DateTime @map("created_at")
+
+  syncGroup    SyncGroup @relation(fields: [syncGroupId], references: [id], onDelete: Cascade)
+  sourceDevice Device    @relation(fields: [sourceDeviceId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceDeviceId, sequence])
+  @@index([syncGroupId, id])
+  @@map("sync_events")
+}
+
+model DeviceCursor {
+  syncGroupId String   @map("sync_group_id") @db.Uuid
+  deviceId    String   @map("device_id") @db.Uuid
+  lastEventId Int      @map("last_event_id")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  syncGroup SyncGroup @relation(fields: [syncGroupId], references: [id], onDelete: Cascade)
+  device    Device    @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@id([syncGroupId, deviceId])
+  @@map("device_cursors")
+}
+
+model MediaObject {
+  id          String   @id @default(uuid()) @db.Uuid
+  syncGroupId String   @map("sync_group_id") @db.Uuid
+  sha256      String
+  byteSize    Int      @map("byte_size")
+  mimeType    String   @map("mime_type")
+  storageKey  String   @map("storage_key")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  syncGroup SyncGroup @relation(fields: [syncGroupId], references: [id], onDelete: Cascade)
+
+  @@unique([syncGroupId, sha256])
+  @@map("media_objects")
+}
+
+model DeviceToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  deviceId  String   @map("device_id") @db.Uuid
+  tokenHash String   @unique @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([tokenHash])
+  @@map("device_tokens")
+}
