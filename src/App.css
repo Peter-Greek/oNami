@@ -508,6 +508,11 @@ textarea:focus {
   font-weight: 900;
 }
 
+.pairing-code-stack {
+  display: grid;
+  gap: 8px;
+}
+
 .pairing-code-panel span {
   overflow-wrap: anywhere;
 }

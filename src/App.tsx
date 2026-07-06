@@ -59,6 +59,8 @@ import './App.css'
 
 type View = 'study' | 'create' | 'import' | 'stats' | 'settings'
 
+type PairingFlow = 'start' | 'join' | null
+
 interface DeckRow {
   deck: DeckSummary
   depth: number
@@ -1395,9 +1397,11 @@ function SettingsView({
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
   const [syncHostUrl, setSyncHostUrl] = useState('')
   const [syncHealth, setSyncHealth] = useState<SyncHealthResult | null>(null)
+  const [pairingFlow, setPairingFlow] = useState<PairingFlow>(null)
   const [pairing, setPairing] = useState<SyncStartPairingResult | null>(null)
   const [joinCode, setJoinCode] = useState('')
   const [pairingMode, setPairingMode] = useState<SyncPairingMode>('merge')
+  const [starterReadyToConfirm, setStarterReadyToConfirm] = useState(false)
   const [syncRun, setSyncRun] = useState<SyncRunResult | null>(null)
   const [syncMessage, setSyncMessage] = useState('')
   const BackupIcon =
@@ -1468,23 +1472,28 @@ function SettingsView({
   const startPairing = () =>
     runBusy(async () => {
       const result = await window.onami.sync.startPairing()
+      setPairingFlow('start')
       setPairing(result)
-      setJoinCode(result.pairingCode)
+      setJoinCode('')
+      setStarterReadyToConfirm(false)
       setSyncStatus(await window.onami.sync.getStatus())
-      setSyncMessage('Pairing code created.')
+      setSyncMessage('Give the pairing code to the other device.')
     })
 
   const joinPairing = () =>
     runBusy(async () => {
+      if (!joinCode.trim()) throw new Error('Enter the pairing code from the other device.')
       const result = await window.onami.sync.joinPairing({ pairingCode: joinCode })
+      setPairingFlow('join')
       setPairing({
         deviceId: result.deviceId,
         pairingCode: joinCode,
         confirmationCode: result.confirmationCode,
         expiresInMs: Math.max(0, Date.parse(result.expiresAt) - Date.now()),
       })
+      setStarterReadyToConfirm(true)
       setSyncStatus(await window.onami.sync.getStatus())
-      setSyncMessage('Pairing code joined.')
+      setSyncMessage('Confirm this device, then tell the starter to confirm.')
     })
 
   const confirmPairing = () =>
@@ -1495,6 +1504,14 @@ function SettingsView({
       setSyncStatus(await window.onami.sync.getStatus())
       setSyncMessage(result.completed ? 'Device paired.' : 'Waiting for the other device.')
     })
+
+  const resetPairingFlow = () => {
+    setPairingFlow(null)
+    setPairing(null)
+    setJoinCode('')
+    setStarterReadyToConfirm(false)
+    setSyncMessage('')
+  }
 
   const syncNow = () =>
     runBusy(async () => {
@@ -1575,35 +1592,90 @@ function SettingsView({
             {syncHealth.ok ? `${syncHealth.service ?? 'Sync host'} online` : syncHealth.error}
           </div>
         )}
-        <div className="button-row">
-          <button className="secondary-action" onClick={startPairing}>
-            Start pairing
-          </button>
-          <button className="secondary-action" onClick={joinPairing}>
-            Join pairing
-          </button>
-        </div>
-        <label className="field">
-          <span>Pairing code</span>
-          <input value={joinCode} onChange={(event) => setJoinCode(event.target.value)} placeholder="123-456" />
-        </label>
-        {pairing && (
-          <div className="pairing-code-panel">
-            <span>Code {pairing.pairingCode}</span>
-            <strong>{pairing.confirmationCode}</strong>
+        {!pairingFlow && (
+          <div className="button-row">
+            <button className="secondary-action" onClick={() => void startPairing()}>
+              Start pairing
+            </button>
+            <button
+              className="secondary-action"
+              onClick={() => {
+                setPairingFlow('join')
+                setPairing(null)
+                setJoinCode('')
+                setStarterReadyToConfirm(false)
+                setSyncMessage('Enter the pairing code from the other device.')
+              }}
+            >
+              Join pairing
+            </button>
           </div>
         )}
-        <label className="field">
-          <span>Pairing mode</span>
-          <select value={pairingMode} onChange={(event) => setPairingMode(event.target.value as SyncPairingMode)}>
-            <option value="merge">Merge devices</option>
-            <option value="copy-desktop-to-phone">Copy desktop to phone</option>
-            <option value="copy-phone-to-desktop">Copy phone to desktop</option>
-          </select>
-        </label>
-        <button className="primary-action" onClick={confirmPairing}>
-          Confirm pairing
-        </button>
+        {pairingFlow === 'start' && pairing && (
+          <>
+            <div className="pairing-code-stack">
+              <div className="pairing-code-panel">
+                <span>Pairing code</span>
+                <strong>{pairing.pairingCode}</strong>
+              </div>
+              <div className="settings-note">
+                The other device enters this pairing code. Match the confirmation code on both screens before
+                finishing.
+              </div>
+              <div className="pairing-code-panel">
+                <span>Confirmation code</span>
+                <strong>{pairing.confirmationCode}</strong>
+              </div>
+            </div>
+            <label className="field">
+              <span>Pairing mode</span>
+              <select value={pairingMode} onChange={(event) => setPairingMode(event.target.value as SyncPairingMode)}>
+                <option value="merge">Merge devices</option>
+                <option value="copy-desktop-to-phone">Copy desktop to phone</option>
+                <option value="copy-phone-to-desktop">Copy phone to desktop</option>
+              </select>
+            </label>
+            {!starterReadyToConfirm ? (
+              <button className="secondary-action" onClick={() => setStarterReadyToConfirm(true)}>
+                Other device is ready
+              </button>
+            ) : (
+              <button className="primary-action" onClick={confirmPairing}>
+                Finish pairing
+              </button>
+            )}
+            <button className="secondary-action" onClick={resetPairingFlow}>
+              Cancel pairing
+            </button>
+          </>
+        )}
+        {pairingFlow === 'join' && (
+          <>
+            <label className="field">
+              <span>Pairing code</span>
+              <input value={joinCode} onChange={(event) => setJoinCode(event.target.value)} placeholder="123-456" />
+            </label>
+            {!pairing ? (
+              <button className="primary-action" onClick={joinPairing} disabled={!joinCode.trim()}>
+                Join pairing
+              </button>
+            ) : (
+              <>
+                <div className="pairing-code-panel">
+                  <span>Confirmation code</span>
+                  <strong>{pairing.confirmationCode}</strong>
+                </div>
+                <div className="settings-note">Confirm here, then tell the starter to finish pairing.</div>
+                <button className="primary-action" onClick={confirmPairing}>
+                  Confirm this device
+                </button>
+              </>
+            )}
+            <button className="secondary-action" onClick={resetPairingFlow}>
+              Cancel pairing
+            </button>
+          </>
+        )}
         <button className="secondary-action" onClick={syncNow} disabled={!syncStatus?.paired}>
           Sync now
         </button>

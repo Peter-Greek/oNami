@@ -23,6 +23,12 @@ import type {
   StatsFilterInput,
   StudyMode,
   StudySessionSettings,
+  SyncConfirmPairingInput,
+  SyncConfirmPairingResult,
+  SyncHealthResult,
+  SyncJoinPairingInput,
+  SyncJoinPairingResult,
+  SyncStartPairingResult,
   ThemeMode,
   UpdateCardInput,
 } from './shared/types'
@@ -92,7 +98,20 @@ interface RuntimeSession {
   unitTestThreshold: number
 }
 
+interface BrowserSyncSettings {
+  hostUrl: string
+  deviceId: string | null
+  deviceName: string | null
+  publicKey: string | null
+  privateKeyJwk: JsonWebKey | null
+  syncGroupId: string | null
+  deviceToken: string | null
+  deviceTokenExpiresAt: string | null
+}
+
 const STORAGE_KEY = 'onami.android.mvp.v1'
+const SYNC_SETTINGS_KEY = 'onami.sync.settings'
+const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
 
 const defaultAppSettings: AppSettings = {
   audioVolume: 0.8,
@@ -134,6 +153,160 @@ const fsrsToState: Record<State, ReviewStateName> = {
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 const nowIso = () => new Date().toISOString()
+
+const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.slice(index, index + 0x8000))
+  }
+  return btoa(binary)
+}
+
+const pemFromSpki = (buffer: ArrayBuffer): string => {
+  const base64 = arrayBufferToBase64(buffer)
+  const lines = base64.match(/.{1,64}/g) ?? []
+  return `-----BEGIN PUBLIC KEY-----\n${lines.join('\n')}\n-----END PUBLIC KEY-----\n`
+}
+
+const normalizeSyncHostUrl = (hostUrl: string): string => {
+  const trimmed = hostUrl.trim().replace(/\/+$/, '')
+  if (!trimmed) return DEFAULT_SYNC_HOST_URL
+  const parsed = new URL(trimmed)
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Sync host URL must start with http:// or https://.')
+  }
+  return parsed.toString().replace(/\/+$/, '')
+}
+
+const readSyncSettings = (): BrowserSyncSettings => {
+  try {
+    const raw = localStorage.getItem(SYNC_SETTINGS_KEY)
+    const parsed = raw ? (JSON.parse(raw) as Partial<BrowserSyncSettings>) : {}
+    return {
+      hostUrl: normalizeSyncHostUrl(parsed.hostUrl || localStorage.getItem('onami.sync.hostUrl') || DEFAULT_SYNC_HOST_URL),
+      deviceId: parsed.deviceId ?? null,
+      deviceName: parsed.deviceName ?? null,
+      publicKey: parsed.publicKey ?? null,
+      privateKeyJwk: parsed.privateKeyJwk ?? null,
+      syncGroupId: parsed.syncGroupId ?? null,
+      deviceToken: parsed.deviceToken ?? null,
+      deviceTokenExpiresAt: parsed.deviceTokenExpiresAt ?? null,
+    }
+  } catch {
+    return {
+      hostUrl: DEFAULT_SYNC_HOST_URL,
+      deviceId: null,
+      deviceName: null,
+      publicKey: null,
+      privateKeyJwk: null,
+      syncGroupId: null,
+      deviceToken: null,
+      deviceTokenExpiresAt: null,
+    }
+  }
+}
+
+const writeSyncSettings = (settings: BrowserSyncSettings) => {
+  const next = {
+    ...settings,
+    hostUrl: normalizeSyncHostUrl(settings.hostUrl),
+  }
+  localStorage.setItem(SYNC_SETTINGS_KEY, JSON.stringify(next))
+  localStorage.setItem('onami.sync.hostUrl', next.hostUrl)
+}
+
+const syncStatusFromSettings = (settings: BrowserSyncSettings) => ({
+  hostUrl: settings.hostUrl,
+  deviceId: settings.deviceId,
+  deviceName: settings.deviceName,
+  syncGroupId: settings.syncGroupId,
+  paired: Boolean(settings.syncGroupId),
+  pendingEvents: 0,
+  lastHostCursor: 0,
+  backedUpEvents: 0,
+  lastBackedUpAt: null,
+  backupState: settings.syncGroupId ? ('no-data' as const) : ('not-paired' as const),
+})
+
+const syncHostRequest = async <T,>(
+  path: string,
+  options: { method: 'GET' | 'POST'; body?: unknown; token?: string }
+): Promise<T> => {
+  const settings = readSyncSettings()
+  const response = await fetch(`${settings.hostUrl}${path}`, {
+    method: options.method,
+    headers: {
+      ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
+      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  })
+  const body = (await response.json()) as T & { error?: string }
+  if (!response.ok) throw new Error(body.error || `Sync host returned HTTP ${response.status}.`)
+  return body
+}
+
+const ensureSyncDevice = async (): Promise<BrowserSyncSettings & {
+  deviceId: string
+  deviceName: string
+  publicKey: string
+  privateKeyJwk: JsonWebKey
+}> => {
+  const settings = readSyncSettings()
+  if (settings.deviceId && settings.deviceName && settings.publicKey && settings.privateKeyJwk) {
+    return {
+      ...settings,
+      deviceId: settings.deviceId,
+      deviceName: settings.deviceName,
+      publicKey: settings.publicKey,
+      privateKeyJwk: settings.privateKeyJwk,
+    }
+  }
+
+  if (!crypto.subtle) throw new Error('This WebView does not support device passkeys.')
+  const pair = (await crypto.subtle.generateKey({ name: 'Ed25519' } as AlgorithmIdentifier, true, [
+    'sign',
+    'verify',
+  ])) as CryptoKeyPair
+  const publicKey = pemFromSpki(await crypto.subtle.exportKey('spki', pair.publicKey))
+  const privateKeyJwk = await crypto.subtle.exportKey('jwk', pair.privateKey)
+  const deviceId = crypto.randomUUID()
+  const deviceName = `${navigator.platform || 'Android'} phone`
+  const next: BrowserSyncSettings = {
+    ...settings,
+    deviceId,
+    deviceName,
+    publicKey,
+    privateKeyJwk,
+  }
+  writeSyncSettings(next)
+  return {
+    ...next,
+    deviceId,
+    deviceName,
+    publicKey,
+    privateKeyJwk,
+  }
+}
+
+const requestSyncDeviceToken = async (): Promise<{ token: string; expiresAt: string }> => {
+  const device = await ensureSyncDevice()
+  const key = await crypto.subtle.importKey('jwk', device.privateKeyJwk, { name: 'Ed25519' } as AlgorithmIdentifier, false, [
+    'sign',
+  ])
+  const timestamp = nowIso()
+  const payload = new TextEncoder().encode(`${device.deviceId}.${timestamp}`)
+  const signature = arrayBufferToBase64(await crypto.subtle.sign({ name: 'Ed25519' } as AlgorithmIdentifier, key, payload))
+  return syncHostRequest('/devices/token', {
+    method: 'POST',
+    body: {
+      deviceId: device.deviceId,
+      timestamp,
+      signature,
+    },
+  })
+}
 
 const makeId = (prefix: string) => {
   const randomId =
@@ -672,44 +845,29 @@ export const installBrowserOnami = () => {
         }),
     },
     sync: {
-      getStatus: async () => ({
-        hostUrl: localStorage.getItem('onami.sync.hostUrl') || 'http://147.135.31.128:41729',
-        deviceId: null,
-        deviceName: null,
-        syncGroupId: null,
-        paired: false,
-        pendingEvents: 0,
-        lastHostCursor: 0,
-        backedUpEvents: 0,
-        lastBackedUpAt: null,
-        backupState: 'not-paired',
-      }),
+      getStatus: async () => syncStatusFromSettings(readSyncSettings()),
       saveSettings: async (input) => {
-        const hostUrl = input.hostUrl.trim().replace(/\/+$/, '') || 'http://147.135.31.128:41729'
-        localStorage.setItem('onami.sync.hostUrl', hostUrl)
-        return {
+        const current = readSyncSettings()
+        const hostUrl = normalizeSyncHostUrl(input.hostUrl)
+        const next = {
+          ...current,
           hostUrl,
-          deviceId: null,
-          deviceName: null,
-          syncGroupId: null,
-          paired: false,
-          pendingEvents: 0,
-          lastHostCursor: 0,
-          backedUpEvents: 0,
-          lastBackedUpAt: null,
-          backupState: 'not-paired',
+          deviceToken: hostUrl === current.hostUrl ? current.deviceToken : null,
+          deviceTokenExpiresAt: hostUrl === current.hostUrl ? current.deviceTokenExpiresAt : null,
         }
+        writeSyncSettings(next)
+        return syncStatusFromSettings(next)
       },
-      checkHealth: async () => {
-        const hostUrl = localStorage.getItem('onami.sync.hostUrl') || 'http://147.135.31.128:41729'
+      checkHealth: async (): Promise<SyncHealthResult> => {
         try {
-          const response = await fetch(`${hostUrl}/health`)
-          const body = (await response.json()) as { ok?: boolean; service?: string; time?: string; error?: string }
+          const body = await syncHostRequest<{ ok?: boolean; service?: string; time?: string }>('/health', {
+            method: 'GET',
+          })
           return {
-            ok: response.ok && body.ok === true,
+            ok: body.ok === true,
             service: body.service ?? null,
             time: body.time ?? null,
-            error: response.ok ? null : body.error ?? `Sync host returned HTTP ${response.status}.`,
+            error: null,
           }
         } catch (error) {
           return {
@@ -720,14 +878,51 @@ export const installBrowserOnami = () => {
           }
         }
       },
-      startPairing: async () => {
-        throw new Error('Device pairing is only available in the desktop app for this beta.')
+      startPairing: async (): Promise<SyncStartPairingResult> => {
+        const device = await ensureSyncDevice()
+        return syncHostRequest('/pairing/start', {
+          method: 'POST',
+          body: {
+            deviceId: device.deviceId,
+            name: device.deviceName,
+            platform: 'android',
+            publicKey: device.publicKey,
+          },
+        })
       },
-      joinPairing: async () => {
-        throw new Error('Device pairing is only available in the desktop app for this beta.')
+      joinPairing: async (input: SyncJoinPairingInput): Promise<SyncJoinPairingResult> => {
+        const device = await ensureSyncDevice()
+        return syncHostRequest('/pairing/join', {
+          method: 'POST',
+          body: {
+            pairingCode: input.pairingCode,
+            deviceId: device.deviceId,
+            name: device.deviceName,
+            platform: 'android',
+            publicKey: device.publicKey,
+          },
+        })
       },
-      confirmPairing: async () => {
-        throw new Error('Device pairing is only available in the desktop app for this beta.')
+      confirmPairing: async (input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult> => {
+        const device = await ensureSyncDevice()
+        const result = await syncHostRequest<SyncConfirmPairingResult>('/pairing/confirm', {
+          method: 'POST',
+          body: {
+            pairingCode: input.pairingCode,
+            deviceId: device.deviceId,
+            mode: input.mode,
+          },
+        })
+        if (result.completed && result.syncGroupId) {
+          const token = await requestSyncDeviceToken()
+          writeSyncSettings({
+            ...readSyncSettings(),
+            syncGroupId: result.syncGroupId,
+            deviceToken: token.token,
+            deviceTokenExpiresAt: token.expiresAt,
+          })
+        }
+        return result
       },
       syncNow: async () => {
         throw new Error('Host sync is only available in the desktop app for this beta.')

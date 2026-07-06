@@ -5,6 +5,7 @@
         android:allowBackup="true"
         android:icon="@drawable/onami_icon"
         android:label="oNami"
+        android:usesCleartextTraffic="true"
         android:theme="@style/AppTheme">
         <activity
             android:name=".MainActivity"
