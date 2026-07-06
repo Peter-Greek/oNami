@@ -158,12 +158,12 @@ const upsertDevice = async ({ deviceId, name, platform, publicKey }) => {
   })
 }
 
-const getPairingSessionByCode = async (code) => {
+const getPairingSessionByCode = async (code, options = {}) => {
   const session = await prisma.pairingSession.findUnique({
     where: { codeHash: codeHash(code) },
   })
   if (!session) throw httpError(404, 'Pairing code not found.')
-  if (session.completedAt) throw httpError(409, 'Pairing code has already been used.')
+  if (session.completedAt && !options.allowCompleted) throw httpError(409, 'Pairing code has already been used.')
   if (session.expiresAt.getTime() <= Date.now()) throw httpError(410, 'Pairing code has expired.')
   return session
 }
@@ -401,10 +401,31 @@ const route = async (request, response, context) => {
   if (request.method === 'POST' && url.pathname === '/pairing/confirm') {
     const body = await readJson(request)
     const deviceId = requiredString(body, 'deviceId')
-    const session = await getPairingSessionByCode(requiredString(body, 'pairingCode'))
+    const session = await getPairingSessionByCode(requiredString(body, 'pairingCode'), { allowCompleted: true })
     const mode = optionalString(body, 'mode') ?? 'merge'
     if (!['merge', 'copy-desktop-to-phone', 'copy-phone-to-desktop'].includes(mode)) {
       throw httpError(400, 'mode must be merge, copy-desktop-to-phone, or copy-phone-to-desktop.')
+    }
+
+    if (deviceId !== session.initiatorDeviceId && deviceId !== session.joiningDeviceId) {
+      throw httpError(403, 'Device is not part of this pairing session.')
+    }
+
+    if (session.completedAt) {
+      const result = await completePairingIfReady(session.id)
+      addLogFields(context, { deviceId, syncGroupId: result.syncGroupId })
+      logRequest(context, 'info', 'pairing.confirm', {
+        completed: result.completed,
+        alreadyCompleted: true,
+        mode: session.mode ?? mode,
+        initiatorDeviceId: session.initiatorDeviceId,
+        joiningDeviceId: session.joiningDeviceId,
+      })
+      return send(response, 200, {
+        completed: result.completed,
+        syncGroupId: result.syncGroupId,
+        mode: session.mode ?? mode,
+      })
     }
 
     if (deviceId === session.initiatorDeviceId) {
@@ -417,8 +438,6 @@ const route = async (request, response, context) => {
         where: { id: session.id },
         data: { joinerConfirmedAt: now(), mode: session.mode ?? mode },
       })
-    } else {
-      throw httpError(403, 'Device is not part of this pairing session.')
     }
 
     const result = await completePairingIfReady(session.id)

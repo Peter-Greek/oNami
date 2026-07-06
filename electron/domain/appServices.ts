@@ -505,10 +505,13 @@ export class AppServices {
     })
 
     if (result.completed && result.syncGroupId) {
-      const token = await this.requestSyncDeviceToken()
       this.saveStoredSyncSettings({
         ...this.getStoredSyncSettings(),
         syncGroupId: result.syncGroupId,
+      })
+      const token = await this.requestSyncDeviceToken()
+      this.saveStoredSyncSettings({
+        ...this.getStoredSyncSettings(),
         deviceToken: token.token,
         deviceTokenExpiresAt: token.expiresAt,
       })

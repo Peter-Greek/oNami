@@ -1579,10 +1579,13 @@ export const installBrowserOnami = () => {
           },
         })
         if (result.completed && result.syncGroupId) {
-          const token = await requestSyncDeviceToken()
           writeSyncSettings({
             ...readSyncSettings(),
             syncGroupId: result.syncGroupId,
+          })
+          const token = await requestSyncDeviceToken()
+          writeSyncSettings({
+            ...readSyncSettings(),
             deviceToken: token.token,
             deviceTokenExpiresAt: token.expiresAt,
           })
