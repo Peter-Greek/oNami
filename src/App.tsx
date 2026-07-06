@@ -61,6 +61,10 @@ type View = 'study' | 'create' | 'import' | 'stats' | 'settings'
 
 type PairingFlow = 'start' | 'join' | null
 
+type BusyRunner = (fn: () => Promise<void>, label?: string) => void
+
+const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
+
 interface DeckRow {
   deck: DeckSummary
   depth: number
@@ -384,6 +388,7 @@ function App() {
   const [stats, setStats] = useState<AppStats>(emptyStats)
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
+  const [busyLabel, setBusyLabel] = useState('Working...')
   const [isMaximized, setIsMaximized] = useState(false)
   const [studyCardMode, setStudyCardMode] = useState(false)
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings)
@@ -450,8 +455,9 @@ function App() {
       await load(deck.id === selectedDeckId ? deck.id : selectedDeckId)
     })
 
-  const runBusy = async (fn: () => Promise<void>) => {
+  const runBusy: BusyRunner = async (fn, label = 'Working...') => {
     setBusy(true)
+    setBusyLabel(label)
     setMessage('')
     try {
       await fn()
@@ -459,6 +465,7 @@ function App() {
       setMessage(error instanceof Error ? error.message : String(error))
     } finally {
       setBusy(false)
+      setBusyLabel('Working...')
     }
   }
 
@@ -620,11 +627,13 @@ function App() {
               appSettings={appSettings}
               onAppSettingsChanged={setAppSettings}
               runBusy={runBusy}
+              setBusyLabel={setBusyLabel}
+              reload={() => load()}
             />
           )}
         </div>
 
-        {busy && <div className="busy">Working...</div>}
+        {busy && <div className="busy">{busyLabel}</div>}
       </section>
     </main>
   )
@@ -765,7 +774,7 @@ function StudyView({
   goToCreate: () => void
   goToImport: () => void
   reload: () => Promise<void>
-  runBusy: (fn: () => Promise<void>) => void
+  runBusy: BusyRunner
   onSessionActiveChange: (active: boolean) => void
   audioVolume: number
 }) {
@@ -1005,7 +1014,7 @@ function CreateView({
   decks: DeckSummary[]
   selectedDeckId: string
   reload: () => Promise<void>
-  runBusy: (fn: () => Promise<void>) => void
+  runBusy: BusyRunner
 }) {
   const [deckId, setDeckId] = useState(selectedDeckId)
   const [newDeckName, setNewDeckName] = useState('')
@@ -1177,7 +1186,7 @@ function ImportView({
   runBusy,
 }: {
   onImported: (deckId: string) => Promise<void>
-  runBusy: (fn: () => Promise<void>) => void
+  runBusy: BusyRunner
 }) {
   const [filePath, setFilePath] = useState('')
   const [preserve, setPreserve] = useState(false)
@@ -1385,10 +1394,14 @@ function SettingsView({
   appSettings,
   onAppSettingsChanged,
   runBusy,
+  setBusyLabel,
+  reload,
 }: {
   appSettings: AppSettings
   onAppSettingsChanged: (settings: AppSettings) => void
-  runBusy: (fn: () => Promise<void>) => void
+  runBusy: BusyRunner
+  setBusyLabel: (label: string) => void
+  reload: () => Promise<void>
 }) {
   const [aiSettings, setAiSettings] = useState<AiSettings>({ hasApiKey: false, model: 'gpt-4o-mini' })
   const [apiKey, setApiKey] = useState('')
@@ -1496,14 +1509,53 @@ function SettingsView({
       setSyncMessage('Confirm this device, then tell the starter to confirm.')
     })
 
+  const runInitialSyncAfterPairing = async () => {
+    setPairingFlow(null)
+    setPairing(null)
+    setJoinCode('')
+    setStarterReadyToConfirm(false)
+    setBusyLabel('Syncing content with host...')
+    setSyncMessage('Pairing complete. Syncing content with host...')
+    try {
+      const result = await window.onami.sync.syncNow()
+      setSyncRun(result)
+      setSyncStatus(await window.onami.sync.getStatus())
+      await reload()
+      setSyncMessage(
+        `Initial sync complete. Sent ${result.pushedEvents} local changes and applied ${result.appliedEvents}/${result.pulledEvents} host updates.`
+      )
+    } catch (error) {
+      setSyncStatus(await window.onami.sync.getStatus())
+      setSyncMessage(
+        `Device paired, but initial sync failed: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+  }
+
   const confirmPairing = () =>
     runBusy(async () => {
       const pairingCode = pairing?.pairingCode || joinCode
       if (!pairingCode.trim()) throw new Error('Pairing code is required.')
-      const result = await window.onami.sync.confirmPairing({ pairingCode, mode: pairingMode })
+      let result = await window.onami.sync.confirmPairing({ pairingCode, mode: pairingMode })
       setSyncStatus(await window.onami.sync.getStatus())
-      setSyncMessage(result.completed ? 'Device paired.' : 'Waiting for the other device.')
-    })
+      if (!result.completed && pairingFlow === 'join') {
+        setBusyLabel('Waiting for starter to finish pairing...')
+        setSyncMessage('Waiting for the starter device to finish pairing...')
+        for (let attempt = 0; attempt < 30; attempt += 1) {
+          await wait(2000)
+          result = await window.onami.sync.confirmPairing({ pairingCode, mode: pairingMode })
+          setSyncStatus(await window.onami.sync.getStatus())
+          if (result.completed && result.syncGroupId) break
+        }
+      }
+
+      if (result.completed && result.syncGroupId) {
+        await runInitialSyncAfterPairing()
+        return
+      }
+
+      setSyncMessage('Waiting for the other device.')
+    }, 'Confirming pairing...')
 
   const resetPairingFlow = () => {
     setPairingFlow(null)
@@ -1515,13 +1567,15 @@ function SettingsView({
 
   const syncNow = () =>
     runBusy(async () => {
+      setSyncMessage('Syncing local changes to host...')
       const result = await window.onami.sync.syncNow()
       setSyncRun(result)
       setSyncStatus(await window.onami.sync.getStatus())
+      await reload()
       setSyncMessage(
         `Synced ${result.pushedEvents} local, ${result.appliedEvents}/${result.pulledEvents} remote.`
       )
-    })
+    }, 'Syncing content with host...')
 
   return (
     <section className="view-stack">

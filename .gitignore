@@ -17,6 +17,7 @@ android/.gradle
 android/app/build
 android/app/src/main/assets/public
 host/data
+host/media-store
 host/.env
 *.local
 

@@ -29,6 +29,7 @@ import type {
   SyncDeckRecord,
   SyncDeckUpsertPayload,
   SyncEntityType,
+  SyncEventRecord,
   SyncEventPayload,
   SyncEventType,
   SyncHealthResult,
@@ -130,11 +131,15 @@ interface BrowserSyncSettings {
   deviceToken: string | null
   deviceTokenExpiresAt: string | null
   lastHostCursor: number
+  nextSyncSequence: number
+  backedUpEvents: number
+  lastBackedUpAt: string | null
   seedSnapshotPending: boolean
 }
 
 const STORAGE_KEY = 'onami.android.mvp.v1'
 const SYNC_SETTINGS_KEY = 'onami.sync.settings'
+const SYNC_OUTBOX_KEY = 'onami.sync.outbox'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
 
 const defaultAppSettings: AppSettings = {
@@ -218,6 +223,10 @@ const readSyncSettings = (): BrowserSyncSettings => {
       deviceToken: parsed.deviceToken ?? null,
       deviceTokenExpiresAt: parsed.deviceTokenExpiresAt ?? null,
       lastHostCursor: typeof parsed.lastHostCursor === 'number' ? parsed.lastHostCursor : 0,
+      nextSyncSequence:
+        typeof parsed.nextSyncSequence === 'number' && parsed.nextSyncSequence > 0 ? parsed.nextSyncSequence : 1,
+      backedUpEvents: typeof parsed.backedUpEvents === 'number' ? parsed.backedUpEvents : 0,
+      lastBackedUpAt: parsed.lastBackedUpAt ?? null,
       seedSnapshotPending: Boolean(parsed.seedSnapshotPending),
     }
   } catch {
@@ -231,6 +240,9 @@ const readSyncSettings = (): BrowserSyncSettings => {
       deviceToken: null,
       deviceTokenExpiresAt: null,
       lastHostCursor: 0,
+      nextSyncSequence: 1,
+      backedUpEvents: 0,
+      lastBackedUpAt: null,
       seedSnapshotPending: false,
     }
   }
@@ -245,19 +257,47 @@ const writeSyncSettings = (settings: BrowserSyncSettings) => {
   localStorage.setItem('onami.sync.hostUrl', next.hostUrl)
 }
 
+const readSyncOutbox = (): SyncEventRecord[] => {
+  try {
+    const raw = localStorage.getItem(SYNC_OUTBOX_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((event): event is SyncEventRecord =>
+      Boolean(
+        event &&
+          typeof event.eventId === 'string' &&
+          typeof event.sourceDeviceId === 'string' &&
+          typeof event.sequence === 'number' &&
+          typeof event.entityType === 'string' &&
+          typeof event.entityId === 'string' &&
+          typeof event.eventType === 'string' &&
+          typeof event.createdAt === 'string'
+      )
+    )
+  } catch {
+    return []
+  }
+}
+
+const writeSyncOutbox = (events: SyncEventRecord[]) => {
+  localStorage.setItem(SYNC_OUTBOX_KEY, JSON.stringify(events))
+}
+
 const syncStatusFromSettings = (settings: BrowserSyncSettings) => ({
   hostUrl: settings.hostUrl,
   deviceId: settings.deviceId,
   deviceName: settings.deviceName,
   syncGroupId: settings.syncGroupId,
   paired: Boolean(settings.syncGroupId),
-  pendingEvents: 0,
+  pendingEvents: readSyncOutbox().length,
   lastHostCursor: settings.lastHostCursor,
-  backedUpEvents: 0,
-  lastBackedUpAt: null,
+  backedUpEvents: settings.backedUpEvents,
+  lastBackedUpAt: settings.lastBackedUpAt,
   backupState: !settings.syncGroupId
     ? ('not-paired' as const)
-    : settings.lastHostCursor > 0
+    : readSyncOutbox().length > 0
+      ? ('needs-sync' as const)
+      : settings.backedUpEvents > 0 || settings.lastHostCursor > 0
       ? ('backed-up' as const)
       : ('no-data' as const),
 })
@@ -884,6 +924,147 @@ const applySnapshotBundle = (state: StoredState, bundle: SyncSnapshotBundle): vo
   }
 }
 
+const buildDeckSyncPayload = (deck: StoredDeck): SyncDeckUpsertPayload => ({
+  version: 1,
+  deck: {
+    id: deck.id,
+    parentId: deck.parentId,
+    name: deck.name,
+    source: deck.source,
+    sourceId: null,
+    createdAt: deck.createdAt,
+    updatedAt: deck.updatedAt,
+  },
+})
+
+const buildCardSyncPayload = (card: StoredCard): SyncCardUpsertPayload => ({
+  version: 1,
+  note: {
+    id: card.noteId,
+    deckId: card.deckId,
+    noteType: card.noteType,
+    fields: card.fields,
+    tags: card.tags,
+    sourceGuid: null,
+    createdAt: card.createdAt,
+    updatedAt: card.updatedAt,
+  },
+  card: {
+    id: card.id,
+    noteId: card.noteId,
+    deckId: card.deckId,
+    templateOrd: card.templateOrd,
+    frontHtml: card.frontHtml,
+    backHtml: card.backHtml,
+    mediaRefs: extractMediaIds(`${card.frontHtml}\n${card.backHtml}`),
+    sourceCardId: null,
+    statsResetAt: null,
+    createdAt: card.createdAt,
+    updatedAt: card.updatedAt,
+  },
+  reviewState: {
+    dueAt: card.dueAt,
+    state: card.state,
+    stability: card.stability,
+    difficulty: card.difficulty,
+    elapsedDays: card.elapsedDays,
+    scheduledDays: card.scheduledDays,
+    learningSteps: card.learningSteps,
+    reps: card.reps,
+    lapses: card.lapses,
+    successRate: card.successRate,
+    lastRating: card.lastRating,
+    lastReviewedAt: card.lastReviewedAt,
+  },
+})
+
+const buildReviewAnswerSyncPayload = (input: {
+  card: StoredCard
+  reviewedAt: string
+  rating: ReviewRating
+  elapsedMs: number
+  revealMs: number
+  answerMs: number
+  previousDueAt: string | null
+  nextDueAt: string | null
+}): SyncReviewAnswerPayload => ({
+  version: 1,
+  cardId: input.card.id,
+  reviewedAt: input.reviewedAt,
+  rating: input.rating,
+  elapsedMs: input.elapsedMs,
+  revealMs: input.revealMs,
+  answerMs: input.answerMs,
+  previousDueAt: input.previousDueAt,
+  nextDueAt: input.nextDueAt,
+  reviewState: buildCardSyncPayload(input.card).reviewState,
+})
+
+const enqueueSyncEvent = (
+  entityType: SyncEntityType,
+  entityId: string,
+  eventType: SyncEventType,
+  payload: SyncEventPayload
+): void => {
+  const settings = readSyncSettings()
+  if (!settings.deviceId || !settings.syncGroupId) return
+
+  const outbox = readSyncOutbox()
+  const sequence = Math.max(settings.nextSyncSequence, ...outbox.map((event) => event.sequence + 1), 1)
+  const event: SyncEventRecord = {
+    eventId: makeId('sync_event'),
+    sourceDeviceId: settings.deviceId,
+    sequence,
+    entityType,
+    entityId,
+    eventType,
+    payload,
+    createdAt: nowIso(),
+  }
+
+  writeSyncOutbox([...outbox, event])
+  writeSyncSettings({
+    ...settings,
+    nextSyncSequence: sequence + 1,
+  })
+}
+
+const markSyncEventsPushed = (eventIds: string[]): void => {
+  if (eventIds.length === 0) return
+  const sent = new Set(eventIds)
+  const current = readSyncOutbox()
+  const remaining = current.filter((event) => !sent.has(event.eventId))
+  const removedCount = current.length - remaining.length
+  if (removedCount === 0) return
+
+  const timestamp = nowIso()
+  writeSyncOutbox(remaining)
+  writeSyncSettings({
+    ...readSyncSettings(),
+    backedUpEvents: readSyncSettings().backedUpEvents + removedCount,
+    lastBackedUpAt: timestamp,
+  })
+}
+
+const pushPendingSyncEvents = async (token: string): Promise<number> => {
+  let pushedEvents = 0
+  while (true) {
+    const pending = readSyncOutbox()
+      .sort((left, right) => left.sequence - right.sequence)
+      .slice(0, 100)
+    if (pending.length === 0) break
+
+    await syncHostRequest<{ accepted: number; highestAcceptedSequence: number }>('/sync/events', {
+      method: 'POST',
+      token,
+      body: { events: pending },
+    })
+    markSyncEventsPushed(pending.map((event) => event.eventId))
+    pushedEvents += pending.length
+  }
+  return pushedEvents
+}
+
 const uploadFullSnapshot = async (): Promise<void> => {
   const settings = readSyncSettings()
   if (!settings.deviceId || !settings.syncGroupId) return
@@ -975,6 +1156,7 @@ export const installBrowserOnami = () => {
             updatedAt: timestamp,
           }
           state.decks.push(deck)
+          enqueueSyncEvent('deck', deck.id, 'deck.upsert', buildDeckSyncPayload(deck))
           return toSummary(state, deck)
         }),
       delete: async (deckId: string) =>
@@ -984,6 +1166,7 @@ export const installBrowserOnami = () => {
           state.decks = state.decks.filter((deck) => !deckIds.has(deck.id))
           state.cards = state.cards.filter((card) => !deletedCardIds.has(card.id))
           state.reviewLog = state.reviewLog.filter((log) => !deletedCardIds.has(log.cardId))
+          enqueueSyncEvent('deck', deckId, 'deck.delete', {})
         }),
       resetScheduling: async (deckId: string) =>
         mutateState((state) => {
@@ -1003,6 +1186,7 @@ export const installBrowserOnami = () => {
             card.lastRating = null
             card.lastReviewedAt = null
             card.updatedAt = nowIso()
+            enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
           })
         }),
       list: async () => {
@@ -1062,6 +1246,7 @@ export const installBrowserOnami = () => {
           }
           state.cards.push(card)
           deck.updatedAt = timestamp
+          enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
           return toCardSummary(state, card)
         }),
       update: async (input: UpdateCardInput) =>
@@ -1078,12 +1263,14 @@ export const installBrowserOnami = () => {
           if (input.backHtml !== undefined) card.backHtml = input.backHtml
           if (input.tags !== undefined) card.tags = input.tags
           card.updatedAt = nowIso()
+          enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
           return toCardSummary(state, card)
         }),
       delete: async (cardId: string) =>
         mutateState((state) => {
           state.cards = state.cards.filter((card) => card.id !== cardId)
           state.reviewLog = state.reviewLog.filter((log) => log.cardId !== cardId)
+          enqueueSyncEvent('card', cardId, 'card.delete', {})
         }),
     },
     study: {
@@ -1156,6 +1343,21 @@ export const installBrowserOnami = () => {
             previousDueAt,
             nextDueAt,
           })
+          enqueueSyncEvent(
+            'review',
+            card.id,
+            'review.answer',
+            buildReviewAnswerSyncPayload({
+              card,
+              reviewedAt: card.lastReviewedAt,
+              rating: input.rating,
+              elapsedMs: input.elapsedMs ?? 0,
+              revealMs: input.revealMs ?? 0,
+              answerMs: input.answerMs ?? 0,
+              previousDueAt,
+              nextDueAt,
+            })
+          )
 
           session.answered.push({ cardId: input.cardId, rating: input.rating })
           const sessionComplete = session.answered.length >= session.cardIds.length
@@ -1219,6 +1421,8 @@ export const installBrowserOnami = () => {
           deviceToken: sameHost ? current.deviceToken : null,
           deviceTokenExpiresAt: sameHost ? current.deviceTokenExpiresAt : null,
           lastHostCursor: sameHost ? current.lastHostCursor : 0,
+          backedUpEvents: sameHost ? current.backedUpEvents : 0,
+          lastBackedUpAt: sameHost ? current.lastBackedUpAt : null,
         }
         writeSyncSettings(next)
         return syncStatusFromSettings(next)
@@ -1308,6 +1512,7 @@ export const installBrowserOnami = () => {
         await maybeSeedSnapshot()
         const hydratedFromSnapshot = await hydrateFromSnapshot(token)
 
+        const pushedEvents = await pushPendingSyncEvents(token)
         let pulledEvents = 0
         let appliedEvents = 0
         let cursor = readSyncSettings().lastHostCursor
@@ -1342,13 +1547,13 @@ export const installBrowserOnami = () => {
         if (appliedEvents > 0 || hydratedFromSnapshot) sessions.clear()
 
         return {
-          pushedEvents: 0,
+          pushedEvents,
           pulledEvents,
           appliedEvents,
-          pendingEvents: 0,
+          pendingEvents: readSyncOutbox().length,
           lastHostCursor: cursor,
-          backedUpEvents: 0,
-          lastBackedUpAt: null,
+          backedUpEvents: readSyncSettings().backedUpEvents,
+          lastBackedUpAt: readSyncSettings().lastBackedUpAt,
         }
       },
     },

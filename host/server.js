@@ -131,8 +131,21 @@ const getPairingSessionByCode = async (code) => {
 const completePairingIfReady = async (sessionId) => {
   return prisma.$transaction(async (tx) => {
     const session = await tx.pairingSession.findUnique({ where: { id: sessionId } })
-    if (!session?.initiatorConfirmedAt || !session?.joinerConfirmedAt || session.completedAt) {
-      return { completed: Boolean(session?.completedAt), syncGroupId: null }
+    if (!session) return { completed: false, syncGroupId: null }
+
+    if (session.completedAt) {
+      const pairedDevice = await tx.device.findFirst({
+        where: {
+          id: { in: [session.initiatorDeviceId, session.joiningDeviceId].filter(Boolean) },
+          syncGroupId: { not: null },
+        },
+        select: { syncGroupId: true },
+      })
+      return { completed: true, syncGroupId: pairedDevice?.syncGroupId ?? null }
+    }
+
+    if (!session.initiatorConfirmedAt || !session.joinerConfirmedAt) {
+      return { completed: false, syncGroupId: null }
     }
 
     const [initiator, joiner] = await Promise.all([
