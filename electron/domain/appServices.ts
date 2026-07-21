@@ -105,6 +105,8 @@ export class AppServices {
   private readonly importer = new ApkgImporter()
   private readonly scheduler: SchedulerService
   private readonly sessions = new Map<string, StudySessionRuntime>()
+  private autoSyncTimer: NodeJS.Timeout | null = null
+  private syncInFlight: Promise<SyncRunResult> | null = null
 
   constructor(private readonly database: OnamiDatabase) {
     this.scheduler = new SchedulerService(database)
@@ -422,6 +424,8 @@ export class AppServices {
         backedUpEvents: backup.backedUpEvents,
         lastHostCursor,
       }),
+      activeProgress: null,
+      recentProgress: [],
     }
   }
 
@@ -521,7 +525,17 @@ export class AppServices {
     return result
   }
 
-  async syncNow(onProgress?: SyncProgressReporter): Promise<SyncRunResult> {
+  syncNow(onProgress?: SyncProgressReporter): Promise<SyncRunResult> {
+    if (this.syncInFlight) return this.syncInFlight
+
+    const task = this.runSync(onProgress).finally(() => {
+      if (this.syncInFlight === task) this.syncInFlight = null
+    })
+    this.syncInFlight = task
+    return task
+  }
+
+  private async runSync(onProgress?: SyncProgressReporter): Promise<SyncRunResult> {
     const stored = this.getStoredSyncSettings()
     if (!stored.syncGroupId) throw new Error('Pair this device before syncing.')
 
@@ -905,6 +919,21 @@ export class AppServices {
       eventType,
       payload,
     })
+    this.scheduleAutoSync()
+  }
+
+  private scheduleAutoSync(): void {
+    const stored = this.getStoredSyncSettings()
+    if (!stored.syncGroupId) return
+    if (this.autoSyncTimer) return
+
+    this.autoSyncTimer = setTimeout(() => {
+      this.autoSyncTimer = null
+      void this.syncNow().catch(() => {
+        // Background sync is best-effort. Manual sync still reports failures.
+      })
+    }, 500)
+    this.autoSyncTimer.unref?.()
   }
 
   private getSyncBackupState(input: {

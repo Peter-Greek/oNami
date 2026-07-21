@@ -134,6 +134,38 @@ const optionalString = (body, key) => {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+const requiredUuid = (body, key) => {
+  const value = requiredString(body, key)
+  if (!UUID_PATTERN.test(value)) throw httpError(400, `${key} must be a UUID.`)
+  return value
+}
+
+const optionalDate = (body, key) => {
+  const value = optionalString(body, key)
+  if (!value) return null
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) throw httpError(400, `${key} must be a valid timestamp.`)
+  return date
+}
+
+const allowedEntityTypes = new Set(['deck', 'card', 'review'])
+const allowedEventTypes = new Set(['deck.upsert', 'deck.delete', 'card.upsert', 'card.delete', 'review.answer'])
+
+const requiredKnownString = (body, key, allowed) => {
+  const value = requiredString(body, key)
+  if (!allowed.has(value)) throw httpError(400, `${key} is not supported.`)
+  return value
+}
+
+const optionalObject = (body, key) => {
+  const value = body?.[key]
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) throw httpError(400, `${key} must be an object.`)
+  return value
+}
+
 const upsertDevice = async ({ deviceId, name, platform, publicKey }) => {
   const existing = await prisma.device.findUnique({ where: { id: deviceId } })
   if (existing) {
@@ -480,12 +512,13 @@ const route = async (request, response, context) => {
       let highest = 0
 
       for (const event of events) {
-        const eventId = requiredString(event, 'eventId')
-        const sourceDeviceId = requiredString(event, 'sourceDeviceId')
+        const eventId = requiredUuid(event, 'eventId')
+        const sourceDeviceId = requiredUuid(event, 'sourceDeviceId')
         if (sourceDeviceId !== device.id) throw httpError(403, 'sourceDeviceId must match the authenticated device.')
 
         const sequence = Number(event.sequence)
         if (!Number.isInteger(sequence) || sequence <= 0) throw httpError(400, 'sequence must be a positive integer.')
+        const createdAt = optionalDate(event, 'createdAt') ?? now()
 
         const existingById = await tx.syncEvent.findUnique({
           where: { eventId },
@@ -508,11 +541,11 @@ const route = async (request, response, context) => {
             syncGroupId: device.syncGroupId,
             sourceDeviceId: device.id,
             sequence,
-            entityType: requiredString(event, 'entityType'),
+            entityType: requiredKnownString(event, 'entityType', allowedEntityTypes),
             entityId: requiredString(event, 'entityId'),
-            eventType: requiredString(event, 'eventType'),
-            payloadJson: event.payload ?? {},
-            createdAt: optionalString(event, 'createdAt') ? new Date(event.createdAt) : now(),
+            eventType: requiredKnownString(event, 'eventType', allowedEventTypes),
+            payloadJson: optionalObject(event, 'payload'),
+            createdAt,
           },
         })
         highest = Math.max(highest, sequence)

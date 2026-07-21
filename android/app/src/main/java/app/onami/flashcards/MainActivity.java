@@ -4,7 +4,9 @@ import android.app.Activity;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
+import android.view.WindowManager;
 import android.webkit.ConsoleMessage;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -46,10 +48,24 @@ public class MainActivity extends Activity {
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         settings.setMediaPlaybackRequiresUserGesture(false);
 
+        webView.addJavascriptInterface(new AndroidBridge(), "onamiAndroid");
         webView.setOverScrollMode(View.OVER_SCROLL_NEVER);
         setContentView(webView);
 
         webView.loadUrl("file:///android_asset/public/index.html");
+    }
+
+    private class AndroidBridge {
+        @JavascriptInterface
+        public void setKeepScreenAwake(boolean enabled) {
+            runOnUiThread(() -> {
+                if (enabled) {
+                    getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                } else {
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                }
+            });
+        }
     }
 
     @Override

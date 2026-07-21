@@ -138,11 +138,24 @@ interface BrowserSyncSettings {
   seedSnapshotPending: boolean
 }
 
+interface BrowserSyncProgressState {
+  active: boolean
+  updatedAt: string | null
+  events: SyncProgressEvent[]
+}
+
 const STORAGE_KEY = 'onami.android.mvp.v1'
 const SYNC_SETTINGS_KEY = 'onami.sync.settings'
 const SYNC_OUTBOX_KEY = 'onami.sync.outbox'
+const SYNC_PROGRESS_KEY = 'onami.sync.progress'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
+const AUTO_SYNC_DELAY_MS = 500
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const syncProgressListeners = new Set<(event: SyncProgressEvent) => void>()
+let browserWakeLock: { release?: () => Promise<void> } | null = null
+let browserAutoSyncTimer: number | null = null
+let browserSyncInFlight: Promise<SyncRunResult> | null = null
+let browserAutoSyncRunner: (() => Promise<SyncRunResult>) | null = null
 
 const defaultAppSettings: AppSettings = {
   audioVolume: 0.8,
@@ -285,28 +298,165 @@ const writeSyncOutbox = (events: SyncEventRecord[]) => {
   localStorage.setItem(SYNC_OUTBOX_KEY, JSON.stringify(events))
 }
 
+const isUuid = (value: unknown): value is string => typeof value === 'string' && UUID_PATTERN.test(value)
+
+const isValidTimestamp = (value: unknown): value is string =>
+  typeof value === 'string' && Number.isFinite(Date.parse(value))
+
+const normalizeSyncOutboxForUpload = (): SyncEventRecord[] => {
+  const settings = readSyncSettings()
+  const events = readSyncOutbox().sort((left, right) => left.sequence - right.sequence)
+  const usedSequences = new Set<number>()
+  let nextSequence = 1
+  let changed = false
+
+  const normalized = events.map((event) => {
+    const next: SyncEventRecord = { ...event }
+
+    if (!isUuid(next.eventId)) {
+      next.eventId = crypto.randomUUID()
+      changed = true
+    }
+    if (settings.deviceId && next.sourceDeviceId !== settings.deviceId) {
+      next.sourceDeviceId = settings.deviceId
+      changed = true
+    }
+    if (!Number.isInteger(next.sequence) || next.sequence <= 0 || usedSequences.has(next.sequence)) {
+      while (usedSequences.has(nextSequence)) nextSequence += 1
+      next.sequence = nextSequence
+      changed = true
+    }
+    usedSequences.add(next.sequence)
+    nextSequence = Math.max(nextSequence, next.sequence + 1)
+
+    if (!isValidTimestamp(next.createdAt)) {
+      next.createdAt = nowIso()
+      changed = true
+    }
+    if (!next.payload || typeof next.payload !== 'object' || Array.isArray(next.payload)) {
+      next.payload = {}
+      changed = true
+    }
+
+    return next
+  })
+
+  if (changed) {
+    writeSyncOutbox(normalized)
+    const highestSequence = Math.max(0, ...normalized.map((event) => event.sequence))
+    if (readSyncSettings().nextSyncSequence <= highestSequence) {
+      writeSyncSettings({ ...readSyncSettings(), nextSyncSequence: highestSequence + 1 })
+    }
+  }
+
+  return normalized
+}
+
+const readSyncProgressState = (): BrowserSyncProgressState => {
+  try {
+    const raw = localStorage.getItem(SYNC_PROGRESS_KEY)
+    const parsed = raw ? (JSON.parse(raw) as Partial<BrowserSyncProgressState>) : {}
+    const events = Array.isArray(parsed.events)
+      ? parsed.events.filter((event): event is SyncProgressEvent =>
+          Boolean(event && typeof event.stage === 'string' && typeof event.message === 'string')
+        )
+      : []
+    return {
+      active: Boolean(parsed.active),
+      updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : null,
+      events,
+    }
+  } catch {
+    return { active: false, updatedAt: null, events: [] }
+  }
+}
+
+const writeSyncProgressState = (state: BrowserSyncProgressState) => {
+  try {
+    localStorage.setItem(SYNC_PROGRESS_KEY, JSON.stringify({ ...state, events: state.events.slice(0, 20) }))
+  } catch {
+    // Progress UI is best-effort; media/state writes are the durable checkpoints.
+  }
+}
+
 const emitSyncProgress = (event: SyncProgressEvent) => {
+  const current = readSyncProgressState()
+  const active = event.stage !== 'complete' && event.stage !== 'error'
+  writeSyncProgressState({
+    active,
+    updatedAt: nowIso(),
+    events: [event, ...current.events].slice(0, 20),
+  })
   for (const listener of syncProgressListeners) listener(event)
 }
 
-const syncStatusFromSettings = (settings: BrowserSyncSettings) => ({
-  hostUrl: settings.hostUrl,
-  deviceId: settings.deviceId,
-  deviceName: settings.deviceName,
-  syncGroupId: settings.syncGroupId,
-  paired: Boolean(settings.syncGroupId),
-  pendingEvents: readSyncOutbox().length,
-  lastHostCursor: settings.lastHostCursor,
-  backedUpEvents: settings.backedUpEvents,
-  lastBackedUpAt: settings.lastBackedUpAt,
-  backupState: !settings.syncGroupId
-    ? ('not-paired' as const)
-    : readSyncOutbox().length > 0
-      ? ('needs-sync' as const)
-      : settings.backedUpEvents > 0 || settings.lastHostCursor > 0
-      ? ('backed-up' as const)
-      : ('no-data' as const),
-})
+const scheduleBrowserAutoSync = () => {
+  if (!readSyncSettings().syncGroupId || browserAutoSyncTimer !== null) return
+  browserAutoSyncTimer = window.setTimeout(() => {
+    browserAutoSyncTimer = null
+    void browserAutoSyncRunner?.().catch(() => {
+      // Background sync is best-effort. Manual sync still reports failures.
+    })
+  }, AUTO_SYNC_DELAY_MS)
+}
+
+const syncStatusFromSettings = (settings: BrowserSyncSettings) => {
+  const progress = readSyncProgressState()
+  return {
+    hostUrl: settings.hostUrl,
+    deviceId: settings.deviceId,
+    deviceName: settings.deviceName,
+    syncGroupId: settings.syncGroupId,
+    paired: Boolean(settings.syncGroupId),
+    pendingEvents: readSyncOutbox().length,
+    lastHostCursor: settings.lastHostCursor,
+    backedUpEvents: settings.backedUpEvents,
+    lastBackedUpAt: settings.lastBackedUpAt,
+    backupState: !settings.syncGroupId
+      ? ('not-paired' as const)
+      : readSyncOutbox().length > 0
+        ? ('needs-sync' as const)
+        : settings.backedUpEvents > 0 || settings.lastHostCursor > 0
+          ? ('backed-up' as const)
+          : ('no-data' as const),
+    activeProgress: progress.active ? (progress.events[0] ?? null) : null,
+    recentProgress: progress.events,
+  }
+}
+
+const setNativeKeepScreenAwake = (enabled: boolean) => {
+  const bridge = window.onamiAndroid
+  if (!bridge) return
+  try {
+    bridge.setKeepScreenAwake(enabled)
+  } catch {
+    // Native bridge is best-effort; browser wake lock below is the fallback.
+  }
+}
+
+const acquireSyncWakeLock = async () => {
+  setNativeKeepScreenAwake(true)
+  const wakeLock = (navigator as Navigator & {
+    wakeLock?: { request(type: 'screen'): Promise<{ release(): Promise<void> }> }
+  }).wakeLock
+  if (!wakeLock?.request || browserWakeLock) return
+  try {
+    browserWakeLock = await wakeLock.request('screen')
+  } catch {
+    browserWakeLock = null
+  }
+}
+
+const releaseSyncWakeLock = async () => {
+  setNativeKeepScreenAwake(false)
+  const current = browserWakeLock
+  browserWakeLock = null
+  try {
+    await current?.release?.()
+  } catch {
+    // Releasing can fail if the browser already revoked the lock.
+  }
+}
 
 const syncHostRequest = async <T,>(
   path: string,
@@ -422,38 +572,159 @@ const clampAudioVolume = (value: unknown): number => {
   return Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : defaultAppSettings.audioVolume
 }
 
-const readState = (): StoredState => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return clone(defaultState)
-    const parsed = JSON.parse(raw) as Partial<StoredState>
-    return {
-      decks: Array.isArray(parsed.decks) ? parsed.decks : [],
-      cards: Array.isArray(parsed.cards) ? parsed.cards : [],
-      reviewLog: Array.isArray(parsed.reviewLog) ? parsed.reviewLog : [],
-      media: Array.isArray(parsed.media) ? parsed.media : [],
-      appSettings: {
-        audioVolume: clampAudioVolume(parsed.appSettings?.audioVolume),
-        themeMode: normalizeThemeMode(parsed.appSettings?.themeMode),
-      },
-      aiSettings: {
-        hasApiKey: Boolean(parsed.aiSettings?.hasApiKey),
-        model: parsed.aiSettings?.model || 'gpt-4o-mini',
-      },
-    }
-  } catch {
-    return clone(defaultState)
+const normalizeState = (parsed: Partial<StoredState> | null | undefined): StoredState => {
+  const source = parsed ?? {}
+  return {
+    decks: Array.isArray(source.decks) ? source.decks : [],
+    cards: Array.isArray(source.cards) ? source.cards : [],
+    reviewLog: Array.isArray(source.reviewLog) ? source.reviewLog : [],
+    media: Array.isArray(source.media) ? source.media : [],
+    appSettings: {
+      audioVolume: clampAudioVolume(source.appSettings?.audioVolume),
+      themeMode: normalizeThemeMode(source.appSettings?.themeMode),
+    },
+    aiSettings: {
+      hasApiKey: Boolean(source.aiSettings?.hasApiKey),
+      model: source.aiSettings?.model || 'gpt-4o-mini',
+    },
   }
 }
 
+// Persistence lives in IndexedDB rather than localStorage: base64 media blobs
+// quickly overflow the ~5MB localStorage quota (the "exceeded the quota" error
+// on content sync). State is held in memory so the synchronous read/write API is
+// unchanged, and mirrored to IndexedDB — the lite state (decks/cards/review
+// log/settings) is one record and each media blob is its own record so growing
+// the media library never rewrites the whole store.
+const IDB_NAME = 'onami'
+const IDB_STATE_STORE = 'state'
+const IDB_MEDIA_STORE = 'media'
+const IDB_STATE_KEY = 'state'
+
+let cachedState: StoredState = clone(defaultState)
+const persistedMediaIds = new Set<string>()
+let persistChain: Promise<void> = Promise.resolve()
+let idbPromise: Promise<IDBDatabase> | null = null
+
+const openStateDb = (): Promise<IDBDatabase> => {
+  if (idbPromise) return idbPromise
+  idbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(IDB_NAME, 1)
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(IDB_STATE_STORE)) db.createObjectStore(IDB_STATE_STORE)
+      if (!db.objectStoreNames.contains(IDB_MEDIA_STORE)) db.createObjectStore(IDB_MEDIA_STORE)
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('Failed to open IndexedDB.'))
+  })
+  return idbPromise
+}
+
+const idbPut = (storeName: string, key: string, value: unknown): Promise<void> =>
+  openStateDb().then(
+    (db) =>
+      new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite')
+        tx.objectStore(storeName).put(value, key)
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+        tx.onabort = () => reject(tx.error)
+      })
+  )
+
+const idbGetStateRecord = (): Promise<Partial<StoredState> | undefined> =>
+  openStateDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const request = db.transaction(IDB_STATE_STORE, 'readonly').objectStore(IDB_STATE_STORE).get(IDB_STATE_KEY)
+        request.onsuccess = () => resolve(request.result as Partial<StoredState> | undefined)
+        request.onerror = () => reject(request.error)
+      })
+  )
+
+const idbGetAllMedia = (): Promise<StoredMedia[]> =>
+  openStateDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const request = db.transaction(IDB_MEDIA_STORE, 'readonly').objectStore(IDB_MEDIA_STORE).getAll()
+        request.onsuccess = () => resolve((request.result as StoredMedia[]) ?? [])
+        request.onerror = () => reject(request.error)
+      })
+  )
+
+const persistState = () => {
+  const liteState: StoredState = { ...cachedState, media: [] }
+  const newMedia = cachedState.media.filter((media) => !persistedMediaIds.has(media.id))
+  for (const media of newMedia) persistedMediaIds.add(media.id)
+  persistChain = persistChain
+    .then(async () => {
+      await idbPut(IDB_STATE_STORE, IDB_STATE_KEY, liteState)
+      for (const media of newMedia) await idbPut(IDB_MEDIA_STORE, media.id, media)
+    })
+    .catch((error) => {
+      // Re-queue this batch's media so a later write retries persisting it.
+      for (const media of newMedia) persistedMediaIds.delete(media.id)
+      console.error('Failed to persist oNami state to IndexedDB.', error)
+    })
+}
+
+// Resolves once every persist queued so far has been durably written to
+// IndexedDB. Sync checkpoints await this before advancing (media downloaded, host
+// cursor moved) so an app kill or dropped connection resumes exactly where it
+// left off instead of re-downloading or skipping un-persisted data.
+const flushState = (): Promise<void> => persistChain
+
+const requestPersistentStorage = async (): Promise<void> => {
+  try {
+    if (navigator.storage?.persist && !(await navigator.storage.persisted())) {
+      await navigator.storage.persist()
+    }
+  } catch {
+    // Best-effort: unsupported WebViews fall back to default (evictable) storage.
+  }
+}
+
+const loadPersistedState = async (): Promise<void> => {
+  try {
+    await requestPersistentStorage()
+    const record = await idbGetStateRecord()
+    if (record) {
+      const state = normalizeState(record)
+      state.media = await idbGetAllMedia()
+      cachedState = state
+      persistedMediaIds.clear()
+      for (const media of cachedState.media) persistedMediaIds.add(media.id)
+      return
+    }
+
+    // One-time migration off the localStorage store that overflowed its quota.
+    const legacy = localStorage.getItem(STORAGE_KEY)
+    cachedState = legacy ? normalizeState(JSON.parse(legacy) as Partial<StoredState>) : clone(defaultState)
+    persistedMediaIds.clear()
+    if (legacy) {
+      await idbPut(IDB_STATE_STORE, IDB_STATE_KEY, { ...cachedState, media: [] })
+      for (const media of cachedState.media) await idbPut(IDB_MEDIA_STORE, media.id, media)
+      for (const media of cachedState.media) persistedMediaIds.add(media.id)
+      localStorage.removeItem(STORAGE_KEY)
+    }
+  } catch (error) {
+    console.error('Failed to load oNami state from IndexedDB.', error)
+    cachedState = clone(defaultState)
+    persistedMediaIds.clear()
+  }
+}
+
+const readState = (): StoredState => cachedState
+
 const writeState = (state: StoredState) => {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+  cachedState = state
+  persistState()
 }
 
 const mutateState = <T>(fn: (state: StoredState) => T): T => {
-  const state = readState()
-  const result = fn(state)
-  writeState(state)
+  const result = fn(cachedState)
+  persistState()
   return result
 }
 
@@ -1018,7 +1289,7 @@ const enqueueSyncEvent = (
   const outbox = readSyncOutbox()
   const sequence = Math.max(settings.nextSyncSequence, ...outbox.map((event) => event.sequence + 1), 1)
   const event: SyncEventRecord = {
-    eventId: makeId('sync_event'),
+    eventId: crypto.randomUUID(),
     sourceDeviceId: settings.deviceId,
     sequence,
     entityType,
@@ -1033,6 +1304,7 @@ const enqueueSyncEvent = (
     ...settings,
     nextSyncSequence: sequence + 1,
   })
+  scheduleBrowserAutoSync()
 }
 
 const markSyncEventsPushed = (eventIds: string[]): void => {
@@ -1055,9 +1327,7 @@ const markSyncEventsPushed = (eventIds: string[]): void => {
 const pushPendingSyncEvents = async (token: string): Promise<number> => {
   let pushedEvents = 0
   while (true) {
-    const pending = readSyncOutbox()
-      .sort((left, right) => left.sequence - right.sequence)
-      .slice(0, 100)
+    const pending = normalizeSyncOutboxForUpload().slice(0, 100)
     if (pending.length === 0) break
 
     emitSyncProgress({
@@ -1159,24 +1429,56 @@ const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
     total: totalItems,
   })
 
-  const state = readState()
-  for (const [index, media] of response.snapshot.media.entries()) {
+  let state = readState()
+  let downloadedMediaCount = response.snapshot.media.filter((media) =>
+    state.media.some((item) => item.sha256 === media.sha256)
+  ).length
+  if (downloadedMediaCount > 0 && downloadedMediaCount < response.snapshot.media.length) {
+    emitSyncProgress({
+      stage: 'snapshot-download',
+      message: `Resuming media download ${downloadedMediaCount}/${response.snapshot.media.length}.`,
+      current: downloadedMediaCount,
+      total: response.snapshot.media.length,
+      itemType: 'media',
+    })
+  }
+
+  for (const media of response.snapshot.media) {
+    state = readState()
     if (state.media.some((item) => item.sha256 === media.sha256)) continue
     emitSyncProgress({
       stage: 'snapshot-download',
-      message: `Downloading media ${index + 1}/${response.snapshot.media.length}.`,
-      current: index + 1,
+      message: `Downloading media ${downloadedMediaCount + 1}/${response.snapshot.media.length}.`,
+      current: downloadedMediaCount + 1,
       total: response.snapshot.media.length,
       itemType: 'media',
       itemName: media.originalName,
     })
     const blob = await syncHostRequest<SyncMediaBlob>(`/media/${media.sha256}`, { method: 'GET', token })
+    state = readState()
+    if (state.media.some((item) => item.sha256 === media.sha256)) {
+      downloadedMediaCount += 1
+      continue
+    }
     state.media.push({
       id: media.id,
       sha256: media.sha256,
       mimeType: media.mimeType,
       originalName: media.originalName,
       dataBase64: blob.dataBase64,
+    })
+    writeState(state)
+    // Wait for the blob to hit IndexedDB before the next download so an
+    // interruption resumes from here rather than re-fetching this media.
+    await flushState()
+    downloadedMediaCount += 1
+    emitSyncProgress({
+      stage: 'snapshot-download',
+      message: `Saved media ${downloadedMediaCount}/${response.snapshot.media.length}.`,
+      current: downloadedMediaCount,
+      total: response.snapshot.media.length,
+      itemType: 'media',
+      itemName: media.originalName,
     })
   }
   for (const [index, deck] of response.snapshot.decks.entries()) {
@@ -1209,8 +1511,12 @@ const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
     })
   }
 
+  state = readState()
   applySnapshotBundle(state, response.snapshot)
   writeState(state)
+  // Only ack once the applied decks/cards are durable — the ack lets the host
+  // delete the snapshot, so losing this write would lose the data entirely.
+  await flushState()
 
   // Confirm receipt so the host clears the snapshot bundle and its media.
   emitSyncProgress({ stage: 'ack', message: 'Acknowledging initial snapshot.' })
@@ -1218,9 +1524,11 @@ const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
   return true
 }
 
-export const installBrowserOnami = () => {
+export const installBrowserOnami = async () => {
   if (window.onami) return
   document.documentElement.classList.add('browser-shell')
+
+  await loadPersistedState()
 
   const scheduler = fsrs({
     request_retention: 0.9,
@@ -1594,79 +1902,104 @@ export const installBrowserOnami = () => {
         return result
       },
       syncNow: async (): Promise<SyncRunResult> => {
-        const settings = readSyncSettings()
-        if (!settings.syncGroupId) throw new Error('Pair this device before syncing.')
+        if (browserSyncInFlight) return browserSyncInFlight
 
-        const token = await getValidSyncDeviceToken()
-        emitSyncProgress({ stage: 'pairing', message: 'Sync device is paired.' })
+        const task = (async (): Promise<SyncRunResult> => {
+          const settings = readSyncSettings()
+          if (!settings.syncGroupId) throw new Error('Pair this device before syncing.')
 
-        // Seed the snapshot if this phone is the source (retry after a failed
-        // confirm-time upload); otherwise hydrate from the source's one-time
-        // full snapshot (decks, cards, review-log history, media) before events.
-        await maybeSeedSnapshot()
-        const hydratedFromSnapshot = await hydrateFromSnapshot(token)
+          await acquireSyncWakeLock()
+          try {
+            const token = await getValidSyncDeviceToken()
+            emitSyncProgress({ stage: 'pairing', message: 'Sync device is paired.' })
 
-        const pushedEvents = await pushPendingSyncEvents(token)
-        let pulledEvents = 0
-        let appliedEvents = 0
-        let cursor = readSyncSettings().lastHostCursor
+            // Seed the snapshot if this phone is the source (retry after a failed
+            // confirm-time upload); otherwise hydrate from the source's one-time
+            // full snapshot (decks, cards, review-log history, media) before events.
+            await maybeSeedSnapshot()
+            const hydratedFromSnapshot = await hydrateFromSnapshot(token)
 
-        while (true) {
-          emitSyncProgress({
-            stage: 'pull',
-            message: `Checking host updates after cursor ${cursor}.`,
-            current: pulledEvents,
-            itemType: 'event',
-          })
-          const result = await syncHostRequest<{ events: RemoteSyncEvent[]; nextCursor: number }>(
-            `/sync/events?after=${cursor}&limit=100`,
-            { method: 'GET', token }
-          )
+            const pushedEvents = await pushPendingSyncEvents(token)
+            let pulledEvents = 0
+            let appliedEvents = 0
+            let cursor = readSyncSettings().lastHostCursor
 
-          pulledEvents += result.events.length
-          if (result.events.length > 0) {
-            const state = readState()
-            for (const event of result.events) {
+            while (true) {
               emitSyncProgress({
-                stage: 'apply',
-                message: `Applying ${event.eventType} update.`,
-                current: appliedEvents + 1,
-                total: pulledEvents,
-                itemType: event.entityType,
-                itemName: event.entityId,
+                stage: 'pull',
+                message: `Checking host updates after cursor ${cursor}.`,
+                current: pulledEvents,
+                itemType: 'event',
               })
-              if (applyRemoteSyncEvent(state, event)) appliedEvents += 1
+              const result = await syncHostRequest<{ events: RemoteSyncEvent[]; nextCursor: number }>(
+                `/sync/events?after=${cursor}&limit=100`,
+                { method: 'GET', token }
+              )
+
+              pulledEvents += result.events.length
+              if (result.events.length > 0) {
+                const state = readState()
+                for (const event of result.events) {
+                  emitSyncProgress({
+                    stage: 'apply',
+                    message: `Applying ${event.eventType} update.`,
+                    current: appliedEvents + 1,
+                    total: pulledEvents,
+                    itemType: event.entityType,
+                    itemName: event.entityId,
+                  })
+                  if (applyRemoteSyncEvent(state, event)) appliedEvents += 1
+                }
+                writeState(state)
+                // Persist applied events before advancing the cursor below;
+                // otherwise a crash would skip them on the next sync.
+                await flushState()
+              }
+
+              cursor = result.nextCursor
+              writeSyncSettings({ ...readSyncSettings(), lastHostCursor: cursor })
+
+              if (result.events.length < 100) break
             }
-            writeState(state)
+
+            emitSyncProgress({ stage: 'ack', message: `Acknowledging host cursor ${cursor}.`, current: cursor })
+            await syncHostRequest<{ ok: boolean }>('/sync/ack', {
+              method: 'POST',
+              token,
+              body: { lastEventId: cursor },
+            })
+
+            if (appliedEvents > 0 || hydratedFromSnapshot) sessions.clear()
+            emitSyncProgress({
+              stage: 'complete',
+              message: `Sync complete. Sent ${pushedEvents}, received ${pulledEvents}, applied ${appliedEvents}.`,
+            })
+
+            return {
+              pushedEvents,
+              pulledEvents,
+              appliedEvents,
+              pendingEvents: readSyncOutbox().length,
+              lastHostCursor: cursor,
+              backedUpEvents: readSyncSettings().backedUpEvents,
+              lastBackedUpAt: readSyncSettings().lastBackedUpAt,
+            }
+          } catch (error) {
+            emitSyncProgress({
+              stage: 'error',
+              message: error instanceof Error ? error.message : String(error),
+            })
+            throw error
+          } finally {
+            await releaseSyncWakeLock()
           }
+        })()
 
-          cursor = result.nextCursor
-          writeSyncSettings({ ...readSyncSettings(), lastHostCursor: cursor })
-
-          if (result.events.length < 100) break
-        }
-
-        emitSyncProgress({ stage: 'ack', message: `Acknowledging host cursor ${cursor}.`, current: cursor })
-        await syncHostRequest<{ ok: boolean }>('/sync/ack', {
-          method: 'POST',
-          token,
-          body: { lastEventId: cursor },
-        })
-
-        if (appliedEvents > 0 || hydratedFromSnapshot) sessions.clear()
-        emitSyncProgress({
-          stage: 'complete',
-          message: `Sync complete. Sent ${pushedEvents}, received ${pulledEvents}, applied ${appliedEvents}.`,
-        })
-
-        return {
-          pushedEvents,
-          pulledEvents,
-          appliedEvents,
-          pendingEvents: readSyncOutbox().length,
-          lastHostCursor: cursor,
-          backedUpEvents: readSyncSettings().backedUpEvents,
-          lastBackedUpAt: readSyncSettings().lastBackedUpAt,
+        browserSyncInFlight = task
+        try {
+          return await task
+        } finally {
+          if (browserSyncInFlight === task) browserSyncInFlight = null
         }
       },
       onProgress: (listener) => {
@@ -1689,5 +2022,6 @@ export const installBrowserOnami = () => {
     },
   }
 
+  browserAutoSyncRunner = api.sync.syncNow
   window.onami = api
 }

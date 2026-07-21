@@ -372,6 +372,8 @@ export interface SyncStatus {
   backedUpEvents: number
   lastBackedUpAt: string | null
   backupState: SyncBackupState
+  activeProgress: SyncProgressEvent | null
+  recentProgress: SyncProgressEvent[]
 }
 
 export interface SaveSyncSettingsInput {

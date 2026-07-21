@@ -65,6 +65,7 @@ type PairingFlow = 'start' | 'join' | null
 type BusyRunner = (fn: () => Promise<void>, label?: string) => void
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
+const AUTO_SYNC_INTERVAL_MS = 15_000
 
 interface DeckRow {
   deck: DeckSummary
@@ -394,6 +395,7 @@ function App() {
   const [studyCardMode, setStudyCardMode] = useState(false)
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings)
   const [systemTheme, setSystemTheme] = useState<'light' | 'dark'>('light')
+  const autoSyncRunningRef = useRef(false)
 
   const load = useCallback(async (deckId = selectedDeckId) => {
     const [deckList, appStats] = await Promise.all([window.onami.decks.list(), window.onami.stats.get()])
@@ -408,6 +410,39 @@ function App() {
   useEffect(() => {
     load().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)))
   }, [load])
+
+  useEffect(() => {
+    let disposed = false
+
+    const runAutoSync = async () => {
+      if (disposed || busy || studyCardMode || autoSyncRunningRef.current) return
+
+      autoSyncRunningRef.current = true
+      try {
+        const status = await window.onami.sync.getStatus()
+        if (!status.paired) return
+
+        const result = await window.onami.sync.syncNow()
+        if (disposed) return
+        if (result.appliedEvents > 0) await load()
+      } catch {
+        // Background sync is best-effort. The Settings tab still exposes the
+        // manual action and detailed progress/error messages.
+      } finally {
+        autoSyncRunningRef.current = false
+      }
+    }
+
+    void runAutoSync()
+    const interval = window.setInterval(() => {
+      void runAutoSync()
+    }, AUTO_SYNC_INTERVAL_MS)
+
+    return () => {
+      disposed = true
+      window.clearInterval(interval)
+    }
+  }, [busy, load, studyCardMode])
 
   useEffect(() => {
     window.onami.appWindow.isMaximized().then(setIsMaximized).catch(() => undefined)
@@ -789,6 +824,19 @@ function StudyView({
 
   const current = session?.cards[index]
 
+  // A parent deck has no direct cards, so its DeckDetail counts are 0. Use the
+  // subdeck-inclusive aggregate (what the tree shows and what a study session
+  // actually pulls from) for the metrics and the start/empty-state gate.
+  const selectedCounts = useMemo(() => {
+    const row = buildDeckRows(decks).find((entry) => entry.deck.id === selectedDeckId)
+    if (row) return row.aggregate
+    return {
+      totalCards: deck?.totalCards ?? 0,
+      dueCards: deck?.dueCards ?? 0,
+      newCards: deck?.newCards ?? 0,
+    }
+  }, [decks, selectedDeckId, deck])
+
   const resetCardTimer = useCallback(() => {
     cardStartedAtRef.current = performance.now()
     cardRevealedAtRef.current = null
@@ -955,9 +1003,9 @@ function StudyView({
       />
 
       <div className="deck-strip">
-        <Metric label="Cards" value={deck?.totalCards ?? 0} />
-        <Metric label="Due" value={deck?.dueCards ?? 0} />
-        <Metric label="New" value={deck?.newCards ?? 0} />
+        <Metric label="Cards" value={selectedCounts.totalCards} />
+        <Metric label="Due" value={selectedCounts.dueCards} />
+        <Metric label="New" value={selectedCounts.newCards} />
       </div>
 
       <div className="segmented">
@@ -968,7 +1016,7 @@ function StudyView({
         ))}
       </div>
 
-      {!session && (deck?.totalCards ?? 0) === 0 && (
+      {!session && selectedCounts.totalCards === 0 && (
         <div className="empty-state">
           <BookOpen size={28} />
           <h2>{deck?.name ?? 'Study'}</h2>
@@ -985,7 +1033,7 @@ function StudyView({
         </div>
       )}
 
-      {!session && (deck?.totalCards ?? 0) > 0 && (
+      {!session && selectedCounts.totalCards > 0 && (
         <button className="primary-action" disabled={busy || !selectedDeckId} onClick={start}>
           <BookOpen size={18} />
           Start {formatStudyModeLabel(mode)}
@@ -1438,21 +1486,25 @@ function SettingsView({
     syncStatus?.backupState === 'backed-up'
       ? `Host stores synced deck, card, and review events${backupTime ? ` as of ${backupTime}` : ''}. Media file backup is not enabled yet.`
       : syncStatus?.backupState === 'needs-sync'
-        ? `${syncStatus.pendingEvents} local changes need Sync now before the host is current.`
+        ? `${syncStatus.pendingEvents} local changes are queued and will sync automatically.`
         : syncStatus?.backupState === 'no-data'
-          ? 'Run Sync now after adding or importing cards. The host stores synced events; it is not only a wireless gateway.'
+          ? 'New cards and reviews will sync automatically after this device has study data.'
           : 'Pair this device to back up structured study data to the host.'
+
+  const applySyncStatus = useCallback((next: SyncStatus) => {
+    setSyncStatus(next)
+    setSyncHostUrl(next.hostUrl)
+    if (next.recentProgress.length > 0) setSyncProgress(next.recentProgress.slice(0, 12))
+    if (next.activeProgress) setSyncMessage(next.activeProgress.message)
+  }, [])
 
   useEffect(() => {
     window.onami.ai.getSettings().then((next) => {
       setAiSettings(next)
       setModel(next.model)
     })
-    window.onami.sync.getStatus().then((next) => {
-      setSyncStatus(next)
-      setSyncHostUrl(next.hostUrl)
-    })
-  }, [])
+    window.onami.sync.getStatus().then(applySyncStatus)
+  }, [applySyncStatus])
 
   useEffect(() => {
     setAudioVolume(appSettings.audioVolume)
@@ -1480,8 +1532,7 @@ function SettingsView({
   const saveSyncHost = () =>
     runBusy(async () => {
       const next = await window.onami.sync.saveSettings({ hostUrl: syncHostUrl })
-      setSyncStatus(next)
-      setSyncHostUrl(next.hostUrl)
+      applySyncStatus(next)
       setSyncMessage('Sync host saved.')
     })
 
@@ -1499,7 +1550,7 @@ function SettingsView({
       setPairing(result)
       setJoinCode('')
       setStarterReadyToConfirm(false)
-      setSyncStatus(await window.onami.sync.getStatus())
+      applySyncStatus(await window.onami.sync.getStatus())
       setSyncMessage('Give the pairing code to the other device.')
     })
 
@@ -1515,7 +1566,7 @@ function SettingsView({
         expiresInMs: Math.max(0, Date.parse(result.expiresAt) - Date.now()),
       })
       setStarterReadyToConfirm(true)
-      setSyncStatus(await window.onami.sync.getStatus())
+      applySyncStatus(await window.onami.sync.getStatus())
       setSyncMessage('Confirm this device, then tell the starter to confirm.')
     })
 
@@ -1530,13 +1581,13 @@ function SettingsView({
     try {
       const result = await window.onami.sync.syncNow()
       setSyncRun(result)
-      setSyncStatus(await window.onami.sync.getStatus())
+      applySyncStatus(await window.onami.sync.getStatus())
       await reload()
       setSyncMessage(
         `Initial sync complete. Sent ${result.pushedEvents} local changes and applied ${result.appliedEvents}/${result.pulledEvents} host updates.`
       )
     } catch (error) {
-      setSyncStatus(await window.onami.sync.getStatus())
+      applySyncStatus(await window.onami.sync.getStatus())
       setSyncMessage(
         `Device paired, but initial sync failed: ${error instanceof Error ? error.message : String(error)}`
       )
@@ -1548,7 +1599,7 @@ function SettingsView({
       const pairingCode = pairing?.pairingCode || joinCode
       if (!pairingCode.trim()) throw new Error('Pairing code is required.')
       let result = await window.onami.sync.confirmPairing({ pairingCode, mode: pairingMode })
-      setSyncStatus(await window.onami.sync.getStatus())
+      applySyncStatus(await window.onami.sync.getStatus())
       if (!result.completed) {
         const waitingMessage =
           pairingFlow === 'start'
@@ -1559,7 +1610,7 @@ function SettingsView({
         for (let attempt = 0; attempt < 30; attempt += 1) {
           await wait(2000)
           result = await window.onami.sync.confirmPairing({ pairingCode, mode: pairingMode })
-          setSyncStatus(await window.onami.sync.getStatus())
+          applySyncStatus(await window.onami.sync.getStatus())
           if (result.completed && result.syncGroupId) break
         }
       }
@@ -1586,7 +1637,7 @@ function SettingsView({
       setSyncMessage('Syncing local changes to host...')
       const result = await window.onami.sync.syncNow()
       setSyncRun(result)
-      setSyncStatus(await window.onami.sync.getStatus())
+      applySyncStatus(await window.onami.sync.getStatus())
       await reload()
       setSyncMessage(
         `Synced ${result.pushedEvents} local, ${result.appliedEvents}/${result.pulledEvents} remote.`

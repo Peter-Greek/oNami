@@ -1033,6 +1033,34 @@ textarea:focus {
   text-transform: uppercase;
 }
 
+/* Phone shell is far narrower than the desktop window: tighten the numeric
+   columns, action buttons and depth indent so the deck name keeps enough room
+   to stay readable instead of collapsing to one letter. */
+.browser-shell .deck-tree-header,
+.browser-shell .deck-tree-main {
+  grid-template-columns: minmax(0, 1fr) 40px 32px 48px;
+  column-gap: 2px;
+}
+
+.browser-shell .deck-tree-header {
+  padding-right: 66px;
+}
+
+.browser-shell .deck-tree-row {
+  grid-template-columns: minmax(0, 1fr) 28px 28px;
+}
+
+.browser-shell .deck-tree-main {
+  padding-left: calc(10px + var(--deck-depth, 0px) * 0.55);
+  padding-right: 4px;
+}
+
+.browser-shell .deck-delete,
+.browser-shell .deck-refresh {
+  width: 26px;
+  height: 26px;
+}
+
 .deck-tree-header span:not(:first-child) {
   text-align: right;
 }

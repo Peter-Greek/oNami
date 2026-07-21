@@ -4,10 +4,13 @@ import './index.css'
 import App from './App.tsx'
 import { installBrowserOnami } from './browserOnami'
 
-installBrowserOnami()
+async function bootstrap() {
+  await installBrowserOnami()
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  )
+}
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
+void bootstrap()
