@@ -5,13 +5,12 @@ plugins {
 android {
     namespace 'app.onami.flashcards'
     compileSdk 30
-    buildToolsVersion '30.0.2'
 
     defaultConfig {
         applicationId 'app.onami.flashcards'
         minSdk 23
         targetSdk 30
-        versionCode 1
-        versionName '0.1.0'
+        versionCode = Integer.parseInt(System.getenv('ONAMI_VERSION_CODE') ?: '1')
+        versionName = System.getenv('ONAMI_VERSION_NAME') ?: '0.1.0'
     }
 }

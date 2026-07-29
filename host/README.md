@@ -26,6 +26,31 @@ Health check:
 Invoke-RestMethod http://127.0.0.1:41730/health
 ```
 
+## Android APK download
+
+Build and atomically publish the latest Android APK from the repository root:
+
+```powershell
+npm run android:publish
+```
+
+The build script bootstraps JDK 17 and the required Android SDK packages when
+they are missing. The host serves the last successful build at:
+
+```text
+http://147.135.31.128:41729/downloads/onami-latest.apk
+```
+
+Build metadata, including version, commit, size, and SHA-256, is available at:
+
+```text
+http://147.135.31.128:41729/downloads/android.json
+```
+
+Every build receives a timestamp-based Android version code. Android builds
+made on this server share its persistent debug signing key, so later remote
+builds can update earlier remote builds in place.
+
 ## PM2 on the Server
 
 First run setup once:

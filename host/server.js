@@ -33,6 +33,7 @@ const config = {
   // Full-data snapshots and single media blobs are much larger than incremental events.
   maxBlobBytes: Number(process.env.ONAMI_MAX_BLOB_BYTES ?? 64 * 1024 * 1024),
   mediaDir: process.env.ONAMI_MEDIA_DIR ?? path.join(__dirname, 'media-store'),
+  androidReleaseDir: process.env.ONAMI_ANDROID_RELEASE_DIR ?? path.join(__dirname, '..', 'release', 'android'),
 }
 
 if (!process.env.DATABASE_URL) {
@@ -333,6 +334,23 @@ const send = (response, status, body) => {
   response.end(JSON.stringify(body))
 }
 
+const sendDownload = (request, response, filePath, contentType, downloadName) => {
+  if (!fs.existsSync(filePath)) {
+    return send(response, 404, { error: 'The Android build is not available yet.' })
+  }
+
+  const stat = fs.statSync(filePath)
+  response.writeHead(200, {
+    'content-type': contentType,
+    'content-length': stat.size,
+    'content-disposition': `attachment; filename="${downloadName}"`,
+    'cache-control': 'no-cache',
+    'access-control-allow-origin': config.corsOrigin,
+  })
+  if (request.method === 'HEAD') return response.end()
+  fs.createReadStream(filePath).pipe(response)
+}
+
 const route = async (request, response, context) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
   logRequest(context, 'info', 'request.start')
@@ -341,6 +359,27 @@ const route = async (request, response, context) => {
   if (request.method === 'GET' && url.pathname === '/health') {
     await prisma.$queryRaw`SELECT 1`
     return send(response, 200, { ok: true, service: 'onami-host', time: nowIso() })
+  }
+  if (
+    (request.method === 'GET' || request.method === 'HEAD') &&
+    url.pathname === '/downloads/onami-latest.apk'
+  ) {
+    return sendDownload(
+      request,
+      response,
+      path.join(config.androidReleaseDir, 'onami-latest.apk'),
+      'application/vnd.android.package-archive',
+      'oNami-latest.apk',
+    )
+  }
+  if (request.method === 'GET' && url.pathname === '/downloads/android.json') {
+    return sendDownload(
+      request,
+      response,
+      path.join(config.androidReleaseDir, 'android.json'),
+      'application/json; charset=utf-8',
+      'oNami-android.json',
+    )
   }
 
   if (request.method === 'POST' && url.pathname === '/devices/bootstrap') {
