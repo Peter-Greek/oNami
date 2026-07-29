@@ -918,6 +918,7 @@ const getStats = (state: StoredState, filter?: StatsFilterInput): AppStats => {
         deckId: card.deckId,
         deckName: state.decks.find((deck) => deck.id === card.deckId)?.name ?? card.deckNameSnapshot,
         frontHtml: rewriteMediaForDisplay(state, card.frontHtml),
+        backHtml: rewriteMediaForDisplay(state, card.backHtml),
         state: card.state,
         dueAt: card.dueAt,
         reps: card.reps,

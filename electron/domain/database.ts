@@ -1490,6 +1490,7 @@ export class OnamiDatabase {
         deckId: item.card.deckId,
         deckName: item.card.deckName,
         frontHtml: item.card.frontHtml,
+        backHtml: item.card.backHtml,
         state: item.card.state,
         dueAt: item.card.dueAt,
         reps: item.card.reps,

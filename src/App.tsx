@@ -320,12 +320,6 @@ const formatDuration = (valueMs: number) => {
   return remainingHours === 0 ? `${days}d` : `${days}d ${remainingHours}h`
 }
 
-const previewHtml = (html: string) => {
-  const template = document.createElement('template')
-  template.innerHTML = sanitize(html)
-  return template.content.textContent?.replace(/\s+/g, ' ').trim() ?? ''
-}
-
 const dueLabel = (card: CardSummary) => {
   if (card.state === 'New') return 'New'
   if (!card.dueAt) return card.state
@@ -656,6 +650,7 @@ function App() {
               decks={decks}
               deleteDeck={deleteDeck}
               resetDeckScheduling={resetDeckScheduling}
+              audioVolume={appSettings.audioVolume}
             />
           )}
           {view === 'settings' && (
@@ -1280,11 +1275,13 @@ function StatsView({
   decks,
   deleteDeck,
   resetDeckScheduling,
+  audioVolume,
 }: {
   stats: AppStats
   decks: DeckSummary[]
   deleteDeck: (deck: DeckSummary) => void
   resetDeckScheduling: (deck: DeckSummary) => void
+  audioVolume: number
 }) {
   const [scopedDeckId, setScopedDeckId] = useState('')
   const [scopedStats, setScopedStats] = useState<AppStats>(stats)
@@ -1398,7 +1395,7 @@ function StatsView({
         {activeStats.hardestCards.length > 0 ? (
           <div className="hard-card-list">
             {activeStats.hardestCards.map((card) => (
-              <HardCardRow card={card} key={card.cardId} />
+              <HardCardRow card={card} audioVolume={audioVolume} key={card.cardId} />
             ))}
           </div>
         ) : (
@@ -1416,15 +1413,39 @@ function StatsView({
   )
 }
 
-function HardCardRow({ card }: { card: HardCardSummary }) {
-  const preview = previewHtml(card.frontHtml) || 'Untitled card'
+function HardCardRow({ card, audioVolume }: { card: HardCardSummary; audioVolume: number }) {
+  const front = useMemo(() => extractAudio(card.frontHtml), [card.frontHtml])
+  const back = useMemo(() => extractAudio(card.backHtml), [card.backHtml])
+  const audioSources = useMemo(
+    () => [...new Set([...front.audioSources, ...back.audioSources])],
+    [back.audioSources, front.audioSources]
+  )
 
   return (
     <div className="hard-card-row">
       <div className="hard-card-copy">
-        <strong>{preview}</strong>
-        <span>{card.deckName}</span>
+        {front.html ? (
+          <div className="hard-card-front" dangerouslySetInnerHTML={{ __html: front.html }} />
+        ) : (
+          <strong>Untitled card</strong>
+        )}
+        <span className="hard-card-deck-name">{card.deckName}</span>
       </div>
+      <div className="hard-card-answer">
+        <span>Answer</span>
+        {back.html ? (
+          <div className="hard-card-answer-content" dangerouslySetInnerHTML={{ __html: back.html }} />
+        ) : (
+          <div className="hard-card-answer-content">No answer provided</div>
+        )}
+      </div>
+      {audioSources.length > 0 && (
+        <div className="hard-card-audio" aria-label="Card audio">
+          {audioSources.map((source, index) => (
+            <AudioPlayButton key={`${source}-${index}`} src={source} volume={audioVolume} />
+          ))}
+        </div>
+      )}
       <div className="hard-card-meta">
         <span>{percent(card.successRate)} recall</span>
         <span>{formatDuration(card.averageReviewMs)} avg</span>

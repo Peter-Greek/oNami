@@ -1282,24 +1282,71 @@ textarea:focus {
   gap: 3px;
 }
 
-.hard-card-copy strong,
-.hard-card-copy span {
+.hard-card-deck-name {
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.hard-card-copy strong {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+.hard-card-front {
+  overflow-wrap: anywhere;
+  font-size: 16px;
+  font-weight: 900;
   line-height: 1.3;
 }
 
-.hard-card-copy span {
+.hard-card-front :first-child,
+.hard-card-answer-content :first-child {
+  margin-top: 0;
+}
+
+.hard-card-front :last-child,
+.hard-card-answer-content :last-child {
+  margin-bottom: 0;
+}
+
+.hard-card-front img,
+.hard-card-answer-content img {
+  max-width: 100%;
+  max-height: 180px;
+  border-radius: 8px;
+}
+
+.hard-card-deck-name {
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
   white-space: nowrap;
+}
+
+.hard-card-answer {
+  display: grid;
+  gap: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.hard-card-answer > span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.hard-card-answer-content {
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+
+.hard-card-audio {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.hard-card-audio .audio-play-button {
+  width: 36px;
+  height: 36px;
 }
 
 .hard-card-meta {

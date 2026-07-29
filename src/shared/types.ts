@@ -184,6 +184,7 @@ export interface HardCardSummary {
   deckId: string
   deckName: string
   frontHtml: string
+  backHtml: string
   state: ReviewStateName
   dueAt: string | null
   reps: number

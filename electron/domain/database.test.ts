@@ -147,6 +147,8 @@ describe('OnamiDatabase.getStats', () => {
       expect(scoped.averageAgainToEasyMs).not.toBeNull()
       expect(scoped.completion.fullyLearned).toBe(true)
       expect(scoped.hardestCards[0]?.cardId).toBe(hardCard.id)
+      expect(scoped.hardestCards[0]?.frontHtml).toBe('inu')
+      expect(scoped.hardestCards[0]?.backHtml).toBe('dog')
 
       const overall = db.getStats()
       expect(overall.scopeDeckId).toBeNull()
