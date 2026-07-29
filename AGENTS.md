@@ -33,3 +33,75 @@ Pull requests should include a concise summary, test results (`npm test`, `npm r
 ## Agent-Specific Instructions
 
 When changing IPC-backed features, update all related pieces together: `src/shared/types.ts`, the relevant `AppServices` method, `electron/main.ts` IPC handler, and `electron/preload.ts` bridge entry. Preserve local-only data handling and avoid exposing secrets, especially OpenAI API keys, to the renderer.
+
+## Mandatory Android Remote Deployment
+
+After completing any change that affects the oNami app, deploy it unless the
+user explicitly says not to deploy. Do not stop after editing or testing. The
+required outcome is: commit the change, push it to `origin/main`, fast-forward
+the remote checkout, build and publish the Android APK on the remote host,
+verify the public download, and return the download link to the user.
+
+Use the `main-server-ssh` skill and treat the remote host as production.
+
+- SSH: `admin@147.135.31.128` on port `2222`
+- Identity: `C:\Users\xerxe\.ssh\id_ed25519`
+- Remote oNami checkout: `C:\Users\admin\Desktop\oNami`
+- Production branch: `main`
+- Remote publish command: `npm run android:publish`
+- Stable APK URL: `http://147.135.31.128:41729/downloads/onami-latest.apk`
+- Metadata URL: `http://147.135.31.128:41729/downloads/android.json`
+- Health URL: `http://147.135.31.128:41729/health`
+
+Follow this sequence every time:
+
+1. Inspect local status and preserve unrelated work. Run the relevant tests,
+   `npm test`, `npm run lint`, and `npm run build` in proportion to the change.
+2. Commit only the intended files with a short imperative commit message.
+3. Push the exact commit to `origin/main`, normally with
+   `git push origin HEAD:main`, and record the full pushed SHA.
+4. Before changing the remote checkout, run `git status -sb`,
+   `git branch --show-current`, `git remote -v`, and `git rev-parse HEAD` in
+   `C:\Users\admin\Desktop\oNami`. Refuse to overwrite unrelated dirty state.
+5. Run `git pull --ff-only origin main`. The server's GitHub credential helper
+   may fail for this private repository. If it does, use the verified bundle
+   fallback below; never reset, force-checkout, or copy source files over the
+   checkout.
+6. Verify remote `HEAD` exactly equals the pushed full SHA and that the remote
+   worktree is clean.
+7. Run `npm run android:publish` in the remote checkout. This installs locked
+   dependencies, builds the renderer and Android app, and atomically publishes
+   `release\android\onami-latest.apk` plus `android.json`.
+8. Do not replace, remove, display, or transmit the remote Android signing key
+   at `C:\Users\admin\.android\debug.keystore`. It is deliberately persistent
+   so downloaded builds can update existing matching installations.
+9. Restart `onami-host` with `pm2 restart onami-host --update-env` only when
+   host code or download-serving behavior changed. A normal app-only APK build
+   does not require a host restart because publishing replaces the served file
+   atomically.
+10. Verify the metadata reports the expected `gitSha`, `gitDirty: false`, a
+    nonzero size, and a SHA-256. Verify the APK URL returns `200`, and a request
+    with `Range: bytes=0-1023` returns `206` with exactly 1024 bytes. Verify the
+    health URL still returns `ok: true`.
+11. Return a clickable cache-busting link such as
+    `http://147.135.31.128:41729/downloads/onami-latest.apk?v=<versionCode>`
+    using the published `versionCode`, plus the version and commit SHA. Tell the
+    user to cancel any older stuck Chrome download before tapping the new link.
+
+### Verified Git-bundle fallback
+
+Use this only when the remote host cannot authenticate to GitHub:
+
+1. Independently confirm `git ls-remote origin refs/heads/main` equals the
+   exact commit just pushed.
+2. Create a complete bundle from the updated local tracking ref with
+   `git bundle create <temp-bundle> origin/main`, then run
+   `git bundle verify <temp-bundle>`.
+3. Copy the bundle over SSH to a specific temporary file under
+   `C:\Users\admin\AppData\Local\Temp` without exposing the SSH key.
+4. In the remote checkout, fetch only
+   `refs/remotes/origin/main:refs/remotes/origin/main` from that bundle.
+5. Confirm remote `refs/remotes/origin/main` equals the exact pushed SHA, then
+   run `git merge --ff-only refs/remotes/origin/main`.
+6. Confirm remote `HEAD` equals the pushed SHA, report status, and remove only
+   the specific temporary bundle file.
