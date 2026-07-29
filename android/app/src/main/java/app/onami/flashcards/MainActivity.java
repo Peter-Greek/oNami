@@ -47,6 +47,9 @@ public class MainActivity extends Activity {
         settings.setAllowUniversalAccessFromFileURLs(true);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setSupportZoom(false);
+        settings.setBuiltInZoomControls(false);
+        settings.setDisplayZoomControls(false);
 
         webView.addJavascriptInterface(new AndroidBridge(), "onamiAndroid");
         webView.setOverScrollMode(View.OVER_SCROLL_NEVER);

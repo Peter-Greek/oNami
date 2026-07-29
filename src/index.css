@@ -20,3 +20,26 @@ body {
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 }
+
+html.browser-shell,
+html.browser-shell body,
+html.browser-shell #root {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+html.browser-shell * {
+  -webkit-tap-highlight-color: transparent;
+}
+
+html.browser-shell :is(input, textarea, .html-content, .hard-card-front, .hard-card-answer-content),
+html.browser-shell :is(.html-content, .hard-card-front, .hard-card-answer-content) * {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+html.browser-shell .tabbar button:focus:not(:focus-visible) {
+  outline: none;
+}
