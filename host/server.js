@@ -2,6 +2,7 @@ import http from 'node:http'
 import { createHash, randomBytes, randomUUID, timingSafeEqual, verify as verifySignature } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { pipeline } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 
 import { PrismaClient } from '@prisma/client'
@@ -334,21 +335,82 @@ const send = (response, status, body) => {
   response.end(JSON.stringify(body))
 }
 
+const parseByteRange = (rangeHeader, size) => {
+  if (!rangeHeader) return null
+
+  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim())
+  if (!match || (!match[1] && !match[2])) return { invalid: true }
+
+  let start
+  let end
+  if (!match[1]) {
+    const suffixLength = Number(match[2])
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return { invalid: true }
+    start = Math.max(size - suffixLength, 0)
+    end = size - 1
+  } else {
+    start = Number(match[1])
+    end = match[2] ? Number(match[2]) : size - 1
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) ||
+      start < 0 ||
+      start >= size ||
+      end < start
+    ) {
+      return { invalid: true }
+    }
+    end = Math.min(end, size - 1)
+  }
+
+  return { start, end }
+}
+
 const sendDownload = (request, response, filePath, contentType, downloadName) => {
   if (!fs.existsSync(filePath)) {
     return send(response, 404, { error: 'The Android build is not available yet.' })
   }
 
   const stat = fs.statSync(filePath)
-  response.writeHead(200, {
+  const range = parseByteRange(request.headers.range, stat.size)
+  const baseHeaders = {
     'content-type': contentType,
-    'content-length': stat.size,
     'content-disposition': `attachment; filename="${downloadName}"`,
-    'cache-control': 'no-cache',
+    'cache-control': 'no-store',
+    'accept-ranges': 'bytes',
+    'last-modified': stat.mtime.toUTCString(),
+    'x-content-type-options': 'nosniff',
+    connection: 'close',
     'access-control-allow-origin': config.corsOrigin,
+  }
+
+  response.shouldKeepAlive = false
+  if (range?.invalid) {
+    response.writeHead(416, {
+      ...baseHeaders,
+      'content-range': `bytes */${stat.size}`,
+      'content-length': 0,
+    })
+    return response.end()
+  }
+
+  const start = range?.start ?? 0
+  const end = range?.end ?? stat.size - 1
+  const contentLength = Math.max(end - start + 1, 0)
+  response.writeHead(range ? 206 : 200, {
+    ...baseHeaders,
+    'content-length': contentLength,
+    ...(range ? { 'content-range': `bytes ${start}-${end}/${stat.size}` } : {}),
   })
   if (request.method === 'HEAD') return response.end()
-  fs.createReadStream(filePath).pipe(response)
+
+  return new Promise((resolve) => {
+    const stream = fs.createReadStream(filePath, range ? { start, end } : undefined)
+    pipeline(stream, response, (error) => {
+      if (error && !response.destroyed) response.destroy(error)
+      resolve()
+    })
+  })
 }
 
 const route = async (request, response, context) => {
