@@ -19,6 +19,8 @@ export interface DeckSummary {
   learningCards: number
   reviewCards: number
   successRate: number
+  unitTestScore: number | null
+  unitTestedAt: string | null
   createdAt: string
   updatedAt: string
 }
@@ -199,6 +201,17 @@ export interface HardCardSummary {
   difficultyScore: number
 }
 
+export interface DeckTestScoreSummary {
+  deckId: string
+  deckName: string
+  parentId: string | null
+  score: number
+  hasTakenTest: boolean
+  testedAt: string | null
+  subdeckAverage: number | null
+  subdeckCount: number
+}
+
 export interface AppStats {
   scopeDeckId: string | null
   scopeDeckName: string | null
@@ -218,6 +231,7 @@ export interface AppStats {
   averageReviewMs: number
   averageRevealMs: number
   averageAgainToEasyMs: number | null
+  unitTestScores: DeckTestScoreSummary[]
   hardestCards: HardCardSummary[]
 }
 
@@ -250,6 +264,8 @@ export interface SyncDeckRecord {
   name: string
   source: string
   sourceId: string | null
+  unitTestScore?: number | null
+  unitTestedAt?: string | null
   createdAt: string
   updatedAt: string
 }

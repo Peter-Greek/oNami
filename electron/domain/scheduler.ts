@@ -44,7 +44,8 @@ export interface StudySessionRuntime {
 export const selectCardsForMode = (
   cards: CardSummary[],
   mode: StudyMode,
-  settings: StudySessionSettings
+  settings: StudySessionSettings,
+  random: () => number = Math.random
 ): CardSummary[] => {
   const limit = settings.limit ?? 30
   const now = Date.now()
@@ -58,9 +59,14 @@ export const selectCardsForMode = (
   if (mode === 'learn-new') return newCards.slice(0, limit)
   if (mode === 'review-due') return dueCards.slice(0, limit)
   if (mode === 'unit-test') {
-    return [...cards]
-      .sort((a, b) => a.successRate - b.successRate || a.reps - b.reps)
-      .slice(0, settings.unitTestEvery ?? limit)
+    const shuffled = [...cards]
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+      const swapIndex = Math.floor(random() * (index + 1))
+      const current = shuffled[index]
+      shuffled[index] = shuffled[swapIndex]
+      shuffled[swapIndex] = current
+    }
+    return shuffled
   }
 
   const newEvery = Math.max(1, settings.newEvery ?? 5)
@@ -96,6 +102,12 @@ export class SchedulerService {
   constructor(private readonly database: OnamiDatabase) {}
 
   answer(input: AnswerInput, session: StudySessionRuntime): AnswerResult {
+    if (!session.cardIds.includes(input.cardId)) throw new Error('Card is not part of this study session.')
+    if (session.answered.some((answer) => answer.cardId === input.cardId)) {
+      throw new Error('Card has already been answered in this study session.')
+    }
+    if (session.mode === 'unit-test') return this.answerUnitTest(input, session)
+
     const previous = this.database.getReviewState(input.cardId)
     const fsrsCard = this.toFsrsCard(previous)
     const reviewedAt = new Date()
@@ -133,14 +145,6 @@ export class SchedulerService {
 
     session.answered.push({ cardId: input.cardId, rating: input.rating })
     const sessionComplete = session.answered.length >= session.cardIds.length
-    const unitScore =
-      session.mode === 'unit-test' && session.answered.length > 0
-        ? session.answered.filter((answer) => answer.rating !== 'again').length / session.answered.length
-        : null
-    const recommendation =
-      sessionComplete && unitScore !== null && unitScore < session.unitTestThreshold
-        ? 'Score is below target. Run a focused Review Due session before adding more new cards.'
-        : null
 
     return {
       cardId: input.cardId,
@@ -149,8 +153,38 @@ export class SchedulerService {
       state: nextState,
       successRate,
       sessionComplete,
+      unitScore: null,
+      recommendation: null,
+    }
+  }
+
+  private answerUnitTest(input: AnswerInput, session: StudySessionRuntime): AnswerResult {
+    if (input.rating !== 'hard' && input.rating !== 'easy') {
+      throw new Error('Unit test answers must be Hard or Easy.')
+    }
+
+    const reviewedAt = new Date().toISOString()
+    if (input.rating === 'hard') this.database.markCardReviewDue(input.cardId, reviewedAt)
+
+    session.answered.push({ cardId: input.cardId, rating: input.rating })
+    const sessionComplete = session.answered.length >= session.cardIds.length
+    const unitScore =
+      session.answered.filter((answer) => answer.rating === 'easy').length / session.answered.length
+    if (sessionComplete) this.database.recordDeckUnitTestScore(session.deckId, unitScore, reviewedAt)
+
+    const state = this.database.getReviewState(input.cardId)
+    return {
+      cardId: input.cardId,
+      rating: input.rating,
+      nextDueAt: state?.dueAt ?? null,
+      state: state?.state ?? 'New',
+      successRate: state?.successRate ?? 0,
+      sessionComplete,
       unitScore,
-      recommendation,
+      recommendation:
+        sessionComplete && unitScore < session.unitTestThreshold
+          ? 'Score is below target. Incorrect cards are ready in Review Due.'
+          : null,
     }
   }
 

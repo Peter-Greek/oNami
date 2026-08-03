@@ -304,6 +304,13 @@ export class AppServices {
     if (!session) throw new Error('Study session not found.')
     const previous = this.database.getReviewState(input.cardId)
     const result = this.scheduler.answer(input, session)
+
+    if (session.mode === 'unit-test') {
+      if (input.rating === 'hard') this.queueCardUpsert(input.cardId)
+      if (result.sessionComplete) this.queueDeckUpsert(session.deckId)
+      return result
+    }
+
     const reviewedAt = this.database.getReviewState(input.cardId)?.lastReviewedAt ?? new Date().toISOString()
     this.queueSyncEvent(
       'review',

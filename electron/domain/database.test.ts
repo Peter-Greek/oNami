@@ -13,6 +13,46 @@ const createTestDatabase = () => {
 }
 
 describe('OnamiDatabase.getStats', () => {
+  it('reports per-deck unit scores and counts untested subdecks as zero in their parent average', () => {
+    const { db, dir } = createTestDatabase()
+
+    try {
+      const parent = db.createDeck({ name: 'Languages' })
+      const japanese = db.createDeck({ name: 'Japanese', parentId: parent.id })
+      const spanish = db.createDeck({ name: 'Spanish', parentId: parent.id })
+
+      db.recordDeckUnitTestScore(japanese.id, 0.8, '2026-08-01T12:00:00.000Z')
+
+      const beforeParentTest = db.getStats(parent.id).unitTestScores
+      const parentBefore = beforeParentTest.find((score) => score.deckId === parent.id)
+      const japaneseScore = beforeParentTest.find((score) => score.deckId === japanese.id)
+      const spanishScore = beforeParentTest.find((score) => score.deckId === spanish.id)
+
+      expect(parentBefore).toMatchObject({
+        score: 0,
+        hasTakenTest: false,
+        subdeckAverage: 0.4,
+        subdeckCount: 2,
+      })
+      expect(japaneseScore).toMatchObject({ score: 0.8, hasTakenTest: true })
+      expect(spanishScore).toMatchObject({ score: 0, hasTakenTest: false })
+
+      db.recordDeckUnitTestScore(parent.id, 1, '2026-08-02T12:00:00.000Z')
+      expect(db.getDeckSummary(parent.id)).toMatchObject({
+        unitTestScore: 1,
+        unitTestedAt: '2026-08-02T12:00:00.000Z',
+      })
+      expect(db.getStats(parent.id).unitTestScores.find((score) => score.deckId === parent.id)).toMatchObject({
+        score: 1,
+        hasTakenTest: true,
+        subdeckAverage: 0.4,
+      })
+    } finally {
+      db.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('aggregates review telemetry and supports deck scoping', () => {
     const { db, dir } = createTestDatabase()
 
@@ -280,6 +320,7 @@ describe('OnamiDatabase sync events', () => {
 
     try {
       const deck = source.db.createDeck({ name: 'Remote deck' })
+      source.db.recordDeckUnitTestScore(deck.id, 1, '2026-07-06T11:00:00.000Z')
       const card = source.db.createCard({
         deckId: deck.id,
         noteType: 'basic',
@@ -350,6 +391,7 @@ describe('OnamiDatabase sync events', () => {
       expect(cardApplied).toBe(true)
       expect(reviewApplied).toBe(true)
       expect(target.db.getDeckSummary(deck.id).name).toBe('Remote deck')
+      expect(target.db.getDeckSummary(deck.id).unitTestScore).toBe(1)
       expect(target.db.getCard(card.id).frontHtml).toBe('kaze')
       expect(target.db.getReviewState(card.id)?.reps).toBe(1)
 

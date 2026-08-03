@@ -608,6 +608,27 @@ export class OnamiDatabase {
     this.upsertReviewState(cardId, createDefaultReviewState())
   }
 
+  markCardReviewDue(cardId: string, dueAt = nowIso()): void {
+    const current = this.getReviewState(cardId) ?? createDefaultReviewState()
+    this.upsertReviewState(cardId, {
+      ...current,
+      dueAt,
+      state: current.state === 'New' ? 'Learning' : current.state,
+    })
+  }
+
+  recordDeckUnitTestScore(deckId: string, score: number, testedAt = nowIso()): void {
+    this.assertDeck(deckId)
+    const normalizedScore = Math.min(1, Math.max(0, score))
+    this.db
+      .prepare(
+        `UPDATE decks
+         SET unit_test_score = ?, unit_tested_at = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(normalizedScore, testedAt, testedAt, deckId)
+  }
+
   resetDeckScheduling(deckId: string): void {
     this.assertDeck(deckId)
     const cardIds = this.getCardIdsForDeckTree(deckId)
@@ -1098,6 +1119,22 @@ export class OnamiDatabase {
       averageReviewMs,
       averageRevealMs,
       averageAgainToEasyMs,
+      unitTestScores: scopedDecks.map((deck) => {
+        const children = allDecks.filter((candidate) => candidate.parentId === deck.id)
+        return {
+          deckId: deck.id,
+          deckName: deck.name,
+          parentId: deck.parentId,
+          score: deck.unitTestScore ?? 0,
+          hasTakenTest: deck.unitTestScore !== null,
+          testedAt: deck.unitTestedAt,
+          subdeckAverage:
+            children.length > 0
+              ? children.reduce((sum, child) => sum + (child.unitTestScore ?? 0), 0) / children.length
+              : null,
+          subdeckCount: children.length,
+        }
+      }),
       hardestCards: cardPerformance
         .sort(
           (a, b) =>
@@ -1241,6 +1278,8 @@ export class OnamiDatabase {
     `)
 
     this.ensureColumn('cards', 'stats_reset_at', 'TEXT')
+    this.ensureColumn('decks', 'unit_test_score', 'REAL')
+    this.ensureColumn('decks', 'unit_tested_at', 'TEXT')
     this.ensureColumn('review_log', 'reveal_ms', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('review_log', 'answer_ms', 'INTEGER NOT NULL DEFAULT 0')
   }
@@ -1549,6 +1588,8 @@ export class OnamiDatabase {
         d.parent_id,
         d.name,
         d.source,
+        d.unit_test_score,
+        d.unit_tested_at,
         d.created_at,
         d.updated_at,
         COUNT(c.id) AS total_cards,
@@ -1590,6 +1631,10 @@ export class OnamiDatabase {
       name: toStringValue(row.name),
       source: toStringValue(row.source),
       sourceId: row.source_id ? toStringValue(row.source_id) : null,
+      unitTestScore: row.unit_test_score === null || row.unit_test_score === undefined
+        ? null
+        : toNumber(row.unit_test_score),
+      unitTestedAt: row.unit_tested_at ? toStringValue(row.unit_tested_at) : null,
       createdAt: toStringValue(row.created_at),
       updatedAt: toStringValue(row.updated_at),
     }
@@ -1598,18 +1643,34 @@ export class OnamiDatabase {
   private applyDeckUpsert(payload: SyncDeckUpsertPayload): void {
     const deck = payload.deck
     const parentId = deck.parentId && this.hasDeck(deck.parentId) ? deck.parentId : null
+    const hasUnitTestScore = Object.prototype.hasOwnProperty.call(deck, 'unitTestScore')
     this.db
       .prepare(
-        `INSERT INTO decks (id, parent_id, name, source, source_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO decks
+          (id, parent_id, name, source, source_id, unit_test_score, unit_tested_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
           parent_id = excluded.parent_id,
           name = excluded.name,
           source = excluded.source,
           source_id = excluded.source_id,
+          unit_test_score = CASE WHEN ? THEN excluded.unit_test_score ELSE decks.unit_test_score END,
+          unit_tested_at = CASE WHEN ? THEN excluded.unit_tested_at ELSE decks.unit_tested_at END,
           updated_at = excluded.updated_at`
       )
-      .run(deck.id, parentId, deck.name, deck.source, deck.sourceId, deck.createdAt, deck.updatedAt)
+      .run(
+        deck.id,
+        parentId,
+        deck.name,
+        deck.source,
+        deck.sourceId,
+        deck.unitTestScore ?? null,
+        deck.unitTestedAt ?? null,
+        deck.createdAt,
+        deck.updatedAt,
+        hasUnitTestScore ? 1 : 0,
+        hasUnitTestScore ? 1 : 0
+      )
   }
 
   private applyCardUpsert(payload: SyncCardUpsertPayload): void {
@@ -1744,6 +1805,10 @@ export class OnamiDatabase {
       learningCards: toNumber(row.learning_cards),
       reviewCards: toNumber(row.review_cards),
       successRate: toNumber(row.success_rate),
+      unitTestScore: row.unit_test_score === null || row.unit_test_score === undefined
+        ? null
+        : toNumber(row.unit_test_score),
+      unitTestedAt: row.unit_tested_at ? toStringValue(row.unit_tested_at) : null,
       createdAt: toStringValue(row.created_at),
       updatedAt: toStringValue(row.updated_at),
     }

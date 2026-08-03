@@ -53,6 +53,8 @@ interface StoredDeck {
   parentId: string | null
   name: string
   source: string
+  unitTestScore: number | null
+  unitTestedAt: string | null
   createdAt: string
   updatedAt: string
 }
@@ -575,7 +577,16 @@ const clampAudioVolume = (value: unknown): number => {
 const normalizeState = (parsed: Partial<StoredState> | null | undefined): StoredState => {
   const source = parsed ?? {}
   return {
-    decks: Array.isArray(source.decks) ? source.decks : [],
+    decks: Array.isArray(source.decks)
+      ? source.decks.map((deck) => ({
+          ...deck,
+          unitTestScore:
+            typeof deck.unitTestScore === 'number'
+              ? Math.min(1, Math.max(0, deck.unitTestScore))
+              : null,
+          unitTestedAt: deck.unitTestedAt ?? null,
+        }))
+      : [],
     cards: Array.isArray(source.cards) ? source.cards : [],
     reviewLog: Array.isArray(source.reviewLog) ? source.reviewLog : [],
     media: Array.isArray(source.media) ? source.media : [],
@@ -747,6 +758,8 @@ const toSummary = (state: StoredState, deck: StoredDeck): DeckSummary => {
       reviewedCards.length > 0
         ? reviewedCards.reduce((sum, card) => sum + card.successRate, 0) / reviewedCards.length
         : 0,
+    unitTestScore: deck.unitTestScore,
+    unitTestedAt: deck.unitTestedAt,
     createdAt: deck.createdAt,
     updatedAt: deck.updatedAt,
   }
@@ -814,7 +827,8 @@ const selectedCardsForStats = (state: StoredState, deckId?: string | null) => {
 const selectCardsForMode = (
   cards: CardSummary[],
   mode: StudyMode,
-  settings: StudySessionSettings
+  settings: StudySessionSettings,
+  random: () => number = Math.random
 ): CardSummary[] => {
   const limit = settings.limit ?? 30
   const now = Date.now()
@@ -828,9 +842,14 @@ const selectCardsForMode = (
   if (mode === 'learn-new') return newCards.slice(0, limit)
   if (mode === 'review-due') return dueCards.slice(0, limit)
   if (mode === 'unit-test') {
-    return [...cards]
-      .sort((a, b) => a.successRate - b.successRate || a.reps - b.reps)
-      .slice(0, settings.unitTestEvery ?? limit)
+    const shuffled = [...cards]
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+      const swapIndex = Math.floor(random() * (index + 1))
+      const current = shuffled[index]
+      shuffled[index] = shuffled[swapIndex]
+      shuffled[swapIndex] = current
+    }
+    return shuffled
   }
 
   const newEvery = Math.max(1, settings.newEvery ?? 5)
@@ -969,6 +988,25 @@ const getStats = (state: StoredState, filter?: StatsFilterInput): AppStats => {
     averageReviewMs: logs.length > 0 ? logs.reduce((sum, log) => sum + log.elapsedMs, 0) / logs.length : 0,
     averageRevealMs: logs.length > 0 ? logs.reduce((sum, log) => sum + log.revealMs, 0) / logs.length : 0,
     averageAgainToEasyMs: null,
+    unitTestScores: (scopeDeckId
+      ? state.decks.filter((deck) => getDescendantDeckIds(state, scopeDeckId).includes(deck.id))
+      : state.decks
+    ).map((deck) => {
+      const children = state.decks.filter((candidate) => candidate.parentId === deck.id)
+      return {
+        deckId: deck.id,
+        deckName: deck.name,
+        parentId: deck.parentId,
+        score: deck.unitTestScore ?? 0,
+        hasTakenTest: deck.unitTestScore !== null,
+        testedAt: deck.unitTestedAt,
+        subdeckAverage:
+          children.length > 0
+            ? children.reduce((sum, child) => sum + (child.unitTestScore ?? 0), 0) / children.length
+            : null,
+        subdeckCount: children.length,
+      }
+    }),
     hardestCards: hardCards,
   }
 }
@@ -994,15 +1032,23 @@ const normalizeNoteType = (value: string): NoteTypeName => {
 
 const applyDeckUpsert = (state: StoredState, payload: SyncDeckUpsertPayload): boolean => {
   const deck = payload.deck
+  const existing = state.decks.find((item) => item.id === deck.id)
   const record: StoredDeck = {
     id: deck.id,
     parentId: deck.parentId,
     name: deck.name,
     source: deck.source,
+    unitTestScore:
+      typeof deck.unitTestScore === 'number'
+        ? Math.min(1, Math.max(0, deck.unitTestScore))
+        : existing?.unitTestScore ?? null,
+    unitTestedAt:
+      Object.prototype.hasOwnProperty.call(deck, 'unitTestedAt')
+        ? deck.unitTestedAt ?? null
+        : existing?.unitTestedAt ?? null,
     createdAt: deck.createdAt,
     updatedAt: deck.updatedAt,
   }
-  const existing = state.decks.find((item) => item.id === deck.id)
   if (existing) Object.assign(existing, record)
   else state.decks.push(record)
   return true
@@ -1122,6 +1168,8 @@ const buildSnapshot = (state: StoredState): SyncSnapshotBundle => ({
       name: deck.name,
       source: deck.source,
       sourceId: null,
+      unitTestScore: deck.unitTestScore,
+      unitTestedAt: deck.unitTestedAt,
       createdAt: deck.createdAt,
       updatedAt: deck.updatedAt,
     })
@@ -1210,6 +1258,8 @@ const buildDeckSyncPayload = (deck: StoredDeck): SyncDeckUpsertPayload => ({
     name: deck.name,
     source: deck.source,
     sourceId: null,
+    unitTestScore: deck.unitTestScore,
+    unitTestedAt: deck.unitTestedAt,
     createdAt: deck.createdAt,
     updatedAt: deck.updatedAt,
   },
@@ -1553,6 +1603,8 @@ export const installBrowserOnami = async () => {
             parentId: input.parentId ?? null,
             name: trimmedName,
             source: 'android-local',
+            unitTestScore: null,
+            unitTestedAt: null,
             createdAt: timestamp,
             updatedAt: timestamp,
           }
@@ -1710,6 +1762,56 @@ export const installBrowserOnami = async () => {
           if (!session) throw new Error('Study session not found.')
           const card = state.cards.find((item) => item.id === input.cardId)
           if (!card) throw new Error('Card not found.')
+          if (!session.cardIds.includes(input.cardId)) {
+            throw new Error('Card is not part of this study session.')
+          }
+          if (session.answered.some((answer) => answer.cardId === input.cardId)) {
+            throw new Error('Card has already been answered in this study session.')
+          }
+
+          if (session.mode === 'unit-test') {
+            if (input.rating !== 'hard' && input.rating !== 'easy') {
+              throw new Error('Unit test answers must be Hard or Easy.')
+            }
+
+            const testedAt = nowIso()
+            if (input.rating === 'hard') {
+              card.dueAt = testedAt
+              if (card.state === 'New') card.state = 'Learning'
+              card.updatedAt = testedAt
+              enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
+            }
+
+            session.answered.push({ cardId: input.cardId, rating: input.rating })
+            const sessionComplete = session.answered.length >= session.cardIds.length
+            const unitScore =
+              session.answered.filter((answer) => answer.rating === 'easy').length /
+              session.answered.length
+
+            if (sessionComplete) {
+              const deck = state.decks.find((item) => item.id === session.deckId)
+              if (!deck) throw new Error('Deck not found.')
+              deck.unitTestScore = unitScore
+              deck.unitTestedAt = testedAt
+              deck.updatedAt = testedAt
+              enqueueSyncEvent('deck', deck.id, 'deck.upsert', buildDeckSyncPayload(deck))
+            }
+
+            return {
+              cardId: card.id,
+              rating: input.rating,
+              nextDueAt: card.dueAt,
+              state: card.state,
+              successRate: card.successRate,
+              sessionComplete,
+              unitScore,
+              recommendation:
+                sessionComplete && unitScore < session.unitTestThreshold
+                  ? 'Score is below target. Incorrect cards are ready in Review Due.'
+                  : null,
+            }
+          }
+
           const previousDueAt = card.dueAt
           const previousReps = card.reps
           const result = scheduler.next(toFsrsCard(card), new Date(), ratingMap[input.rating] as Grade)
@@ -1762,14 +1864,6 @@ export const installBrowserOnami = async () => {
 
           session.answered.push({ cardId: input.cardId, rating: input.rating })
           const sessionComplete = session.answered.length >= session.cardIds.length
-          const unitScore =
-            session.mode === 'unit-test' && session.answered.length > 0
-              ? session.answered.filter((answer) => answer.rating !== 'again').length / session.answered.length
-              : null
-          const recommendation =
-            sessionComplete && unitScore !== null && unitScore < session.unitTestThreshold
-              ? 'Score is below target. Run a focused Review Due session before adding more new cards.'
-              : null
 
           return {
             cardId: card.id,
@@ -1778,8 +1872,8 @@ export const installBrowserOnami = async () => {
             state: nextState,
             successRate,
             sessionComplete,
-            unitScore,
-            recommendation,
+            unitScore: null,
+            recommendation: null,
           }
         }),
     },

@@ -134,6 +134,7 @@ const emptyStats: AppStats = {
   averageReviewMs: 0,
   averageRevealMs: 0,
   averageAgainToEasyMs: null,
+  unitTestScores: [],
   hardestCards: [],
 }
 
@@ -735,20 +736,20 @@ function DeckTree({
       </div>
       <div className="deck-tree-rows">
         {rows.map((row) => {
-          const fullyLearned = row.aggregate.totalCards > 0 && row.aggregate.newCards === 0
+          const perfectUnitTest = row.deck.unitTestScore === 1
           return (
             <div
-              className={`deck-tree-row${row.deck.id === selectedDeckId ? ' selected' : ''}${fullyLearned ? ' completed' : ''}`}
+              className={`deck-tree-row${row.deck.id === selectedDeckId ? ' selected' : ''}${perfectUnitTest ? ' perfect-test' : ''}`}
               key={row.deck.id}
               style={{ '--deck-depth': `${row.depth * 18}px` } as CSSProperties}
             >
               <button className="deck-tree-main" onClick={() => onSelect(row.deck.id)}>
                 <span className="deck-tree-name-cell">
                   <span className="deck-tree-name">{row.deck.name}</span>
-                  {fullyLearned && (
+                  {perfectUnitTest && (
                     <span className="deck-complete-badge">
                       <CheckCircle2 size={12} />
-                      100%
+                      Test 100%
                     </span>
                   )}
                 </span>
@@ -861,7 +862,6 @@ function StudyView({
       const next = await window.onami.study.startSession(selectedDeckId, mode, {
         limit: 30,
         newEvery: 5,
-        unitTestEvery: 20,
         unitTestThreshold: 0.8,
       })
       setIndex(0)
@@ -973,11 +973,20 @@ function StudyView({
               Reveal
             </button>
           ) : (
-            <div className="rating-grid session-rating-grid">
-              <button onClick={() => answer('again')}>Again</button>
-              <button onClick={() => answer('hard')}>Hard</button>
-              <button onClick={() => answer('good')}>Good</button>
-              <button onClick={() => answer('easy')}>Easy</button>
+            <div className={`rating-grid session-rating-grid${mode === 'unit-test' ? ' unit-test' : ''}`}>
+              {mode === 'unit-test' ? (
+                <>
+                  <button onClick={() => answer('hard')}>Hard</button>
+                  <button onClick={() => answer('easy')}>Easy</button>
+                </>
+              ) : (
+                <>
+                  <button onClick={() => answer('again')}>Again</button>
+                  <button onClick={() => answer('hard')}>Hard</button>
+                  <button onClick={() => answer('good')}>Good</button>
+                  <button onClick={() => answer('easy')}>Easy</button>
+                </>
+              )}
             </div>
           )}
 
@@ -1383,6 +1392,31 @@ function StatsView({
               : formatDuration(activeStats.averageAgainToEasyMs)
           }
         />
+      </div>
+      <div className="stats-section">
+        <div className="stats-section-header">
+          <span>
+            <CheckCircle2 size={16} />
+            Unit test scores
+          </span>
+          {loading && <strong>Updating...</strong>}
+        </div>
+        <div className="unit-test-score-list">
+          {activeStats.unitTestScores.map((deckScore) => (
+            <div className="unit-test-score-row" key={deckScore.deckId}>
+              <div>
+                <strong>{deckScore.deckName}</strong>
+                <span>{deckScore.hasTakenTest ? 'Latest deck test' : 'Not taken'}</span>
+              </div>
+              <strong>{percent(deckScore.score)}</strong>
+              {deckScore.subdeckAverage !== null && (
+                <span>
+                  Subdeck average {percent(deckScore.subdeckAverage)} ({deckScore.subdeckCount})
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
       </div>
       <div className="stats-section">
         <div className="stats-section-header">

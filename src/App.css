@@ -929,6 +929,20 @@ textarea:focus {
   color: #334b92;
 }
 
+.rating-grid.unit-test {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.rating-grid.unit-test button:first-child {
+  background: #f7ded8;
+  color: #8a3d2f;
+}
+
+.rating-grid.unit-test button:last-child {
+  background: #e3e6f4;
+  color: #334b92;
+}
+
 .inline-create {
   display: grid;
   grid-template-columns: 1fr 44px;
@@ -1106,20 +1120,25 @@ textarea:focus {
   color: var(--paper);
 }
 
-.deck-tree-row.completed {
+.deck-tree-row.perfect-test {
   background:
-    linear-gradient(135deg, rgba(213, 161, 67, 0.15), rgba(47, 112, 108, 0.08)),
+    linear-gradient(135deg, rgba(213, 161, 67, 0.38), rgba(224, 183, 97, 0.2)),
     var(--surface);
+  border: 1px solid rgba(213, 161, 67, 0.65);
 }
 
-.deck-tree-row.completed .deck-tree-main span:not(.deck-tree-name):not(.deck-complete-badge) {
-  color: var(--teal);
+.deck-tree-row.perfect-test .deck-tree-main span:not(.deck-tree-name):not(.deck-complete-badge) {
+  color: var(--ink);
 }
 
-.deck-tree-row.completed.selected {
+.deck-tree-row.perfect-test.selected {
   background:
-    linear-gradient(135deg, rgba(213, 161, 67, 0.18), rgba(47, 112, 108, 0.16)),
+    linear-gradient(135deg, rgba(213, 161, 67, 0.42), rgba(224, 183, 97, 0.25)),
     var(--ink);
+}
+
+.deck-tree-row.perfect-test.selected .deck-tree-main span:not(.deck-tree-name):not(.deck-complete-badge) {
+  color: var(--paper);
 }
 
 .deck-tree-main {
@@ -1266,6 +1285,36 @@ textarea:focus {
 .hard-card-list {
   display: grid;
   gap: 8px;
+}
+
+.unit-test-score-list {
+  display: grid;
+  gap: 8px;
+}
+
+.unit-test-score-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+
+.unit-test-score-row > div {
+  display: grid;
+  gap: 2px;
+}
+
+.unit-test-score-row span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.unit-test-score-row > span {
+  grid-column: 1 / -1;
 }
 
 .hard-card-row {
