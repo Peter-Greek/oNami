@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url'
 
 import { PrismaClient } from '@prisma/client'
 
+import { parseByteRange, resolveAndroidDownload } from './downloads.js'
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const loadEnvFile = (filePath) => {
@@ -335,38 +337,7 @@ const send = (response, status, body) => {
   response.end(JSON.stringify(body))
 }
 
-const parseByteRange = (rangeHeader, size) => {
-  if (!rangeHeader) return null
-
-  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim())
-  if (!match || (!match[1] && !match[2])) return { invalid: true }
-
-  let start
-  let end
-  if (!match[1]) {
-    const suffixLength = Number(match[2])
-    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return { invalid: true }
-    start = Math.max(size - suffixLength, 0)
-    end = size - 1
-  } else {
-    start = Number(match[1])
-    end = match[2] ? Number(match[2]) : size - 1
-    if (
-      !Number.isSafeInteger(start) ||
-      !Number.isSafeInteger(end) ||
-      start < 0 ||
-      start >= size ||
-      end < start
-    ) {
-      return { invalid: true }
-    }
-    end = Math.min(end, size - 1)
-  }
-
-  return { start, end }
-}
-
-const sendDownload = (request, response, filePath, contentType, downloadName) => {
+const sendDownload = (request, response, filePath, contentType, downloadName, etag = null) => {
   if (!fs.existsSync(filePath)) {
     return send(response, 404, { error: 'The Android build is not available yet.' })
   }
@@ -375,13 +346,16 @@ const sendDownload = (request, response, filePath, contentType, downloadName) =>
   const range = parseByteRange(request.headers.range, stat.size)
   const baseHeaders = {
     'content-type': contentType,
-    'content-disposition': `attachment; filename="${downloadName}"`,
-    'cache-control': 'no-store',
+    'content-disposition': `attachment; filename="${downloadName}"; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
+    'cache-control': 'private, no-store, no-cache, must-revalidate, max-age=0',
+    pragma: 'no-cache',
+    expires: '0',
     'accept-ranges': 'bytes',
     'last-modified': stat.mtime.toUTCString(),
     'x-content-type-options': 'nosniff',
     connection: 'close',
     'access-control-allow-origin': config.corsOrigin,
+    ...(etag ? { etag } : {}),
   }
 
   response.shouldKeepAlive = false
@@ -422,16 +396,23 @@ const route = async (request, response, context) => {
     await prisma.$queryRaw`SELECT 1`
     return send(response, 200, { ok: true, service: 'onami-host', time: nowIso() })
   }
-  if (
-    (request.method === 'GET' || request.method === 'HEAD') &&
-    url.pathname === '/downloads/onami-latest.apk'
-  ) {
+  const androidDownload = resolveAndroidDownload(url.pathname, config.androidReleaseDir)
+  if ((request.method === 'GET' || request.method === 'HEAD') && androidDownload) {
+    if (androidDownload.stale) {
+      return send(response, 410, {
+        error: 'That Android build has been replaced.',
+        currentDownloadUrl: androidDownload.currentVersion
+          ? `/downloads/onami-${androidDownload.currentVersion}.apk?v=${androidDownload.currentVersion}`
+          : '/downloads/onami-latest.apk',
+      })
+    }
     return sendDownload(
       request,
       response,
-      path.join(config.androidReleaseDir, 'onami-latest.apk'),
+      androidDownload.filePath,
       'application/vnd.android.package-archive',
-      'oNami-latest.apk',
+      androidDownload.downloadName,
+      androidDownload.etag,
     )
   }
   if (request.method === 'GET' && url.pathname === '/downloads/android.json') {

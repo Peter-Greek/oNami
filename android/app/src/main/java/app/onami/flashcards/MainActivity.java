@@ -1,9 +1,14 @@
 package app.onami.flashcards;
 
 import android.app.Activity;
+import android.content.res.Configuration;
+import android.graphics.Color;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.ConsoleMessage;
 import android.webkit.JavascriptInterface;
@@ -19,6 +24,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        int nightMode = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+        applySystemBarTheme(nightMode == Configuration.UI_MODE_NIGHT_YES);
 
         webView = new WebView(this);
         webView.setWebViewClient(new WebViewClient());
@@ -58,6 +66,46 @@ public class MainActivity extends Activity {
         webView.loadUrl("file:///android_asset/public/index.html");
     }
 
+    private void applySystemBarTheme(boolean dark) {
+        Window window = getWindow();
+        int backgroundColor = Color.parseColor(dark ? "#15171D" : "#FBF7EF");
+        window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+        window.setStatusBarColor(backgroundColor);
+        window.setNavigationBarColor(backgroundColor);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.setNavigationBarDividerColor(backgroundColor);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.setStatusBarContrastEnforced(false);
+            window.setNavigationBarContrastEnforced(false);
+        }
+
+        int lightBarFlags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            lightBarFlags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+
+        View decorView = window.getDecorView();
+        int visibility = decorView.getSystemUiVisibility();
+        visibility = dark ? visibility & ~lightBarFlags : visibility | lightBarFlags;
+        decorView.setSystemUiVisibility(visibility);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController controller = decorView.getWindowInsetsController();
+            if (controller != null) {
+                int appearanceMask =
+                    WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                controller.setSystemBarsAppearance(dark ? 0 : appearanceMask, appearanceMask);
+            }
+        }
+
+        if (webView != null) {
+            webView.setBackgroundColor(backgroundColor);
+        }
+    }
+
     private class AndroidBridge {
         @JavascriptInterface
         public void setKeepScreenAwake(boolean enabled) {
@@ -68,6 +116,11 @@ public class MainActivity extends Activity {
                     getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 }
             });
+        }
+
+        @JavascriptInterface
+        public void setSystemBarTheme(boolean dark) {
+            runOnUiThread(() -> applySystemBarTheme(dark));
         }
     }
 

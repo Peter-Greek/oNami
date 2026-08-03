@@ -502,6 +502,22 @@ function App() {
 
   const inStudyCardMode = view === 'study' && studyCardMode
   const effectiveTheme = appSettings.themeMode === 'system' ? systemTheme : appSettings.themeMode
+
+  useEffect(() => {
+    const dark = effectiveTheme === 'dark'
+    const backgroundColor = dark ? '#15171d' : '#fbf7ef'
+    document.documentElement.style.colorScheme = effectiveTheme
+    document.documentElement.style.backgroundColor = backgroundColor
+    document.body.style.backgroundColor = backgroundColor
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', backgroundColor)
+
+    try {
+      window.onamiAndroid?.setSystemBarTheme(dark)
+    } catch {
+      // The native bridge is Android-only; browser and Electron use the CSS theme.
+    }
+  }, [effectiveTheme])
+
   const toggleTheme = () => {
     const themeMode: ThemeMode = effectiveTheme === 'dark' ? 'light' : 'dark'
     setAppSettings((current) => ({ ...current, themeMode }))

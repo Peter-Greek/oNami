@@ -230,7 +230,7 @@ try {
       gitDirty = $gitDirty
       sha256 = Get-FileSha256 $publishedApk
       sizeBytes = (Get-Item -LiteralPath $publishedApk).Length
-      downloadUrl = '/downloads/onami-latest.apk'
+      downloadUrl = "/downloads/onami-$($env:ONAMI_VERSION_CODE).apk?v=$($env:ONAMI_VERSION_CODE)"
     }
     $metadata | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath $temporaryMetadata
     Move-Item -Force -LiteralPath $temporaryMetadata -Destination $metadataPath

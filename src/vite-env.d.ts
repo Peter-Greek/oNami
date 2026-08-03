@@ -7,6 +7,7 @@ declare global {
     onami: OnamiApi
     onamiAndroid?: {
       setKeepScreenAwake(enabled: boolean): void
+      setSystemBarTheme(dark: boolean): void
     }
   }
 }
