@@ -24,6 +24,9 @@ import type {
   DeckSummary,
   GlobalDeckCard,
   GlobalDeckHeartResult,
+  GlobalDeckMedia,
+  GlobalDeckMediaBlob,
+  GlobalDeckNode,
   GlobalDeckSummary,
   ImportApkgOptions,
   ImportResult,
@@ -292,7 +295,7 @@ export class AppServices {
    * Publishes a local deck as a card snapshot. Only card content and the deck
    * name leave the device — scheduling, review history and settings never do.
    */
-  publishGlobalDeck(localDeckId: string): Promise<GlobalDeckSummary> {
+  async publishGlobalDeck(localDeckId: string): Promise<GlobalDeckSummary> {
     const deck = this.database.getDeck(localDeckId)
     if (deck.cards.length === 0) throw new Error('That deck has no cards to publish yet.')
     if (deck.cards.length > GLOBAL_DECKS_MAX_PUBLISH_CARDS) {
@@ -302,14 +305,54 @@ export class AppServices {
     }
 
     const noteTypes = this.database.listCardNoteTypes(localDeckId)
-    const cards: GlobalDeckCard[] = deck.cards.map((card) => ({
-      frontHtml: card.frontHtml,
-      backHtml: card.backHtml,
-      tags: card.tags,
-      noteType: noteTypes.get(card.id) ?? 'basic',
+    const allDecks = this.database.listDecks()
+    const included = new Set([localDeckId])
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const candidate of allDecks) {
+        if (candidate.parentId && included.has(candidate.parentId) && !included.has(candidate.id)) {
+          included.add(candidate.id)
+          changed = true
+        }
+      }
+    }
+    const cardsByDeck = new Map<string, GlobalDeckCard[]>()
+    const mediaIds = new Set<string>()
+    for (const card of deck.cards) {
+      const cards = cardsByDeck.get(card.deckId) ?? []
+      cards.push({
+        frontHtml: card.frontHtml,
+        backHtml: card.backHtml,
+        tags: card.tags,
+        noteType: noteTypes.get(card.id) ?? 'basic',
+      })
+      cardsByDeck.set(card.deckId, cards)
+      for (const mediaId of this.extractMediaIds(`${card.frontHtml}\n${card.backHtml}`)) mediaIds.add(mediaId)
+    }
+    const decks: GlobalDeckNode[] = allDecks
+      .filter((candidate) => included.has(candidate.id))
+      .map((candidate) => ({
+        sourceDeckId: candidate.id,
+        parentSourceDeckId: candidate.id === localDeckId ? null : candidate.parentId,
+        name: candidate.name,
+        cards: cardsByDeck.get(candidate.id) ?? [],
+      }))
+    const mediaRecords = this.database.listMediaRecords().filter((media) => mediaIds.has(media.id))
+    if (mediaRecords.length !== mediaIds.size) throw new Error('One or more deck media files are missing locally.')
+    const media: GlobalDeckMedia[] = mediaRecords.map((item) => ({
+      sourceMediaId: item.id,
+      sha256: item.sha256,
+      mimeType: item.mimeType,
+      byteSize: item.byteSize,
+      originalName: item.originalName,
     }))
+    const mediaBlobs: GlobalDeckMediaBlob[] = mediaRecords.flatMap((item) => {
+      const bytes = this.database.readMediaBytesByHash(item.sha256)
+      return bytes ? [{ sha256: item.sha256, mimeType: item.mimeType, dataBase64: bytes.toString('base64') }] : []
+    })
 
-    return this.globalDecks.publish({ sourceDeckId: deck.id, name: deck.name, cards })
+    return this.globalDecks.publish({ sourceDeckId: deck.id, name: deck.name, decks, media, mediaBlobs })
   }
 
   heartGlobalDeck(globalDeckId: string, hearted: boolean): Promise<GlobalDeckHeartResult> {
@@ -322,19 +365,66 @@ export class AppServices {
    */
   async addGlobalDeckToLibrary(globalDeckId: string): Promise<DeckSummary> {
     const detail = await this.globalDecks.get(globalDeckId)
-    if (detail.cards.length === 0) throw new Error('That deck has no cards to add.')
+    const totalCards = detail.decks.reduce((total, item) => total + item.cards.length, 0)
+    if (totalCards === 0) throw new Error('That deck has no cards to add.')
 
-    const deck = this.createDeck({ name: this.uniqueLocalDeckName(detail.name) })
-    for (const card of detail.cards) {
-      this.createCard({
-        deckId: deck.id,
-        noteType: card.noteType,
-        frontHtml: card.frontHtml,
-        backHtml: card.backHtml,
-        tags: card.tags,
-      })
+    const mediaIdMap = new Map<string, string>()
+    for (const media of detail.media) {
+      const blob = await this.globalDecks.downloadMedia(media.sha256)
+      const localId = this.database.saveGlobalMediaBlob(
+        {
+          id: media.sourceMediaId,
+          sha256: media.sha256,
+          mimeType: media.mimeType,
+          byteSize: media.byteSize,
+          originalName: media.originalName,
+        },
+        Buffer.from(blob.dataBase64, 'base64')
+      )
+      mediaIdMap.set(media.sourceMediaId, localId)
     }
-    return this.database.getDeckSummary(deck.id)
+
+    const localDeckIds = new Map<string, string>()
+    const pending = [...detail.decks]
+    let rootDeck: DeckSummary | null = null
+    while (pending.length > 0) {
+      const index = pending.findIndex((item) => !item.parentSourceDeckId || localDeckIds.has(item.parentSourceDeckId))
+      if (index < 0) throw new Error('That global deck has an invalid subdeck hierarchy.')
+      const [item] = pending.splice(index, 1)
+      const created = this.createDeck({
+        name: item.parentSourceDeckId ? item.name : this.uniqueLocalDeckName(item.name),
+        parentId: item.parentSourceDeckId ? localDeckIds.get(item.parentSourceDeckId) : null,
+      })
+      if (!item.parentSourceDeckId) rootDeck = created
+      localDeckIds.set(item.sourceDeckId, created.id)
+      for (const card of item.cards) {
+        this.createCard({
+          deckId: created.id,
+          noteType: card.noteType,
+          frontHtml: this.remapMediaIds(card.frontHtml, mediaIdMap),
+          backHtml: this.remapMediaIds(card.backHtml, mediaIdMap),
+          tags: card.tags,
+        })
+      }
+    }
+    if (!rootDeck) throw new Error('That global deck has no root deck.')
+    return this.database.getDeckSummary(rootDeck.id)
+  }
+
+  private extractMediaIds(html: string): string[] {
+    const ids = new Set<string>()
+    const pattern = /onami-media:\/\/([^"')\s]+)/g
+    let match: RegExpExecArray | null
+    while ((match = pattern.exec(html)) !== null) ids.add(decodeURIComponent(match[1]))
+    return [...ids]
+  }
+
+  private remapMediaIds(html: string, ids: Map<string, string>): string {
+    return html.replace(/onami-media:\/\/([^"')\s]+)/g, (original, rawId: string) => {
+      const sourceId = decodeURIComponent(rawId)
+      const localId = ids.get(sourceId)
+      return localId ? `onami-media://${encodeURIComponent(localId)}` : original
+    })
   }
 
   /** Keeps repeated adds of the same library deck distinguishable. */

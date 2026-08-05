@@ -135,6 +135,27 @@ export interface GlobalDeckCard {
   noteType: NoteTypeName
 }
 
+export interface GlobalDeckNode {
+  sourceDeckId: string
+  parentSourceDeckId: string | null
+  name: string
+  cards: GlobalDeckCard[]
+}
+
+export interface GlobalDeckMedia {
+  sourceMediaId: string
+  sha256: string
+  mimeType: string
+  byteSize: number
+  originalName: string
+}
+
+export interface GlobalDeckMediaBlob {
+  sha256: string
+  mimeType: string
+  dataBase64: string
+}
+
 /** A deck listed in the global library. All fields come from the host. */
 export interface GlobalDeckSummary {
   id: string
@@ -148,7 +169,8 @@ export interface GlobalDeckSummary {
 }
 
 export interface GlobalDeckDetail extends GlobalDeckSummary {
-  cards: GlobalDeckCard[]
+  decks: GlobalDeckNode[]
+  media: GlobalDeckMedia[]
 }
 
 export interface GlobalDeckHeartResult {

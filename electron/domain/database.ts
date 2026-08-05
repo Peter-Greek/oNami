@@ -1027,6 +1027,26 @@ export class OnamiDatabase {
     return fs.existsSync(storedPath) ? fs.readFileSync(storedPath) : null
   }
 
+  saveGlobalMediaBlob(record: SyncMediaRecord, data: Buffer): string {
+    const actualHash = createHash('sha256').update(data).digest('hex')
+    if (actualHash !== record.sha256) throw new Error('Global deck media checksum did not match.')
+    const existing = this.db.prepare('SELECT * FROM media WHERE hash = ?').get(record.sha256) as Row | undefined
+    if (existing) return this.rowToMedia(existing).id
+
+    const idCollision = this.db.prepare('SELECT 1 FROM media WHERE id = ?').get(record.id)
+    const id = idCollision ? randomUUID() : record.id
+    const ext = path.extname(record.originalName) || `.${mime.extension(record.mimeType || '') || 'bin'}`
+    const storedPath = path.join(this.mediaDir, `${record.sha256}${ext.toLowerCase()}`)
+    if (!fs.existsSync(storedPath)) fs.writeFileSync(storedPath, data)
+    this.db
+      .prepare(
+        `INSERT INTO media (id, original_name, stored_path, mime_type, hash, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(id, record.originalName, storedPath, record.mimeType, record.sha256, nowIso())
+    return id
+  }
+
   hasMediaHash(hash: string): boolean {
     return Boolean(this.db.prepare('SELECT 1 FROM media WHERE hash = ?').get(hash))
   }

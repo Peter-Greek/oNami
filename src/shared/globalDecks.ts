@@ -2,6 +2,9 @@ import type {
   GlobalDeckCard,
   GlobalDeckDetail,
   GlobalDeckHeartResult,
+  GlobalDeckMedia,
+  GlobalDeckMediaBlob,
+  GlobalDeckNode,
   GlobalDeckSummary,
   NoteTypeName,
 } from './types'
@@ -12,16 +15,19 @@ export const GLOBAL_DECKS_BASE_URL = 'http://147.135.31.128:41729'
 /** The library is always listed most-hearted first. */
 export const GLOBAL_DECKS_SORT = 'hearts'
 
-export const GLOBAL_DECKS_TIMEOUT_MS = 15_000
+export const GLOBAL_DECKS_TIMEOUT_MS = 60_000
 
 /** Upper bound on a single publish, so one huge deck cannot become one huge POST. */
 export const GLOBAL_DECKS_MAX_PUBLISH_CARDS = 5000
+export const GLOBAL_DECKS_MAX_MEDIA_BYTES = 32 * 1024 * 1024
 
 /** What is uploaded for a deck: names and card content only, never scheduling. */
 export interface GlobalDeckPublishInput {
   sourceDeckId: string
   name: string
-  cards: GlobalDeckCard[]
+  decks: GlobalDeckNode[]
+  media: GlobalDeckMedia[]
+  mediaBlobs: GlobalDeckMediaBlob[]
 }
 
 export interface GlobalDecksClient {
@@ -29,6 +35,7 @@ export interface GlobalDecksClient {
   get(globalDeckId: string): Promise<GlobalDeckDetail>
   publish(input: GlobalDeckPublishInput): Promise<GlobalDeckSummary>
   heart(globalDeckId: string, hearted: boolean): Promise<GlobalDeckHeartResult>
+  downloadMedia(sha256: string): Promise<GlobalDeckMediaBlob>
 }
 
 const asString = (value: unknown, fallback = ''): string => (typeof value === 'string' ? value : fallback)
@@ -86,13 +93,52 @@ export const toGlobalDeckSummary = (raw: unknown): GlobalDeckSummary | null => {
 export const toGlobalDeckDetail = (raw: unknown): GlobalDeckDetail | null => {
   const summary = toGlobalDeckSummary(raw)
   if (!summary) return null
-  const cards = Array.isArray((raw as Record<string, unknown>).cards)
-    ? ((raw as Record<string, unknown>).cards as unknown[])
-        .map(toGlobalDeckCard)
-        .filter((card): card is GlobalDeckCard => card !== null)
+  const row = raw as Record<string, unknown>
+  const decks = Array.isArray(row.decks)
+    ? row.decks.flatMap((candidate): GlobalDeckNode[] => {
+        if (!candidate || typeof candidate !== 'object') return []
+        const deck = candidate as Record<string, unknown>
+        const sourceDeckId = asString(deck.sourceDeckId)
+        const name = asString(deck.name).trim()
+        if (!sourceDeckId || !name) return []
+        const cards = Array.isArray(deck.cards)
+          ? deck.cards.map(toGlobalDeckCard).filter((card): card is GlobalDeckCard => card !== null)
+          : []
+        return [{
+          sourceDeckId,
+          parentSourceDeckId: typeof deck.parentSourceDeckId === 'string' ? deck.parentSourceDeckId : null,
+          name,
+          cards,
+        }]
+      })
     : []
-  // The host's declared count can disagree with what it actually sent.
-  return { ...summary, cards, cardCount: cards.length || summary.cardCount }
+  // Backward compatibility for snapshots published by the first global-deck build.
+  if (decks.length === 0 && Array.isArray(row.cards)) {
+    decks.push({
+      sourceDeckId: summary.id,
+      parentSourceDeckId: null,
+      name: summary.name,
+      cards: row.cards.map(toGlobalDeckCard).filter((card): card is GlobalDeckCard => card !== null),
+    })
+  }
+  const media = Array.isArray(row.media)
+    ? row.media.flatMap((candidate): GlobalDeckMedia[] => {
+        if (!candidate || typeof candidate !== 'object') return []
+        const item = candidate as Record<string, unknown>
+        const sourceMediaId = asString(item.sourceMediaId)
+        const sha256 = asString(item.sha256).toLowerCase()
+        if (!sourceMediaId || !/^[a-f0-9]{64}$/.test(sha256)) return []
+        return [{
+          sourceMediaId,
+          sha256,
+          mimeType: asString(item.mimeType, 'application/octet-stream'),
+          byteSize: asCount(item.byteSize),
+          originalName: asString(item.originalName, 'media.bin'),
+        }]
+      })
+    : []
+  const cardCount = decks.reduce((total, deck) => total + deck.cards.length, 0)
+  return { ...summary, decks, media, cardCount: cardCount || summary.cardCount }
 }
 
 export const toGlobalDeckHeartResult = (
@@ -203,13 +249,30 @@ export const createGlobalDecksClient = (options: {
 
     publish: async (input) => {
       const publisherId = await options.installationId()
+      const check = await request<{ missingSha256?: unknown }>('/global-decks/media/check', {
+        method: 'POST',
+        body: { media: input.media },
+      })
+      const missing = new Set(
+        Array.isArray(check.missingSha256)
+          ? check.missingSha256.filter((value): value is string => typeof value === 'string')
+          : []
+      )
+      for (const blob of input.mediaBlobs) {
+        if (!missing.has(blob.sha256)) continue
+        await request(`/global-decks/media/${blob.sha256}`, {
+          method: 'POST',
+          body: { mimeType: blob.mimeType, dataBase64: blob.dataBase64 },
+        })
+      }
       const payload = await request<unknown>('/global-decks', {
         method: 'POST',
         body: {
           publisherId,
           sourceDeckId: input.sourceDeckId,
           name: input.name,
-          cards: input.cards,
+          decks: input.decks,
+          media: input.media,
         },
       })
       const summary = toGlobalDeckSummary(unwrapDeck(payload))
@@ -218,7 +281,7 @@ export const createGlobalDecksClient = (options: {
         return {
           id: '',
           name: input.name,
-          cardCount: input.cards.length,
+          cardCount: input.decks.reduce((total, deck) => total + deck.cards.length, 0),
           heartCount: 0,
           viewerHearted: false,
           publishedAt: new Date().toISOString(),
@@ -235,6 +298,13 @@ export const createGlobalDecksClient = (options: {
         body: { installationId, hearted },
       })
       return toGlobalDeckHeartResult(unwrapDeck(payload), { id: globalDeckId, hearted })
+    },
+
+    downloadMedia: async (sha256) => {
+      const payload = await request<GlobalDeckMediaBlob>(`/global-decks/media/${encodeURIComponent(sha256)}`, {
+        method: 'GET',
+      })
+      return payload
     },
   }
 }

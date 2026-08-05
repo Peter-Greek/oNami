@@ -94,9 +94,15 @@ describe('toGlobalDeckDetail', () => {
       name: 'Deck',
       cardCount: 9,
       publishedAt: '2026-01-02T03:04:05.000Z',
-      cards: [{ frontHtml: 'q', backHtml: 'a' }, null, { frontHtml: '', backHtml: '' }],
+      decks: [{
+        sourceDeckId: 'root',
+        parentSourceDeckId: null,
+        name: 'Deck',
+        cards: [{ frontHtml: 'q', backHtml: 'a' }, null, { frontHtml: '', backHtml: '' }],
+      }],
+      media: [],
     })
-    expect(detail?.cards).toHaveLength(1)
+    expect(detail?.decks[0].cards).toHaveLength(1)
     expect(detail?.cardCount).toBe(1)
   })
 })
@@ -142,8 +148,10 @@ describe('createGlobalDecksClient', () => {
   })
 
   it('publishes card content only, under the installation id', async () => {
-    const fetchMock = vi.fn<FetchFn>(async () =>
-      jsonResponse({ id: 'deck-1', name: 'Deck', cardCount: 1, publishedAt: '2026-01-01T00:00:00.000Z' })
+    const fetchMock = vi.fn<FetchFn>(async (input) =>
+      String(input).endsWith('/global-decks/media/check')
+        ? jsonResponse({ missingSha256: [] })
+        : jsonResponse({ id: 'deck-1', name: 'Deck', cardCount: 1, publishedAt: '2026-01-01T00:00:00.000Z' })
     )
     vi.stubGlobal('fetch', fetchMock)
 
@@ -151,16 +159,48 @@ describe('createGlobalDecksClient', () => {
     await client.publish({
       sourceDeckId: 'local-1',
       name: 'Deck',
-      cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }],
+      decks: [{
+        sourceDeckId: 'local-1', parentSourceDeckId: null, name: 'Deck',
+        cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }],
+      }],
+      media: [],
+      mediaBlobs: [],
     })
 
-    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body))
+    const body = JSON.parse(String(fetchMock.mock.calls[1][1]?.body))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(body).toEqual({
       publisherId: 'install-1',
       sourceDeckId: 'local-1',
       name: 'Deck',
-      cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }],
+      decks: [{
+        sourceDeckId: 'local-1', parentSourceDeckId: null, name: 'Deck',
+        cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }],
+      }],
+      media: [],
     })
+  })
+
+  it('uploads only media the host says is missing', async () => {
+    const sha256 = 'a'.repeat(64)
+    const fetchMock = vi.fn<FetchFn>(async (input) => {
+      const url = String(input)
+      if (url.endsWith('/global-decks/media/check')) return jsonResponse({ missingSha256: [sha256] })
+      if (url.endsWith(`/global-decks/media/${sha256}`)) return jsonResponse({ sha256 })
+      return jsonResponse({ id: 'deck-1', name: 'Deck', cardCount: 1, publishedAt: '2026-01-01T00:00:00.000Z' })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = createGlobalDecksClient({ installationId: () => 'install-1' })
+    await client.publish({
+      sourceDeckId: 'local-1', name: 'Deck',
+      decks: [{ sourceDeckId: 'local-1', parentSourceDeckId: null, name: 'Deck', cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }] }],
+      media: [{ sourceMediaId: 'm1', sha256, mimeType: 'image/png', byteSize: 1, originalName: 'x.png' }],
+      mediaBlobs: [{ sha256, mimeType: 'image/png', dataBase64: 'eA==' }],
+    })
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]))
+    expect(urls[0].endsWith('/global-decks/media/check')).toBe(true)
+    expect(urls[1].endsWith(`/global-decks/media/${sha256}`)).toBe(true)
+    expect(urls[2].endsWith('/global-decks')).toBe(true)
   })
 
   it('surfaces the host error message', async () => {

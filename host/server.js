@@ -9,6 +9,7 @@ import { PrismaClient } from '@prisma/client'
 
 import { parseByteRange, resolveAndroidDownload } from './downloads.js'
 import {
+  GLOBAL_DECK_LIMITS,
   globalDeckResponse,
   normalizeGlobalDeckPublish,
   normalizeGlobalDeckSearch,
@@ -449,6 +450,46 @@ const route = async (request, response, context) => {
     return send(response, 200, { decks: decks.map((deck) => globalDeckResponse(deck)) })
   }
 
+  if (request.method === 'POST' && url.pathname === '/global-decks/media/check') {
+    const body = await readJson(request)
+    if (!Array.isArray(body.media)) throw httpError(400, 'media must be an array.')
+    if (body.media.length > GLOBAL_DECK_LIMITS.maxMedia) throw httpError(400, 'Too many media files.')
+    const hashes = [...new Set(body.media.map((item) => sanitizeSha256(item?.sha256)))]
+    const missingSha256 = hashes.filter((hash) => !fs.existsSync(mediaBlobPath(hash)))
+    return send(response, 200, { missingSha256 })
+  }
+
+  const globalMediaMatch = url.pathname.match(/^\/global-decks\/media\/([a-f0-9]{64})$/i)
+  if (request.method === 'POST' && globalMediaMatch) {
+    const sha256 = sanitizeSha256(globalMediaMatch[1])
+    const body = await readJson(request, config.maxBlobBytes)
+    const mimeType = requiredString(body, 'mimeType')
+    const dataBase64 = requiredString(body, 'dataBase64')
+    const data = Buffer.from(dataBase64, 'base64')
+    if (data.length <= 0 || data.length > GLOBAL_DECK_LIMITS.maxMediaBytes) {
+      throw httpError(413, 'Global deck media is too large.')
+    }
+    if (createHash('sha256').update(data).digest('hex') !== sha256) {
+      throw httpError(400, 'Uploaded global deck media does not match its sha256.')
+    }
+    const blobPath = mediaBlobPath(sha256)
+    const reused = fs.existsSync(blobPath)
+    if (!reused) fs.writeFileSync(blobPath, data)
+    return send(response, 200, { sha256, byteSize: data.length, mimeType, reused })
+  }
+
+  if (request.method === 'GET' && globalMediaMatch) {
+    const sha256 = sanitizeSha256(globalMediaMatch[1])
+    const media = await prisma.globalDeckMedia.findFirst({ where: { sha256 } })
+    const blobPath = mediaBlobPath(sha256)
+    if (!media || !fs.existsSync(blobPath)) throw httpError(404, 'Global deck media not found.')
+    return send(response, 200, {
+      sha256,
+      mimeType: media.mimeType,
+      dataBase64: fs.readFileSync(blobPath).toString('base64'),
+    })
+  }
+
   const globalDeckHeartMatch = url.pathname.match(/^\/global-decks\/([0-9a-f-]+)\/heart$/i)
   if (request.method === 'POST' && globalDeckHeartMatch) {
     const deckId = globalDeckHeartMatch[1]
@@ -492,40 +533,59 @@ const route = async (request, response, context) => {
           ? { hearts: { where: { installationId }, select: { installationId: true } } }
           : {}),
         _count: { select: { hearts: true } },
+        media: true,
       },
     })
     if (!deck) throw httpError(404, 'Global deck not found.')
-    return send(response, 200, { deck: globalDeckResponse(deck) })
+    return send(response, 200, { deck: globalDeckResponse(deck, true) })
   }
 
   if (request.method === 'POST' && url.pathname === '/global-decks') {
     const input = normalizeGlobalDeckPublish(await readJson(request, config.maxGlobalDeckJsonBytes))
-    const deck = await prisma.globalDeck.upsert({
-      where: {
-        publisherId_sourceDeckId: {
+    for (const media of input.media) {
+      const blobPath = mediaBlobPath(media.sha256)
+      if (!fs.existsSync(blobPath) || fs.statSync(blobPath).size !== media.byteSize) {
+        throw httpError(409, `Media ${media.originalName} must be uploaded before publishing.`)
+      }
+    }
+    const deck = await prisma.$transaction(async (tx) => {
+      const saved = await tx.globalDeck.upsert({
+        where: {
+          publisherId_sourceDeckId: {
+            publisherId: input.publisherId,
+            sourceDeckId: input.sourceDeckId,
+          },
+        },
+        update: {
+          name: input.name,
+          cardsJson: { decks: input.decks },
+          cardCount: input.cardCount,
+          publishedAt: now(),
+        },
+        create: {
           publisherId: input.publisherId,
           sourceDeckId: input.sourceDeckId,
+          name: input.name,
+          cardsJson: { decks: input.decks },
+          cardCount: input.cardCount,
         },
-      },
-      update: {
-        name: input.name,
-        cardsJson: input.cards,
-        cardCount: input.cards.length,
-        publishedAt: now(),
-      },
-      create: {
-        publisherId: input.publisherId,
-        sourceDeckId: input.sourceDeckId,
-        name: input.name,
-        cardsJson: input.cards,
-        cardCount: input.cards.length,
-      },
-      include: {
-        hearts: { where: { installationId: input.publisherId }, select: { installationId: true } },
-        _count: { select: { hearts: true } },
-      },
+      })
+      await tx.globalDeckMedia.deleteMany({ where: { deckId: saved.id } })
+      if (input.media.length > 0) {
+        await tx.globalDeckMedia.createMany({
+          data: input.media.map((media) => ({ deckId: saved.id, ...media })),
+        })
+      }
+      return tx.globalDeck.findUniqueOrThrow({
+        where: { id: saved.id },
+        include: {
+          hearts: { where: { installationId: input.publisherId }, select: { installationId: true } },
+          _count: { select: { hearts: true } },
+          media: true,
+        },
+      })
     })
-    return send(response, 200, { deck: globalDeckResponse(deck) })
+    return send(response, 200, { deck: globalDeckResponse(deck, true) })
   }
 
   if (request.method === 'POST' && url.pathname === '/devices/bootstrap') {
@@ -947,7 +1007,11 @@ const route = async (request, response, context) => {
 
       for (const sha256 of hashes) {
         try {
-          fs.rmSync(mediaBlobPath(sha256), { force: true })
+          const [syncReferences, globalReferences] = await Promise.all([
+            prisma.mediaObject.count({ where: { sha256 } }),
+            prisma.globalDeckMedia.count({ where: { sha256 } }),
+          ])
+          if (syncReferences === 0 && globalReferences === 0) fs.rmSync(mediaBlobPath(sha256), { force: true })
         } catch {
           // Best-effort blob cleanup; the DB row is already gone.
         }

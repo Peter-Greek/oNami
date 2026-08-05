@@ -138,6 +138,9 @@ GET  /global-decks?search=<text>&sort=hearts&installationId=<id>
 GET  /global-decks/:id?installationId=<id>
 POST /global-decks
 POST /global-decks/:id/heart
+POST /global-decks/media/check
+POST /global-decks/media/:sha256
+GET  /global-decks/media/:sha256
 POST /devices/bootstrap
 POST /pairing/start
 POST /pairing/join
@@ -158,6 +161,11 @@ id for publishing and hearts. A published snapshot contains only its deck name
 and card content; it never includes review history, scheduling, sync secrets,
 or OpenAI settings. Re-publishing the same local deck from the same installation
 updates its existing global entry.
+
+Global deck media is content-addressed by SHA-256. Clients call the media check
+endpoint before publishing and upload only hashes that are not already present,
+including blobs previously uploaded through device sync. Downloaded cards remap
+the publisher's media ids to ids in the receiving device's local media store.
 
 `/sync/*` and `/media` endpoints require:
 

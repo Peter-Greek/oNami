@@ -150,10 +150,25 @@ model GlobalDeck {
   publishedAt  DateTime          @default(now()) @map("published_at")
   updatedAt    DateTime          @updatedAt @map("updated_at")
   hearts       GlobalDeckHeart[]
+  media        GlobalDeckMedia[]
 
   @@unique([publisherId, sourceDeckId])
   @@index([name])
   @@map("global_decks")
+}
+
+model GlobalDeckMedia {
+  deckId        String     @map("deck_id") @db.Uuid
+  sourceMediaId String     @map("source_media_id")
+  sha256        String
+  mimeType      String     @map("mime_type")
+  byteSize      Int        @map("byte_size")
+  originalName  String     @map("original_name")
+  deck          GlobalDeck @relation(fields: [deckId], references: [id], onDelete: Cascade)
+
+  @@id([deckId, sourceMediaId])
+  @@index([sha256])
+  @@map("global_deck_media")
 }
 
 model GlobalDeckHeart {

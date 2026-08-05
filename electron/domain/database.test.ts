@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 
 import { describe, expect, it } from 'vitest'
 
@@ -422,6 +423,36 @@ describe('OnamiDatabase sync events', () => {
       target.db.close()
       fs.rmSync(source.dir, { recursive: true, force: true })
       fs.rmSync(target.dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('OnamiDatabase global media', () => {
+  it('deduplicates by SHA-256 and remaps a colliding source media id', () => {
+    const { db, dir } = createTestDatabase()
+    try {
+      const first = Buffer.from('first image')
+      const second = Buffer.from('second image')
+      const firstHash = createHash('sha256').update(first).digest('hex')
+      const secondHash = createHash('sha256').update(second).digest('hex')
+      const firstId = db.saveGlobalMediaBlob(
+        { id: 'shared-id', sha256: firstHash, mimeType: 'image/png', byteSize: first.length, originalName: 'first.png' },
+        first
+      )
+      expect(db.saveGlobalMediaBlob(
+        { id: 'other-source-id', sha256: firstHash, mimeType: 'image/png', byteSize: first.length, originalName: 'same.png' },
+        first
+      )).toBe(firstId)
+      const remappedId = db.saveGlobalMediaBlob(
+        { id: 'shared-id', sha256: secondHash, mimeType: 'image/png', byteSize: second.length, originalName: 'second.png' },
+        second
+      )
+      expect(remappedId).not.toBe('shared-id')
+      expect(db.hasMediaHash(firstHash)).toBe(true)
+      expect(db.hasMediaHash(secondHash)).toBe(true)
+    } finally {
+      db.close()
+      fs.rmSync(dir, { recursive: true, force: true })
     }
   })
 })

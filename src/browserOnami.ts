@@ -15,6 +15,9 @@ import type {
   DeckDetail,
   DeckSummary,
   GlobalDeckCard,
+  GlobalDeckMedia,
+  GlobalDeckMediaBlob,
+  GlobalDeckNode,
   GlobalDeckSummary,
   HardCardSummary,
   ImportResult,
@@ -1707,37 +1710,100 @@ export const installBrowserOnami = async () => {
         if (!deck) throw new Error('Deck not found.')
         const deckIds = new Set(getDescendantDeckIds(state, deck.id))
         // Card content only: scheduling and review history stay on the device.
-        const cards: GlobalDeckCard[] = state.cards
-          .filter((card) => deckIds.has(card.deckId))
-          .map((card) => ({
-            frontHtml: card.frontHtml,
-            backHtml: card.backHtml,
-            tags: card.tags,
-            noteType: card.noteType,
-          }))
-        if (cards.length === 0) throw new Error('That deck has no cards to publish yet.')
-        if (cards.length > GLOBAL_DECKS_MAX_PUBLISH_CARDS) {
+        const selectedCards = state.cards.filter((card) => deckIds.has(card.deckId))
+        if (selectedCards.length === 0) throw new Error('That deck has no cards to publish yet.')
+        if (selectedCards.length > GLOBAL_DECKS_MAX_PUBLISH_CARDS) {
           throw new Error(
-            `Decks up to ${GLOBAL_DECKS_MAX_PUBLISH_CARDS} cards can be published; this one has ${cards.length}.`
+            `Decks up to ${GLOBAL_DECKS_MAX_PUBLISH_CARDS} cards can be published; this one has ${selectedCards.length}.`
           )
         }
-        return globalDecksClient.publish({ sourceDeckId: deck.id, name: deck.name, cards })
+        const decks: GlobalDeckNode[] = state.decks
+          .filter((item) => deckIds.has(item.id))
+          .map((item) => ({
+            sourceDeckId: item.id,
+            parentSourceDeckId: item.id === deck.id ? null : item.parentId,
+            name: item.name,
+            cards: selectedCards
+              .filter((card) => card.deckId === item.id)
+              .map((card): GlobalDeckCard => ({
+                frontHtml: card.frontHtml,
+                backHtml: card.backHtml,
+                tags: card.tags,
+                noteType: card.noteType,
+              })),
+          }))
+        const mediaIds = new Set(selectedCards.flatMap((card) => extractMediaIds(`${card.frontHtml}\n${card.backHtml}`)))
+        const selectedMedia = state.media.filter((item) => mediaIds.has(item.id))
+        if (selectedMedia.length !== mediaIds.size) throw new Error('One or more deck media files are missing locally.')
+        const media: GlobalDeckMedia[] = selectedMedia.map((item) => ({
+          sourceMediaId: item.id,
+          sha256: item.sha256,
+          mimeType: item.mimeType,
+          byteSize: base64ByteLength(item.dataBase64),
+          originalName: item.originalName,
+        }))
+        const mediaBlobs: GlobalDeckMediaBlob[] = selectedMedia.map((item) => ({
+          sha256: item.sha256,
+          mimeType: item.mimeType,
+          dataBase64: item.dataBase64,
+        }))
+        return globalDecksClient.publish({ sourceDeckId: deck.id, name: deck.name, decks, media, mediaBlobs })
       },
       heart: (globalDeckId: string, hearted: boolean) => globalDecksClient.heart(globalDeckId, hearted),
       addToLibrary: async (globalDeckId: string): Promise<DeckSummary> => {
         const detail = await globalDecksClient.get(globalDeckId)
-        if (detail.cards.length === 0) throw new Error('That deck has no cards to add.')
-
-        const created = await api.decks.create({ name: uniqueLocalDeckName(detail.name) })
-        for (const card of detail.cards) {
-          await api.cards.create({
-            deckId: created.id,
-            noteType: card.noteType,
-            frontHtml: card.frontHtml,
-            backHtml: card.backHtml,
-            tags: card.tags,
+        const totalCards = detail.decks.reduce((total, item) => total + item.cards.length, 0)
+        if (totalCards === 0) throw new Error('That deck has no cards to add.')
+        const mediaIdMap = new Map<string, string>()
+        for (const media of detail.media) {
+          const blob = await globalDecksClient.downloadMedia(media.sha256)
+          mutateState((state) => {
+            const existing = state.media.find((item) => item.sha256 === media.sha256)
+            if (existing) {
+              mediaIdMap.set(media.sourceMediaId, existing.id)
+              return
+            }
+            const id = state.media.some((item) => item.id === media.sourceMediaId)
+              ? makeId('media')
+              : media.sourceMediaId
+            state.media.push({
+              id,
+              sha256: media.sha256,
+              mimeType: media.mimeType,
+              originalName: media.originalName,
+              dataBase64: blob.dataBase64,
+            })
+            mediaIdMap.set(media.sourceMediaId, id)
           })
         }
+        const localDeckIds = new Map<string, string>()
+        const pending = [...detail.decks]
+        let created: DeckSummary | null = null
+        while (pending.length > 0) {
+          const index = pending.findIndex((item) => !item.parentSourceDeckId || localDeckIds.has(item.parentSourceDeckId))
+          if (index < 0) throw new Error('That global deck has an invalid subdeck hierarchy.')
+          const [item] = pending.splice(index, 1)
+          const localDeck = await api.decks.create({
+            name: item.parentSourceDeckId ? item.name : uniqueLocalDeckName(item.name),
+            parentId: item.parentSourceDeckId ? localDeckIds.get(item.parentSourceDeckId) : null,
+          })
+          if (!item.parentSourceDeckId) created = localDeck
+          localDeckIds.set(item.sourceDeckId, localDeck.id)
+          for (const card of item.cards) {
+            const remap = (html: string) => html.replace(/onami-media:\/\/([^"')\s]+)/g, (original, rawId: string) => {
+              const localId = mediaIdMap.get(decodeURIComponent(rawId))
+              return localId ? `onami-media://${encodeURIComponent(localId)}` : original
+            })
+            await api.cards.create({
+              deckId: localDeck.id,
+              noteType: card.noteType,
+              frontHtml: remap(card.frontHtml),
+              backHtml: remap(card.backHtml),
+              tags: card.tags,
+            })
+          }
+        }
+        if (!created) throw new Error('That global deck has no root deck.')
         const state = readState()
         const deck = state.decks.find((item) => item.id === created.id)
         return deck ? toSummary(state, deck) : created
