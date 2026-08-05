@@ -1,5 +1,7 @@
 import { createEmptyCard, fsrs, Rating, State, type Card as FsrsCard, type Grade } from 'ts-fsrs'
 
+import { createGlobalDecksClient, GLOBAL_DECKS_MAX_PUBLISH_CARDS } from './shared/globalDecks'
+
 import type {
   AiGenerationResult,
   AiSettings,
@@ -12,6 +14,8 @@ import type {
   CreateDeckInput,
   DeckDetail,
   DeckSummary,
+  GlobalDeckCard,
+  GlobalDeckSummary,
   HardCardSummary,
   ImportResult,
   NoteTypeName,
@@ -564,6 +568,37 @@ const makeId = (prefix: string) => {
       ? crypto.randomUUID()
       : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
   return `${prefix}_${randomId}`
+}
+
+const GLOBAL_DECKS_INSTALLATION_KEY = 'onami.globalDecks.installationId'
+
+/**
+ * Stable id for this browser install, kept in localStorage so hearts and
+ * published decks stay attributable across reloads. It is deliberately not the
+ * sync device id: the deck library only ever sees this.
+ */
+const getInstallationId = (): string => {
+  const stored = localStorage.getItem(GLOBAL_DECKS_INSTALLATION_KEY)
+  if (stored) return stored
+  const installationId =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  localStorage.setItem(GLOBAL_DECKS_INSTALLATION_KEY, installationId)
+  return installationId
+}
+
+const globalDecksClient = createGlobalDecksClient({ installationId: getInstallationId })
+
+/** Keeps repeated adds of the same library deck distinguishable. */
+const uniqueLocalDeckName = (name: string): string => {
+  const taken = new Set(readState().decks.map((deck) => deck.name))
+  if (!taken.has(name)) return name
+  for (let suffix = 2; suffix < 1000; suffix += 1) {
+    const candidate = `${name} (${suffix})`
+    if (!taken.has(candidate)) return candidate
+  }
+  return `${name} (${Date.now()})`
 }
 
 const normalizeThemeMode = (value: unknown): ThemeMode =>
@@ -1662,6 +1697,50 @@ export const installBrowserOnami = async () => {
       },
       importApkg: async (): Promise<ImportResult> => {
         throw new Error('APKG import is not available in this Android MVP yet.')
+      },
+    },
+    globalDecks: {
+      list: (search: string) => globalDecksClient.list(search),
+      publish: async (localDeckId: string): Promise<GlobalDeckSummary> => {
+        const state = readState()
+        const deck = state.decks.find((item) => item.id === localDeckId)
+        if (!deck) throw new Error('Deck not found.')
+        const deckIds = new Set(getDescendantDeckIds(state, deck.id))
+        // Card content only: scheduling and review history stay on the device.
+        const cards: GlobalDeckCard[] = state.cards
+          .filter((card) => deckIds.has(card.deckId))
+          .map((card) => ({
+            frontHtml: card.frontHtml,
+            backHtml: card.backHtml,
+            tags: card.tags,
+            noteType: card.noteType,
+          }))
+        if (cards.length === 0) throw new Error('That deck has no cards to publish yet.')
+        if (cards.length > GLOBAL_DECKS_MAX_PUBLISH_CARDS) {
+          throw new Error(
+            `Decks up to ${GLOBAL_DECKS_MAX_PUBLISH_CARDS} cards can be published; this one has ${cards.length}.`
+          )
+        }
+        return globalDecksClient.publish({ sourceDeckId: deck.id, name: deck.name, cards })
+      },
+      heart: (globalDeckId: string, hearted: boolean) => globalDecksClient.heart(globalDeckId, hearted),
+      addToLibrary: async (globalDeckId: string): Promise<DeckSummary> => {
+        const detail = await globalDecksClient.get(globalDeckId)
+        if (detail.cards.length === 0) throw new Error('That deck has no cards to add.')
+
+        const created = await api.decks.create({ name: uniqueLocalDeckName(detail.name) })
+        for (const card of detail.cards) {
+          await api.cards.create({
+            deckId: created.id,
+            noteType: card.noteType,
+            frontHtml: card.frontHtml,
+            backHtml: card.backHtml,
+            tags: card.tags,
+          })
+        }
+        const state = readState()
+        const deck = state.decks.find((item) => item.id === created.id)
+        return deck ? toSummary(state, deck) : created
       },
     },
     cards: {

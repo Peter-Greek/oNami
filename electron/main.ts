@@ -147,6 +147,17 @@ const registerIpc = (): void => {
     getServices().importApkg(filePath, options)
   )
 
+  ipcMain.handle('global-decks:list', (_event, search: string) => getServices().listGlobalDecks(search))
+  ipcMain.handle('global-decks:publish', (_event, localDeckId: string) =>
+    getServices().publishGlobalDeck(localDeckId)
+  )
+  ipcMain.handle('global-decks:heart', (_event, globalDeckId: string, hearted: boolean) =>
+    getServices().heartGlobalDeck(globalDeckId, hearted)
+  )
+  ipcMain.handle('global-decks:add-to-library', (_event, globalDeckId: string) =>
+    getServices().addGlobalDeckToLibrary(globalDeckId)
+  )
+
   ipcMain.handle('cards:create', (_event, input: CreateCardInput) => getServices().createCard(input))
   ipcMain.handle('cards:update', (_event, input: UpdateCardInput) => getServices().updateCard(input))
   ipcMain.handle('cards:delete', (_event, cardId: string) => getServices().deleteCard(cardId))

@@ -12,6 +12,12 @@ const api: OnamiApi = {
     selectApkg: () => ipcRenderer.invoke('decks:select-apkg'),
     importApkg: (filePath, options) => ipcRenderer.invoke('decks:import-apkg', filePath, options),
   },
+  globalDecks: {
+    list: (search) => ipcRenderer.invoke('global-decks:list', search),
+    publish: (localDeckId) => ipcRenderer.invoke('global-decks:publish', localDeckId),
+    heart: (globalDeckId, hearted) => ipcRenderer.invoke('global-decks:heart', globalDeckId, hearted),
+    addToLibrary: (globalDeckId) => ipcRenderer.invoke('global-decks:add-to-library', globalDeckId),
+  },
   cards: {
     create: (input) => ipcRenderer.invoke('cards:create', input),
     update: (input) => ipcRenderer.invoke('cards:update', input),

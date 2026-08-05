@@ -12,6 +12,7 @@ import type {
   DeckDetail,
   DeckSummary,
   HardCardSummary,
+  NoteTypeName,
   ReviewRating,
   ReviewStateName,
   SyncCardUpsertPayload,
@@ -296,6 +297,41 @@ export class OnamiDatabase {
       )
       .all({ deckId }) as Row[]
     return rows.map((row) => this.rowToCardSummary(row))
+  }
+
+  /**
+   * Note type per card id for a deck and its children. `CardSummary` does not
+   * carry the note type, but publishing a deck needs it so cloze cards stay
+   * cloze cards for whoever adds the deck to their library.
+   */
+  listCardNoteTypes(deckId: string): Map<string, NoteTypeName> {
+    const rows = this.db
+      .prepare(
+        `SELECT c.id, n.note_type
+         FROM cards c
+         JOIN notes n ON n.id = c.note_id
+         WHERE c.deck_id IN (
+           WITH RECURSIVE deck_tree(id) AS (
+             SELECT @deckId
+             UNION ALL
+             SELECT d.id
+             FROM decks d
+             JOIN deck_tree dt ON d.parent_id = dt.id
+           )
+           SELECT id FROM deck_tree
+         )`
+      )
+      .all({ deckId }) as Row[]
+
+    const noteTypes = new Map<string, NoteTypeName>()
+    for (const row of rows) {
+      const noteType = toStringValue(row.note_type)
+      noteTypes.set(
+        toStringValue(row.id),
+        noteType === 'cloze' || noteType === 'imported' ? noteType : 'basic'
+      )
+    }
+    return noteTypes
   }
 
   getCard(cardId: string): CardSummary {

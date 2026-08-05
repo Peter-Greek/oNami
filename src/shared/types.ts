@@ -123,6 +123,40 @@ export interface ImportResult {
   warnings: string[]
 }
 
+/**
+ * One card of a globally published deck. A published deck is a plain snapshot
+ * of card content — scheduling, review history and note ids stay local and are
+ * never uploaded.
+ */
+export interface GlobalDeckCard {
+  frontHtml: string
+  backHtml: string
+  tags: string[]
+  noteType: NoteTypeName
+}
+
+/** A deck listed in the global library. All fields come from the host. */
+export interface GlobalDeckSummary {
+  id: string
+  name: string
+  cardCount: number
+  heartCount: number
+  /** True when this installation has hearted the deck. */
+  viewerHearted: boolean
+  publishedAt: string
+  updatedAt: string
+}
+
+export interface GlobalDeckDetail extends GlobalDeckSummary {
+  cards: GlobalDeckCard[]
+}
+
+export interface GlobalDeckHeartResult {
+  id: string
+  heartCount: number
+  viewerHearted: boolean
+}
+
 export interface AiGenerationOptions {
   style: 'basic' | 'cloze' | 'mixed'
   deckId?: string
@@ -471,6 +505,15 @@ export interface OnamiApi {
     get(deckId: string): Promise<DeckDetail>
     selectApkg(): Promise<string | null>
     importApkg(filePath: string, options: ImportApkgOptions): Promise<ImportResult>
+  }
+  globalDecks: {
+    /** Decks from the global library, in the host's heart order. */
+    list(search: string): Promise<GlobalDeckSummary[]>
+    /** Publishes an existing local deck as a card snapshot. */
+    publish(localDeckId: string): Promise<GlobalDeckSummary>
+    heart(globalDeckId: string, hearted: boolean): Promise<GlobalDeckHeartResult>
+    /** Copies a global deck into the local library as a new deck. */
+    addToLibrary(globalDeckId: string): Promise<DeckSummary>
   }
   cards: {
     create(input: CreateCardInput): Promise<CardSummary>

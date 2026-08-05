@@ -7,6 +7,7 @@ import { safeStorage } from 'electron'
 import { z } from 'zod'
 
 import { ApkgImporter } from './apkgImporter'
+import { createGlobalDecksClient, GLOBAL_DECKS_MAX_PUBLISH_CARDS } from '../../src/shared/globalDecks'
 import { OnamiDatabase, type RemoteSyncEvent } from './database'
 import { SchedulerService, selectCardsForMode, type StudySessionRuntime } from './scheduler'
 import type {
@@ -21,6 +22,9 @@ import type {
   CreateDeckInput,
   DeckDetail,
   DeckSummary,
+  GlobalDeckCard,
+  GlobalDeckHeartResult,
+  GlobalDeckSummary,
   ImportApkgOptions,
   ImportResult,
   SaveAiSettingsInput,
@@ -74,6 +78,7 @@ interface StoredSyncSettings {
 const AI_SETTINGS_KEY = 'ai.settings'
 const APP_SETTINGS_KEY = 'app.settings'
 const SYNC_SETTINGS_KEY = 'sync.settings'
+const GLOBAL_DECKS_SETTINGS_KEY = 'globalDecks.settings'
 const DEFAULT_AI_MODEL = 'gpt-4o-mini'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
 const DEFAULT_APP_SETTINGS: AppSettings = {
@@ -107,6 +112,9 @@ export class AppServices {
   private readonly sessions = new Map<string, StudySessionRuntime>()
   private autoSyncTimer: NodeJS.Timeout | null = null
   private syncInFlight: Promise<SyncRunResult> | null = null
+  private readonly globalDecks = createGlobalDecksClient({
+    installationId: () => this.getInstallationId(),
+  })
 
   constructor(private readonly database: OnamiDatabase) {
     this.scheduler = new SchedulerService(database)
@@ -274,6 +282,87 @@ export class AppServices {
     } finally {
       fs.rmSync(parsed.tempDir, { recursive: true, force: true })
     }
+  }
+
+  listGlobalDecks(search: string): Promise<GlobalDeckSummary[]> {
+    return this.globalDecks.list(search)
+  }
+
+  /**
+   * Publishes a local deck as a card snapshot. Only card content and the deck
+   * name leave the device — scheduling, review history and settings never do.
+   */
+  publishGlobalDeck(localDeckId: string): Promise<GlobalDeckSummary> {
+    const deck = this.database.getDeck(localDeckId)
+    if (deck.cards.length === 0) throw new Error('That deck has no cards to publish yet.')
+    if (deck.cards.length > GLOBAL_DECKS_MAX_PUBLISH_CARDS) {
+      throw new Error(
+        `Decks up to ${GLOBAL_DECKS_MAX_PUBLISH_CARDS} cards can be published; this one has ${deck.cards.length}.`
+      )
+    }
+
+    const noteTypes = this.database.listCardNoteTypes(localDeckId)
+    const cards: GlobalDeckCard[] = deck.cards.map((card) => ({
+      frontHtml: card.frontHtml,
+      backHtml: card.backHtml,
+      tags: card.tags,
+      noteType: noteTypes.get(card.id) ?? 'basic',
+    }))
+
+    return this.globalDecks.publish({ sourceDeckId: deck.id, name: deck.name, cards })
+  }
+
+  heartGlobalDeck(globalDeckId: string, hearted: boolean): Promise<GlobalDeckHeartResult> {
+    return this.globalDecks.heart(globalDeckId, hearted)
+  }
+
+  /**
+   * Copies a published deck into the local library as a brand new deck, so it
+   * starts unscheduled and never collides with the copy the publisher has.
+   */
+  async addGlobalDeckToLibrary(globalDeckId: string): Promise<DeckSummary> {
+    const detail = await this.globalDecks.get(globalDeckId)
+    if (detail.cards.length === 0) throw new Error('That deck has no cards to add.')
+
+    const deck = this.createDeck({ name: this.uniqueLocalDeckName(detail.name) })
+    for (const card of detail.cards) {
+      this.createCard({
+        deckId: deck.id,
+        noteType: card.noteType,
+        frontHtml: card.frontHtml,
+        backHtml: card.backHtml,
+        tags: card.tags,
+      })
+    }
+    return this.database.getDeckSummary(deck.id)
+  }
+
+  /** Keeps repeated adds of the same library deck distinguishable. */
+  private uniqueLocalDeckName(name: string): string {
+    const taken = new Set(this.database.listDecks().map((deck) => deck.name))
+    if (!taken.has(name)) return name
+    for (let suffix = 2; suffix < 1000; suffix += 1) {
+      const candidate = `${name} (${suffix})`
+      if (!taken.has(candidate)) return candidate
+    }
+    return `${name} (${Date.now()})`
+  }
+
+  /**
+   * Stable per-install id shared with the deck library. It is not the sync
+   * device id: it survives pairing changes and is the only identity the
+   * library host ever sees.
+   */
+  private getInstallationId(): string {
+    const stored = this.database.getSettingsValue<{ installationId: string | null }>(
+      GLOBAL_DECKS_SETTINGS_KEY,
+      { installationId: null }
+    )
+    if (stored.installationId) return stored.installationId
+
+    const installationId = randomUUID()
+    this.database.setSettingsValue(GLOBAL_DECKS_SETTINGS_KEY, { installationId })
+    return installationId
   }
 
   startSession(deckId: string, mode: StudyMode, settings: StudySessionSettings): StudySession {

@@ -21,12 +21,15 @@ import {
   CloudUpload,
   FileUp,
   Flame,
+  Globe2,
+  Heart,
   Layers3,
   Minus,
   Moon,
   Play,
   Plus,
   RotateCcw,
+  Search,
   Settings,
   Sparkles,
   Square,
@@ -44,6 +47,7 @@ import type {
   CardSummary,
   DeckDetail,
   DeckSummary,
+  GlobalDeckSummary,
   HardCardSummary,
   ReviewRating,
   StudyMode,
@@ -58,7 +62,7 @@ import type {
 } from './shared/types'
 import './App.css'
 
-type View = 'study' | 'create' | 'import' | 'stats' | 'settings'
+type View = 'study' | 'create' | 'browse' | 'import' | 'stats' | 'settings'
 
 type PairingFlow = 'start' | 'join' | null
 
@@ -80,6 +84,7 @@ interface DeckRow {
 const tabs: Array<{ id: View; label: string; icon: typeof BookOpen }> = [
   { id: 'study', label: 'Study', icon: BookOpen },
   { id: 'create', label: 'Create', icon: Plus },
+  { id: 'browse', label: 'Browse', icon: Globe2 },
   { id: 'import', label: 'Import', icon: FileUp },
   { id: 'stats', label: 'Stats', icon: BarChart3 },
   { id: 'settings', label: 'Settings', icon: Settings },
@@ -100,6 +105,7 @@ const formatSyncTimestamp = (value: string | null): string | null => {
 const viewTitle: Record<View, string> = {
   study: 'Study',
   create: 'Create',
+  browse: 'Browse',
   import: 'Import',
   stats: 'Stats',
   settings: 'Settings',
@@ -651,6 +657,16 @@ function App() {
               runBusy={runBusy}
             />
           )}
+          {view === 'browse' && (
+            <BrowseView
+              onAdded={(deckId) =>
+                load(deckId).then(() => {
+                  setView('study')
+                })
+              }
+              runBusy={runBusy}
+            />
+          )}
           {view === 'import' && (
             <ImportView
               onImported={(deckId) =>
@@ -831,6 +847,7 @@ function StudyView({
   const [index, setIndex] = useState(0)
   const [showBack, setShowBack] = useState(false)
   const [recommendation, setRecommendation] = useState('')
+  const [publishNote, setPublishNote] = useState('')
   const cardStartedAtRef = useRef(performance.now())
   const cardRevealedAtRef = useRef<number | null>(null)
 
@@ -871,6 +888,27 @@ function StudyView({
     if (!session || !current) return
     resetCardTimer()
   }, [current, resetCardTimer, session])
+
+  // Publishing shares the deck's cards with everyone on the library host, so it
+  // asks first and reports the outcome in place.
+  const publishGlobally = () => {
+    if (!selectedDeckId) return
+    const name = decks.find((item) => item.id === selectedDeckId)?.name ?? 'this deck'
+    const confirmed = window.confirm(
+      `Publish "${name}" to the global library? Its cards become visible to everyone browsing. Your scheduling and review history are not shared.`
+    )
+    if (!confirmed) return
+
+    setPublishNote('')
+    runBusy(async () => {
+      try {
+        const published = await window.onami.globalDecks.publish(selectedDeckId)
+        setPublishNote(`Published "${published.name}" with ${published.cardCount} cards.`)
+      } catch (error) {
+        setPublishNote(error instanceof Error ? error.message : String(error))
+      }
+    }, 'Publishing deck...')
+  }
 
   const start = () =>
     runBusy(async () => {
@@ -1027,6 +1065,16 @@ function StudyView({
         <Metric label="Due" value={selectedCounts.dueCards} />
         <Metric label="New" value={selectedCounts.newCards} />
       </div>
+
+      <button
+        className="secondary-action compact-action"
+        disabled={busy || !selectedDeckId || selectedCounts.totalCards === 0}
+        onClick={publishGlobally}
+      >
+        <Globe2 size={16} />
+        Publish globally
+      </button>
+      {publishNote && <div className="recommendation">{publishNote}</div>}
 
       <div className="segmented">
         {(['learn-new', 'review-due', 'mixed', 'unit-test'] as StudyMode[]).map((item) => (
@@ -1246,6 +1294,156 @@ function CreateView({
           <button onClick={() => saveDraft(draft)}>Save draft</button>
         </div>
       ))}
+    </section>
+  )
+}
+
+const formatHearts = (hearts: number): string => `${hearts} ${hearts === 1 ? 'heart' : 'hearts'}`
+
+const formatGlobalCards = (cards: number): string => `${cards} ${cards === 1 ? 'card' : 'cards'}`
+
+/**
+ * The global deck library. Decks are published by other oNami users and the
+ * host returns them most-hearted first, so the list is shown in the order it
+ * arrives rather than re-sorted here.
+ */
+function BrowseView({
+  onAdded,
+  runBusy,
+}: {
+  onAdded: (deckId: string) => Promise<void>
+  runBusy: BusyRunner
+}) {
+  const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [decks, setDecks] = useState<GlobalDeckSummary[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [result, setResult] = useState('')
+  const [addingId, setAddingId] = useState('')
+  const [reloadToken, setReloadToken] = useState(0)
+
+  // Typing shouldn't fire one request per keystroke at the host.
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search), 300)
+    return () => window.clearTimeout(timer)
+  }, [search])
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    window.onami.globalDecks
+      .list(debouncedSearch)
+      .then((listing) => {
+        if (cancelled) return
+        setDecks(listing)
+        setError('')
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason))
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [debouncedSearch, reloadToken])
+
+  const toggleHeart = async (deck: GlobalDeckSummary) => {
+    const hearted = !deck.viewerHearted
+    setError('')
+    try {
+      const updated = await window.onami.globalDecks.heart(deck.id, hearted)
+      setDecks((current) =>
+        current.map((item) =>
+          item.id === deck.id
+            ? { ...item, heartCount: updated.heartCount, viewerHearted: updated.viewerHearted }
+            : item
+        )
+      )
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    }
+  }
+
+  const addToLibrary = (deck: GlobalDeckSummary) => {
+    setError('')
+    setResult('')
+    setAddingId(deck.id)
+    runBusy(async () => {
+      try {
+        const added = await window.onami.globalDecks.addToLibrary(deck.id)
+        setResult(`Added "${added.name}" with ${added.totalCards} cards.`)
+        await onAdded(added.id)
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      } finally {
+        setAddingId('')
+      }
+    }, 'Adding deck...')
+  }
+
+  return (
+    <section className="view-stack">
+      <div className="global-search">
+        <Search size={16} />
+        <input
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Search published decks"
+          aria-label="Search published decks"
+        />
+        <button
+          className="secondary-action compact-action"
+          onClick={() => setReloadToken((token) => token + 1)}
+          disabled={loading}
+        >
+          <RotateCcw size={16} />
+          Refresh
+        </button>
+      </div>
+
+      {error && <div className="notice">{error}</div>}
+      {result && <div className="recommendation">{result}</div>}
+      {loading && <p className="global-empty">Loading decks…</p>}
+      {!loading && !error && decks.length === 0 && (
+        <p className="global-empty">
+          {debouncedSearch.trim() ? 'No published decks match that search.' : 'No decks have been published yet.'}
+        </p>
+      )}
+
+      <div className="global-list">
+        {decks.map((deck) => (
+          <article className="global-card" key={deck.id}>
+            <header>
+              <h3>{deck.name}</h3>
+              <span className="global-meta">
+                {formatGlobalCards(deck.cardCount)} · {formatHearts(deck.heartCount)}
+              </span>
+            </header>
+            <div className="global-actions">
+              <button
+                className={`heart-toggle${deck.viewerHearted ? ' hearted' : ''}`}
+                aria-pressed={deck.viewerHearted}
+                aria-label={deck.viewerHearted ? `Unheart ${deck.name}` : `Heart ${deck.name}`}
+                onClick={() => void toggleHeart(deck)}
+              >
+                <Heart size={16} />
+                {deck.heartCount}
+              </button>
+              <button
+                className="secondary-action compact-action"
+                disabled={addingId !== ''}
+                onClick={() => addToLibrary(deck)}
+              >
+                <Plus size={16} />
+                {addingId === deck.id ? 'Adding…' : 'Add to library'}
+              </button>
+            </div>
+          </article>
+        ))}
+      </div>
     </section>
   )
 }

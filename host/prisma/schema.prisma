@@ -139,3 +139,30 @@ model DeviceToken {
   @@index([tokenHash])
   @@map("device_tokens")
 }
+
+model GlobalDeck {
+  id           String            @id @default(uuid()) @db.Uuid
+  publisherId  String            @map("publisher_id")
+  sourceDeckId String            @map("source_deck_id")
+  name         String
+  cardsJson    Json              @map("cards_json")
+  cardCount    Int               @map("card_count")
+  publishedAt  DateTime          @default(now()) @map("published_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+  hearts       GlobalDeckHeart[]
+
+  @@unique([publisherId, sourceDeckId])
+  @@index([name])
+  @@map("global_decks")
+}
+
+model GlobalDeckHeart {
+  deckId        String   @map("deck_id") @db.Uuid
+  installationId String  @map("installation_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+  deck          GlobalDeck @relation(fields: [deckId], references: [id], onDelete: Cascade)
+
+  @@id([deckId, installationId])
+  @@index([installationId])
+  @@map("global_deck_hearts")
+}

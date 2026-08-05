@@ -123,6 +123,7 @@ DATABASE_URL=postgresql://onami_user:<password>@localhost:5432/onami_sync?schema
 ONAMI_PAIRING_TTL_MS=600000
 ONAMI_DEVICE_TOKEN_TTL_MS=604800000
 ONAMI_MAX_JSON_BYTES=1048576
+ONAMI_MAX_GLOBAL_DECK_JSON_BYTES=8388608
 ONAMI_MAX_BLOB_BYTES=67108864
 ONAMI_MEDIA_DIR=./media-store
 ```
@@ -133,6 +134,10 @@ ONAMI_MEDIA_DIR=./media-store
 
 ```text
 GET  /health
+GET  /global-decks?search=<text>&sort=hearts&installationId=<id>
+GET  /global-decks/:id?installationId=<id>
+POST /global-decks
+POST /global-decks/:id/heart
 POST /devices/bootstrap
 POST /pairing/start
 POST /pairing/join
@@ -147,6 +152,12 @@ POST /sync/snapshot/ack
 POST /media
 GET  /media/:sha256
 ```
+
+The global deck endpoints are public and use a stable anonymous installation
+id for publishing and hearts. A published snapshot contains only its deck name
+and card content; it never includes review history, scheduling, sync secrets,
+or OpenAI settings. Re-publishing the same local deck from the same installation
+updates its existing global entry.
 
 `/sync/*` and `/media` endpoints require:
 

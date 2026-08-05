@@ -1027,6 +1027,90 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
+.global-search {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: var(--muted);
+}
+
+.global-search input {
+  flex: 1;
+  min-width: 0;
+}
+
+.global-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.global-list {
+  display: grid;
+  gap: 10px;
+}
+
+.global-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.global-card header {
+  display: grid;
+  gap: 4px;
+}
+
+.global-card h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 900;
+  overflow-wrap: anywhere;
+}
+
+.global-meta {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.global-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.heart-toggle {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.heart-toggle.hearted {
+  background: var(--teal-soft);
+  border-color: var(--teal);
+  color: var(--teal-ink);
+}
+
+.heart-toggle.hearted svg {
+  fill: currentColor;
+}
+
 .deck-tree {
   display: grid;
   gap: 6px;

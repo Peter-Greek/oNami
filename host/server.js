@@ -8,6 +8,11 @@ import { fileURLToPath } from 'node:url'
 import { PrismaClient } from '@prisma/client'
 
 import { parseByteRange, resolveAndroidDownload } from './downloads.js'
+import {
+  globalDeckResponse,
+  normalizeGlobalDeckPublish,
+  normalizeGlobalDeckSearch,
+} from './globalDecks.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -33,6 +38,7 @@ const config = {
   pairingTtlMs: Number(process.env.ONAMI_PAIRING_TTL_MS ?? 10 * 60 * 1000),
   tokenTtlMs: Number(process.env.ONAMI_DEVICE_TOKEN_TTL_MS ?? 7 * 24 * 60 * 60 * 1000),
   maxJsonBytes: Number(process.env.ONAMI_MAX_JSON_BYTES ?? 1024 * 1024),
+  maxGlobalDeckJsonBytes: Number(process.env.ONAMI_MAX_GLOBAL_DECK_JSON_BYTES ?? 8 * 1024 * 1024),
   // Full-data snapshots and single media blobs are much larger than incremental events.
   maxBlobBytes: Number(process.env.ONAMI_MAX_BLOB_BYTES ?? 64 * 1024 * 1024),
   mediaDir: process.env.ONAMI_MEDIA_DIR ?? path.join(__dirname, 'media-store'),
@@ -68,7 +74,8 @@ const shouldLogRoute = (pathname) =>
   pathname.startsWith('/sync/') ||
   pathname.startsWith('/pairing/') ||
   pathname.startsWith('/devices/') ||
-  pathname.startsWith('/media')
+  pathname.startsWith('/media') ||
+  pathname.startsWith('/global-decks')
 
 const createRequestContext = (request) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
@@ -423,6 +430,102 @@ const route = async (request, response, context) => {
       'application/json; charset=utf-8',
       'oNami-android.json',
     )
+  }
+
+  if (request.method === 'GET' && url.pathname === '/global-decks') {
+    const search = normalizeGlobalDeckSearch(url.searchParams.get('search'))
+    const installationId = normalizeGlobalDeckSearch(url.searchParams.get('installationId'))
+    const decks = await prisma.globalDeck.findMany({
+      where: search ? { name: { contains: search, mode: 'insensitive' } } : undefined,
+      include: {
+        ...(installationId
+          ? { hearts: { where: { installationId }, select: { installationId: true } } }
+          : {}),
+        _count: { select: { hearts: true } },
+      },
+      orderBy: [{ hearts: { _count: 'desc' } }, { updatedAt: 'desc' }],
+      take: 100,
+    })
+    return send(response, 200, { decks: decks.map((deck) => globalDeckResponse(deck)) })
+  }
+
+  const globalDeckHeartMatch = url.pathname.match(/^\/global-decks\/([0-9a-f-]+)\/heart$/i)
+  if (request.method === 'POST' && globalDeckHeartMatch) {
+    const deckId = globalDeckHeartMatch[1]
+    if (!UUID_PATTERN.test(deckId)) throw httpError(400, 'Global deck id must be a UUID.')
+    const body = await readJson(request)
+    const installationId = requiredString(body, 'installationId')
+    if (installationId.length > 200) throw httpError(400, 'installationId is too long.')
+    if (typeof body.hearted !== 'boolean') throw httpError(400, 'hearted must be a boolean.')
+
+    const result = await prisma.$transaction(async (tx) => {
+      const deck = await tx.globalDeck.findUnique({ where: { id: deckId }, select: { id: true } })
+      if (!deck) throw httpError(404, 'Global deck not found.')
+      if (body.hearted) {
+        await tx.globalDeckHeart.upsert({
+          where: { deckId_installationId: { deckId, installationId } },
+          update: {},
+          create: { deckId, installationId },
+        })
+      } else {
+        await tx.globalDeckHeart.deleteMany({ where: { deckId, installationId } })
+      }
+      return tx.globalDeckHeart.count({ where: { deckId } })
+    })
+    return send(response, 200, {
+      id: deckId,
+      heartCount: result,
+      hearted: body.hearted,
+      viewerHearted: body.hearted,
+    })
+  }
+
+  const globalDeckMatch = url.pathname.match(/^\/global-decks\/([0-9a-f-]+)$/i)
+  if (request.method === 'GET' && globalDeckMatch) {
+    const deckId = globalDeckMatch[1]
+    if (!UUID_PATTERN.test(deckId)) throw httpError(400, 'Global deck id must be a UUID.')
+    const installationId = normalizeGlobalDeckSearch(url.searchParams.get('installationId'))
+    const deck = await prisma.globalDeck.findUnique({
+      where: { id: deckId },
+      include: {
+        ...(installationId
+          ? { hearts: { where: { installationId }, select: { installationId: true } } }
+          : {}),
+        _count: { select: { hearts: true } },
+      },
+    })
+    if (!deck) throw httpError(404, 'Global deck not found.')
+    return send(response, 200, { deck: globalDeckResponse(deck) })
+  }
+
+  if (request.method === 'POST' && url.pathname === '/global-decks') {
+    const input = normalizeGlobalDeckPublish(await readJson(request, config.maxGlobalDeckJsonBytes))
+    const deck = await prisma.globalDeck.upsert({
+      where: {
+        publisherId_sourceDeckId: {
+          publisherId: input.publisherId,
+          sourceDeckId: input.sourceDeckId,
+        },
+      },
+      update: {
+        name: input.name,
+        cardsJson: input.cards,
+        cardCount: input.cards.length,
+        publishedAt: now(),
+      },
+      create: {
+        publisherId: input.publisherId,
+        sourceDeckId: input.sourceDeckId,
+        name: input.name,
+        cardsJson: input.cards,
+        cardCount: input.cards.length,
+      },
+      include: {
+        hearts: { where: { installationId: input.publisherId }, select: { installationId: true } },
+        _count: { select: { hearts: true } },
+      },
+    })
+    return send(response, 200, { deck: globalDeckResponse(deck) })
   }
 
   if (request.method === 'POST' && url.pathname === '/devices/bootstrap') {
