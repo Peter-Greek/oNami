@@ -50,6 +50,9 @@
 .desktop {
   width: 100vw;
   height: 100vh;
+  /* Dynamic viewport units keep the shell exactly one screenful tall on mobile
+     browsers/WebViews, where 100vh ignores the collapsing system chrome. */
+  height: 100dvh;
   background: transparent;
   color: var(--ink);
   overflow: hidden;
@@ -59,6 +62,7 @@
   position: relative;
   width: 100vw;
   height: 100vh;
+  height: 100dvh;
   display: grid;
   grid-template-rows: auto auto auto 1fr;
   border-radius: 16px;
@@ -216,8 +220,11 @@ h2 {
   color: var(--danger-ink);
 }
 
+/* On a phone the status bar already supplies the visual gap, so only reserve
+   the real inset (when the WebView is edge-to-edge) over a small floor rather
+   than stacking a fixed 18px on top of it. */
 .browser-shell .topbar {
-  padding-top: max(18px, env(safe-area-inset-top));
+  padding-top: max(10px, env(safe-area-inset-top, 0px));
   -webkit-app-region: no-drag;
 }
 
@@ -327,11 +334,15 @@ button:disabled {
   white-space: nowrap;
 }
 
+/* Auto columns instead of a hardcoded count: every tab stays on a single row
+   no matter how many tabs exist, so adding one never orphans it onto a second
+   row (which is what happened when Browse was added to the five-column grid). */
 .tabbar {
   margin: 0 22px 12px;
   padding: 5px;
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 4px;
   background: var(--wash);
   border-radius: 12px;
@@ -1133,15 +1144,24 @@ textarea:focus {
 
 /* Phone shell is far narrower than the desktop window: tighten the numeric
    columns, action buttons and depth indent so the deck name keeps enough room
-   to stay readable instead of collapsing to one letter. */
+   to stay readable instead of collapsing to one letter. The count columns are
+   variables so the compact breakpoint can scale them with the viewport instead
+   of clipping four-digit totals on very narrow devices. */
 .browser-shell .deck-tree-header,
 .browser-shell .deck-tree-main {
-  grid-template-columns: minmax(0, 1fr) 40px 32px 48px;
+  grid-template-columns:
+    minmax(0, 1fr)
+    var(--deck-col-new, 40px)
+    var(--deck-col-due, 32px)
+    var(--deck-col-cards, 48px);
   column-gap: 2px;
 }
 
+/* 28px + 28px action cells plus the row's 4px right padding, so the header
+   labels stay above the columns they describe. */
 .browser-shell .deck-tree-header {
-  padding-right: 66px;
+  padding-right: 60px;
+  padding-left: 10px;
 }
 
 .browser-shell .deck-tree-row {
@@ -1504,7 +1524,7 @@ textarea:focus {
 
 .busy {
   position: absolute;
-  inset: auto 18px 16px;
+  inset: auto 18px max(16px, env(safe-area-inset-bottom, 0px));
   min-height: 42px;
   display: grid;
   place-items: center;
@@ -1512,4 +1532,183 @@ textarea:focus {
   background: rgba(32, 37, 43, 0.92);
   color: var(--paper);
   font-weight: 900;
+}
+
+/* ---------------------------------------------------------------------------
+   Compact phone layout.
+
+   Only phone-class viewports enter this block: the desktop window enforces a
+   560px minimum width (electron/main.ts), so everything above keeps the
+   desktop presentation untouched. The goal here is to spend as little vertical
+   space as possible on the chrome above the deck list — narrow devices such as
+   the OnePlus Open front screen are both short on width (clipped labels and
+   counts) and tall enough that the study controls would otherwise push the
+   deck list off screen.
+   --------------------------------------------------------------------------- */
+@media (max-width: 520px) {
+  .topbar {
+    gap: 8px;
+    /* Symmetric, proportional gutters instead of 18/22/10. */
+    padding: 12px clamp(14px, 4.5vw, 22px) 6px;
+  }
+
+  .browser-shell .topbar {
+    padding-top: max(8px, env(safe-area-inset-top, 0px));
+  }
+
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+  }
+
+  .eyebrow {
+    margin-bottom: 1px;
+    font-size: 10px;
+  }
+
+  h1 {
+    font-size: clamp(17px, 5.4vw, 24px);
+  }
+
+  .theme-toggle {
+    min-width: 56px;
+    height: 34px;
+    padding: 0 7px;
+  }
+
+  .status-strip {
+    margin: 0 clamp(14px, 4.5vw, 22px) 8px;
+    grid-template-columns: minmax(88px, 1.55fr) repeat(4, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .streak-pill {
+    padding: 0 7px;
+  }
+
+  .mini-metric,
+  .score-pill,
+  .streak-pill,
+  .settings-state {
+    min-height: 34px;
+  }
+
+  .streak-copy strong {
+    font-size: clamp(13px, 3.8vw, 16px);
+  }
+
+  .streak-copy span {
+    font-size: clamp(8px, 2.3vw, 10px);
+  }
+
+  .streak-copy small {
+    font-size: clamp(7px, 2vw, 9px);
+  }
+
+  .mini-metric strong {
+    overflow: hidden;
+    font-size: clamp(10px, 3vw, 13px);
+    text-overflow: ellipsis;
+  }
+
+  .mini-metric span {
+    font-size: 9px;
+  }
+
+  .score-pill {
+    gap: 2px;
+    padding: 0 3px;
+    font-size: clamp(9px, 2.8vw, 12px);
+  }
+
+  .score-pill svg {
+    width: 12px;
+  }
+
+  .tabbar {
+    margin: 0 clamp(14px, 4.5vw, 22px) 8px;
+    padding: 4px;
+    gap: 2px;
+  }
+
+  /* Six tabs across a narrow viewport: shrink the label with the viewport so
+     "Settings" still renders in full rather than being ellipsised away. */
+  .tabbar button {
+    height: 40px;
+    gap: 1px;
+    font-size: clamp(8px, 2.5vw, 10px);
+  }
+
+  .content {
+    /* Keep the last control clear of the gesture bar / rounded corners. */
+    padding: 0 clamp(14px, 4.5vw, 22px) calc(16px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .view-stack {
+    gap: 10px;
+  }
+
+  /* Scale the deck columns with the viewport so four-digit counts stay whole
+     while the deck name keeps the remaining space. */
+  .deck-tree {
+    --deck-col-new: clamp(34px, 10.5vw, 46px);
+    --deck-col-due: clamp(30px, 9vw, 40px);
+    --deck-col-cards: clamp(38px, 12vw, 52px);
+  }
+
+  .deck-tree-main {
+    min-height: 34px;
+    font-size: clamp(12px, 3.6vw, 15px);
+  }
+
+  .deck-complete-badge {
+    font-size: 9px;
+  }
+
+  /* Keep the study controls in reach while allowing more deck rows on taller
+     phones. The outer content remains the page scroller. */
+  .deck-tree-rows {
+    max-height: clamp(132px, 24vh, 220px);
+    max-height: clamp(132px, 24dvh, 220px);
+  }
+
+  .metric {
+    min-height: 54px;
+  }
+
+  .metric span {
+    font-size: 11px;
+  }
+
+  .segmented button {
+    font-size: clamp(9px, 2.8vw, 11px);
+  }
+
+  .primary-action,
+  .secondary-action,
+  .empty-actions button {
+    min-height: 42px;
+  }
+
+  .busy {
+    inset: auto 14px max(14px, env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* Short viewports (landscape phones, split screen): the deck list must not eat
+   the whole scroller, and the chrome tightens further. */
+@media (max-width: 900px) and (max-height: 560px) {
+  .deck-tree-rows {
+    max-height: clamp(120px, 34vh, 240px);
+    max-height: clamp(120px, 34dvh, 240px);
+  }
+
+  .tabbar button {
+    height: 36px;
+  }
+
+  .metric {
+    min-height: 48px;
+  }
 }
