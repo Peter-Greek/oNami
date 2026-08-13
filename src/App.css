@@ -1534,6 +1534,77 @@ textarea:focus {
   font-weight: 900;
 }
 
+.app-update-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.app-update-card.available {
+  border-color: rgba(213, 161, 67, 0.45);
+  background: var(--notice-bg);
+  color: var(--notice-ink);
+}
+
+.app-update-card.error {
+  color: var(--muted);
+}
+
+.app-update-copy {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.app-update-copy div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.app-update-copy strong {
+  font-size: 13px;
+  font-weight: 950;
+}
+
+.app-update-copy span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.update-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 40px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--notice-ink);
+  color: var(--surface);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 950;
+  cursor: pointer;
+}
+
+.spin {
+  animation: app-update-spin 0.9s linear infinite;
+}
+
+@keyframes app-update-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .transfer-banner {
   display: grid;
   gap: 8px;

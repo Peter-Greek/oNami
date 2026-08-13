@@ -15,12 +15,14 @@ import {
   Bug,
   Check,
   CheckCircle2,
+  CircleAlert,
   Clock3,
   CloudCheck,
   CloudOff,
   CloudUpload,
   FileUp,
   Flame,
+  Download,
   Globe2,
   Heart,
   Layers3,
@@ -29,6 +31,7 @@ import {
   Play,
   Plus,
   RotateCcw,
+  RefreshCw,
   Search,
   Settings,
   Sparkles,
@@ -61,6 +64,12 @@ import type {
   ThemeMode,
   TransferProgressEvent,
 } from './shared/types'
+import {
+  ANDROID_UPDATE_METADATA_URL,
+  isAndroidUpdateAvailable,
+  parseAndroidUpdateMetadata,
+  type AndroidUpdateMetadata,
+} from './shared/androidUpdates'
 import './App.css'
 
 type View = 'study' | 'create' | 'browse' | 'import' | 'stats' | 'settings'
@@ -68,6 +77,12 @@ type View = 'study' | 'create' | 'browse' | 'import' | 'stats' | 'settings'
 type PairingFlow = 'start' | 'join' | null
 
 type BusyRunner = (fn: () => Promise<void>, label?: string) => void
+
+type AndroidUpdateState =
+  | { status: 'checking'; installedVersionName: string }
+  | { status: 'current'; installedVersionName: string }
+  | { status: 'available'; installedVersionName: string; update: AndroidUpdateMetadata }
+  | { status: 'error'; installedVersionName: string; message: string }
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 const AUTO_SYNC_INTERVAL_MS = 15_000
@@ -1762,6 +1777,7 @@ function SettingsView({
   const [syncRun, setSyncRun] = useState<SyncRunResult | null>(null)
   const [syncMessage, setSyncMessage] = useState('')
   const [syncProgress, setSyncProgress] = useState<SyncProgressEvent[]>([])
+  const [androidUpdate, setAndroidUpdate] = useState<AndroidUpdateState | null>(null)
   const BackupIcon =
     syncStatus?.backupState === 'backed-up'
       ? CloudCheck
@@ -1793,13 +1809,40 @@ function SettingsView({
     if (next.activeProgress) setSyncMessage(next.activeProgress.message)
   }, [])
 
+  const checkForAndroidUpdate = useCallback(async () => {
+    const bridge = window.onamiAndroid
+    if (!bridge?.getVersionCode || !bridge.getVersionName || !bridge.openExternalUrl) return
+
+    const installedVersionCode = bridge.getVersionCode()
+    const installedVersionName = bridge.getVersionName() || String(installedVersionCode)
+    setAndroidUpdate({ status: 'checking', installedVersionName })
+
+    try {
+      const response = await fetch(`${ANDROID_UPDATE_METADATA_URL}?t=${Date.now()}`, { cache: 'no-store' })
+      if (!response.ok) throw new Error(`Update server returned ${response.status}.`)
+      const update = parseAndroidUpdateMetadata(await response.json())
+      setAndroidUpdate(
+        isAndroidUpdateAvailable(installedVersionCode, update.versionCode)
+          ? { status: 'available', installedVersionName, update }
+          : { status: 'current', installedVersionName }
+      )
+    } catch (error) {
+      setAndroidUpdate({
+        status: 'error',
+        installedVersionName,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }, [])
+
   useEffect(() => {
     window.onami.ai.getSettings().then((next) => {
       setAiSettings(next)
       setModel(next.model)
     })
     window.onami.sync.getStatus().then(applySyncStatus)
-  }, [applySyncStatus])
+    void checkForAndroidUpdate()
+  }, [applySyncStatus, checkForAndroidUpdate])
 
   useEffect(() => {
     setAudioVolume(appSettings.audioVolume)
@@ -1941,6 +1984,53 @@ function SettingsView({
 
   return (
     <section className="view-stack">
+      {androidUpdate && (
+        <div className={`app-update-card ${androidUpdate.status}`}>
+          <div className="app-update-copy">
+            {androidUpdate.status === 'available' ? (
+              <Download size={20} />
+            ) : androidUpdate.status === 'checking' ? (
+              <RefreshCw className="spin" size={20} />
+            ) : androidUpdate.status === 'error' ? (
+              <CircleAlert size={20} />
+            ) : (
+              <CheckCircle2 size={20} />
+            )}
+            <div>
+              <strong>
+                {androidUpdate.status === 'available'
+                  ? 'oNami update available'
+                  : androidUpdate.status === 'checking'
+                    ? 'Checking for updates...'
+                    : androidUpdate.status === 'error'
+                      ? 'Could not check for updates'
+                      : 'oNami is up to date'}
+              </strong>
+              <span>
+                {androidUpdate.status === 'available'
+                  ? `${androidUpdate.update.versionName} is ready. You have ${androidUpdate.installedVersionName}.`
+                  : androidUpdate.status === 'error'
+                    ? androidUpdate.message
+                    : `Installed version ${androidUpdate.installedVersionName}`}
+              </span>
+            </div>
+          </div>
+          {androidUpdate.status === 'available' ? (
+            <button
+              className="update-action"
+              onClick={() => window.onamiAndroid?.openExternalUrl(androidUpdate.update.downloadUrl)}
+            >
+              <Download size={18} />
+              Download update
+            </button>
+          ) : androidUpdate.status === 'error' ? (
+            <button className="secondary-action" onClick={() => void checkForAndroidUpdate()}>
+              <RefreshCw size={18} />
+              Try again
+            </button>
+          ) : null}
+        </div>
+      )}
       <div className="settings-state">
         <Sparkles size={18} />
         <span>{aiSettings.hasApiKey ? 'AI generation is configured.' : 'AI generation needs an API key.'}</span>

@@ -1,7 +1,10 @@
 package app.onami.flashcards;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.res.Configuration;
+import android.content.pm.PackageInfo;
+import android.net.Uri;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
@@ -109,6 +112,47 @@ public class MainActivity extends Activity {
     }
 
     private class AndroidBridge {
+        @JavascriptInterface
+        public long getVersionCode() {
+            try {
+                PackageInfo packageInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    return packageInfo.getLongVersionCode();
+                }
+                return packageInfo.versionCode;
+            } catch (Exception error) {
+                Log.e(TAG, "Could not read the installed version code.", error);
+                return 0;
+            }
+        }
+
+        @JavascriptInterface
+        public String getVersionName() {
+            try {
+                PackageInfo packageInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+                return packageInfo.versionName == null ? "" : packageInfo.versionName;
+            } catch (Exception error) {
+                Log.e(TAG, "Could not read the installed version name.", error);
+                return "";
+            }
+        }
+
+        @JavascriptInterface
+        public void openExternalUrl(String url) {
+            runOnUiThread(() -> {
+                try {
+                    Uri uri = Uri.parse(url);
+                    String scheme = uri.getScheme();
+                    if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
+                        throw new IllegalArgumentException("Only web links can be opened.");
+                    }
+                    startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                } catch (Exception error) {
+                    Log.e(TAG, "Could not open the update link.", error);
+                }
+            });
+        }
+
         @JavascriptInterface
         public void setKeepScreenAwake(boolean enabled) {
             runOnUiThread(() -> {

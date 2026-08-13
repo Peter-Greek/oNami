@@ -6,6 +6,9 @@ declare global {
   interface Window {
     onami: OnamiApi
     onamiAndroid?: {
+      getVersionCode(): number
+      getVersionName(): string
+      openExternalUrl(url: string): void
       setKeepScreenAwake(enabled: boolean): void
       setSystemBarTheme(dark: boolean): void
       updateTransfer(id: string, title: string, message: string, current: number, total: number): void
