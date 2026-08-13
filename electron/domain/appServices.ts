@@ -8,6 +8,7 @@ import { z } from 'zod'
 
 import { ApkgImporter } from './apkgImporter'
 import { createGlobalDecksClient, GLOBAL_DECKS_MAX_PUBLISH_CARDS } from '../../src/shared/globalDecks'
+import { getPairingSnapshotPlan } from '../../src/shared/syncPairing'
 import { OnamiDatabase, type RemoteSyncEvent } from './database'
 import { SchedulerService, selectCardsForMode, type StudySessionRuntime } from './scheduler'
 import type {
@@ -80,6 +81,8 @@ interface StoredSyncSettings {
   // Set when this device becomes the snapshot source; cleared once a full
   // snapshot upload succeeds. Persisted so a failed seed is retried on next sync.
   seedSnapshotPending: boolean
+  seedSnapshotTargetDeviceId: string | null
+  receiveSnapshotPending: boolean
   syncRequested: boolean
 }
 
@@ -96,6 +99,8 @@ const GLOBAL_DECKS_SETTINGS_KEY = 'globalDecks.settings'
 const TRANSFERS_SETTINGS_KEY = 'transfers.records.v1'
 const DEFAULT_AI_MODEL = 'gpt-4o-mini'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
+const SNAPSHOT_WAIT_ATTEMPTS = 45
+const SNAPSHOT_WAIT_DELAY_MS = 2_000
 const DEFAULT_APP_SETTINGS: AppSettings = {
   audioVolume: 0.8,
   themeMode: 'system',
@@ -143,7 +148,12 @@ export class AppServices {
       const sync = this.getStoredSyncSettings()
       if (
         sync.syncGroupId &&
-        (sync.syncRequested || sync.seedSnapshotPending || this.database.getPendingSyncEventCount() > 0)
+        (
+          sync.syncRequested ||
+          sync.seedSnapshotPending ||
+          sync.receiveSnapshotPending ||
+          this.database.getPendingSyncEventCount() > 0
+        )
       ) {
         void this.syncNow().catch(() => {
           // The durable request remains set for the next launch.
@@ -914,13 +924,6 @@ export class AppServices {
 
   async confirmSyncPairing(input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult> {
     const device = this.ensureSyncDevice()
-    if (input.mode !== 'copy-phone-to-desktop') {
-      this.saveStoredSyncSettings({
-        ...this.getStoredSyncSettings(),
-        seedSnapshotPending: true,
-      })
-    }
-
     const result = await this.syncHostRequest<SyncConfirmPairingResult>('/pairing/confirm', {
       method: 'POST',
       body: {
@@ -931,9 +934,13 @@ export class AppServices {
     })
 
     if (result.completed && result.syncGroupId) {
+      const snapshotPlan = getPairingSnapshotPlan(result, device.deviceId)
       this.saveStoredSyncSettings({
         ...this.getStoredSyncSettings(),
         syncGroupId: result.syncGroupId,
+        seedSnapshotPending: Boolean(snapshotPlan.uploadTargetDeviceId),
+        seedSnapshotTargetDeviceId: snapshotPlan.uploadTargetDeviceId,
+        receiveSnapshotPending: snapshotPlan.downloadPending,
       })
       const token = await this.requestSyncDeviceToken()
       this.saveStoredSyncSettings({
@@ -941,7 +948,7 @@ export class AppServices {
         deviceToken: token.token,
         deviceTokenExpiresAt: token.expiresAt,
       })
-      if (input.mode !== 'copy-phone-to-desktop') await this.maybeSeedSnapshot()
+      if (snapshotPlan.uploadTargetDeviceId) await this.maybeSeedSnapshot()
     }
 
     return result
@@ -1105,6 +1112,7 @@ export class AppServices {
       this.saveStoredSyncSettings({
         ...this.getStoredSyncSettings(),
         seedSnapshotPending: false,
+        seedSnapshotTargetDeviceId: null,
       })
     } catch {
       // Leave the flag set so the next sync retries seeding the snapshot.
@@ -1147,23 +1155,40 @@ export class AppServices {
     await this.syncHostRequest<{ ok: boolean }>('/sync/snapshot', {
       method: 'POST',
       token,
-      body: { snapshot },
+      body: { snapshot, targetDeviceId: stored.seedSnapshotTargetDeviceId },
     })
   }
 
   private async hydrateFromSnapshot(token: string, onProgress?: SyncProgressReporter): Promise<boolean> {
-    let response: SyncSnapshotResponse
-    try {
-      onProgress?.({ stage: 'snapshot-download', message: 'Checking for initial content snapshot.' })
-      response = await this.syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', {
-        method: 'GET',
-        token,
-      })
-    } catch {
-      // A host without snapshot support falls back to event-only sync.
-      return false
+    const waitForSnapshot = this.getStoredSyncSettings().receiveSnapshotPending
+    let response: SyncSnapshotResponse | null = null
+    for (let attempt = 0; attempt < (waitForSnapshot ? SNAPSHOT_WAIT_ATTEMPTS : 1); attempt += 1) {
+      try {
+        onProgress?.({
+          stage: 'snapshot-download',
+          message: attempt === 0
+            ? 'Checking for initial content snapshot.'
+            : `Waiting for the source device to upload cards and media (${attempt + 1}/${SNAPSHOT_WAIT_ATTEMPTS}).`,
+          current: attempt,
+          total: waitForSnapshot ? SNAPSHOT_WAIT_ATTEMPTS : undefined,
+        })
+        response = await this.syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', {
+          method: 'GET',
+          token,
+        })
+      } catch (error) {
+        if (waitForSnapshot) throw error
+        // A host without snapshot support falls back to event-only sync.
+        return false
+      }
+      if (response.snapshot) break
+      if (!waitForSnapshot) return false
+      if (attempt === SNAPSHOT_WAIT_ATTEMPTS - 1) {
+        throw new Error('The source device has not finished uploading its full snapshot yet. Keep both devices online and retry sync.')
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, SNAPSHOT_WAIT_DELAY_MS))
     }
-    if (!response.snapshot) return false
+    if (!response?.snapshot) return false
 
     const totalItems =
       response.snapshot.decks.length +
@@ -1226,6 +1251,7 @@ export class AppServices {
       token,
       body: {},
     })
+    this.saveStoredSyncSettings({ ...this.getStoredSyncSettings(), receiveSnapshotPending: false })
     return true
   }
 
@@ -1295,6 +1321,8 @@ export class AppServices {
       deviceToken: null,
       deviceTokenExpiresAt: null,
       seedSnapshotPending: false,
+      seedSnapshotTargetDeviceId: null,
+      receiveSnapshotPending: false,
       syncRequested: false,
     })
   }

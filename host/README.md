@@ -187,7 +187,9 @@ The host verifies the signature against the paired device's stored public key.
 2. Device B calls `/pairing/join` with the pairing code.
 3. Both devices show the same confirmation code.
 4. Both devices call `/pairing/confirm`.
-5. Host creates or updates the sync group.
+5. Host creates or updates the sync group and identifies the full-snapshot source
+   and target. For merge, Device A is the source; explicit desktop/phone copy
+   modes follow the selected platform direction.
 6. Each device requests a device token.
 7. Devices push local outbox events, pull remote events, and ack the cursor.
 
@@ -199,9 +201,10 @@ drives stats/streak, and media metadata) via `POST /sync/snapshot`, and uploads
 each referenced media blob via `POST /media` (content-addressed by SHA-256). The
 fresh device pulls the bundle with `GET /sync/snapshot`, downloads blobs with
 `GET /media/:sha256`, then calls `POST /sync/snapshot/ack`, which deletes the
-snapshot row **and its media blobs** from the host. All later changes flow through
-the incremental `/sync/events` log. There is one pending snapshot per sync group;
-a device never receives its own snapshot.
+snapshot row **and its media blobs** from the host. A snapshot is addressed to
+the newly paired target so an existing third device cannot consume it. All later
+changes flow through the incremental `/sync/events` log. There is one pending
+snapshot per sync group; a device never receives its own snapshot.
 
 Redeploying with `start-host.bat` runs `prisma generate` + `prisma db push`, which
 creates the new `sync_snapshots` table automatically — no manual migration needed.

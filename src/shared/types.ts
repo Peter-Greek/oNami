@@ -486,6 +486,8 @@ export interface SyncConfirmPairingResult {
   completed: boolean
   syncGroupId: string | null
   mode: SyncPairingMode
+  snapshotSourceDeviceId: string | null
+  snapshotTargetDeviceId: string | null
 }
 
 export interface SyncRunResult {

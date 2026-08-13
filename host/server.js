@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url'
 import { PrismaClient } from '@prisma/client'
 
 import { parseByteRange, resolveAndroidDownload } from './downloads.js'
+import { selectPairingSnapshotDirection } from './pairing.js'
+import { canDeviceReceiveSnapshot, decodeSyncSnapshot, encodeSyncSnapshot } from './syncSnapshots.js'
 import {
   GLOBAL_DECK_LIMITS,
   globalDeckResponse,
@@ -215,27 +217,31 @@ const getPairingSessionByCode = async (code, options = {}) => {
 const completePairingIfReady = async (sessionId) => {
   return prisma.$transaction(async (tx) => {
     const session = await tx.pairingSession.findUnique({ where: { id: sessionId } })
-    if (!session) return { completed: false, syncGroupId: null }
-
-    if (session.completedAt) {
-      const pairedDevice = await tx.device.findFirst({
-        where: {
-          id: { in: [session.initiatorDeviceId, session.joiningDeviceId].filter(Boolean) },
-          syncGroupId: { not: null },
-        },
-        select: { syncGroupId: true },
-      })
-      return { completed: true, syncGroupId: pairedDevice?.syncGroupId ?? null }
-    }
-
-    if (!session.initiatorConfirmedAt || !session.joinerConfirmedAt) {
-      return { completed: false, syncGroupId: null }
+    if (!session) {
+      return {
+        completed: false,
+        syncGroupId: null,
+        mode: 'merge',
+        snapshotSourceDeviceId: null,
+        snapshotTargetDeviceId: null,
+      }
     }
 
     const [initiator, joiner] = await Promise.all([
       tx.device.findUnique({ where: { id: session.initiatorDeviceId } }),
       session.joiningDeviceId ? tx.device.findUnique({ where: { id: session.joiningDeviceId } }) : null,
     ])
+    const mode = session.mode ?? 'merge'
+    const direction = selectPairingSnapshotDirection({ mode, initiator, joiner })
+    const result = (completed, syncGroupId) => ({ completed, syncGroupId, mode, ...direction })
+
+    if (session.completedAt) {
+      return result(true, initiator?.syncGroupId ?? joiner?.syncGroupId ?? null)
+    }
+
+    if (!session.initiatorConfirmedAt || !session.joinerConfirmedAt) {
+      return result(false, null)
+    }
 
     if (!initiator || !joiner) throw httpError(409, 'Both devices must be registered before pairing can complete.')
 
@@ -254,7 +260,7 @@ const completePairingIfReady = async (sessionId) => {
       data: { completedAt: now() },
     })
 
-    return { completed: true, syncGroupId }
+    return result(true, syncGroupId)
   })
 }
 
@@ -694,26 +700,26 @@ const route = async (request, response, context) => {
       logRequest(context, 'info', 'pairing.confirm', {
         completed: result.completed,
         alreadyCompleted: true,
-        mode: session.mode ?? mode,
+        mode: result.mode,
         initiatorDeviceId: session.initiatorDeviceId,
         joiningDeviceId: session.joiningDeviceId,
+        snapshotSourceDeviceId: result.snapshotSourceDeviceId,
+        snapshotTargetDeviceId: result.snapshotTargetDeviceId,
       })
-      return send(response, 200, {
-        completed: result.completed,
-        syncGroupId: result.syncGroupId,
-        mode: session.mode ?? mode,
-      })
+      return send(response, 200, result)
     }
 
     if (deviceId === session.initiatorDeviceId) {
       await prisma.pairingSession.update({
         where: { id: session.id },
-        data: { initiatorConfirmedAt: now(), mode: session.mode ?? mode },
+        // The starter chooses the transfer direction. A joiner may confirm
+        // first, but must not accidentally lock the session to its default.
+        data: { initiatorConfirmedAt: now(), mode },
       })
     } else if (deviceId === session.joiningDeviceId) {
       await prisma.pairingSession.update({
         where: { id: session.id },
-        data: { joinerConfirmedAt: now(), mode: session.mode ?? mode },
+        data: { joinerConfirmedAt: now() },
       })
     }
 
@@ -721,15 +727,13 @@ const route = async (request, response, context) => {
     addLogFields(context, { deviceId, syncGroupId: result.syncGroupId })
     logRequest(context, 'info', 'pairing.confirm', {
       completed: result.completed,
-      mode,
+      mode: result.mode,
       initiatorDeviceId: session.initiatorDeviceId,
       joiningDeviceId: session.joiningDeviceId,
+      snapshotSourceDeviceId: result.snapshotSourceDeviceId,
+      snapshotTargetDeviceId: result.snapshotTargetDeviceId,
     })
-    return send(response, 200, {
-      completed: result.completed,
-      syncGroupId: result.syncGroupId,
-      mode,
-    })
+    return send(response, 200, result)
   }
 
   if (request.method === 'POST' && url.pathname === '/devices/token') {
@@ -931,15 +935,24 @@ const route = async (request, response, context) => {
     const body = await readJson(request, config.maxBlobBytes)
     const snapshot = body.snapshot
     if (!snapshot || typeof snapshot !== 'object') throw httpError(400, 'snapshot object is required.')
+    const targetDeviceId = optionalString(body, 'targetDeviceId')
+    if (targetDeviceId) {
+      const target = await prisma.device.findUnique({ where: { id: targetDeviceId } })
+      if (!target || target.syncGroupId !== device.syncGroupId || target.revokedAt) {
+        throw httpError(400, 'Snapshot target must be an active device in the same sync group.')
+      }
+      if (target.id === device.id) throw httpError(400, 'Snapshot source and target must be different devices.')
+    }
+    const payloadJson = encodeSyncSnapshot(snapshot, targetDeviceId)
 
     await prisma.syncSnapshot.upsert({
       where: { syncGroupId: device.syncGroupId },
       create: {
         syncGroupId: device.syncGroupId,
         sourceDeviceId: device.id,
-        payloadJson: snapshot,
+        payloadJson,
       },
-      update: { sourceDeviceId: device.id, payloadJson: snapshot },
+      update: { sourceDeviceId: device.id, payloadJson },
     })
 
     logRequest(context, 'info', 'sync.snapshot.upload', {
@@ -948,6 +961,7 @@ const route = async (request, response, context) => {
       reviewLogs: Array.isArray(snapshot.reviewLogs) ? snapshot.reviewLogs.length : 0,
       media: Array.isArray(snapshot.media) ? snapshot.media.length : 0,
       sourceDeviceId: device.id,
+      targetDeviceId,
     })
     return send(response, 200, { ok: true })
   }
@@ -959,11 +973,20 @@ const route = async (request, response, context) => {
       where: { syncGroupId: device.syncGroupId },
     })
 
-    // A device never consumes its own snapshot.
-    if (!snapshot || snapshot.sourceDeviceId === device.id) {
+    const decoded = snapshot ? decodeSyncSnapshot(snapshot.payloadJson) : null
+    if (
+      !snapshot ||
+      !decoded ||
+      !canDeviceReceiveSnapshot({
+        sourceDeviceId: snapshot.sourceDeviceId,
+        targetDeviceId: decoded.targetDeviceId,
+        deviceId: device.id,
+      })
+    ) {
       logRequest(context, 'info', 'sync.snapshot.pull', {
         found: false,
         sourceDeviceId: snapshot?.sourceDeviceId ?? null,
+        targetDeviceId: decoded?.targetDeviceId ?? null,
       })
       return send(response, 200, { snapshot: null, sourceDeviceId: null })
     }
@@ -971,13 +994,14 @@ const route = async (request, response, context) => {
     logRequest(context, 'info', 'sync.snapshot.pull', {
       found: true,
       sourceDeviceId: snapshot.sourceDeviceId,
-      decks: Array.isArray(snapshot.payloadJson?.decks) ? snapshot.payloadJson.decks.length : 0,
-      cards: Array.isArray(snapshot.payloadJson?.cards) ? snapshot.payloadJson.cards.length : 0,
-      reviewLogs: Array.isArray(snapshot.payloadJson?.reviewLogs) ? snapshot.payloadJson.reviewLogs.length : 0,
-      media: Array.isArray(snapshot.payloadJson?.media) ? snapshot.payloadJson.media.length : 0,
+      targetDeviceId: decoded.targetDeviceId,
+      decks: Array.isArray(decoded.snapshot?.decks) ? decoded.snapshot.decks.length : 0,
+      cards: Array.isArray(decoded.snapshot?.cards) ? decoded.snapshot.cards.length : 0,
+      reviewLogs: Array.isArray(decoded.snapshot?.reviewLogs) ? decoded.snapshot.reviewLogs.length : 0,
+      media: Array.isArray(decoded.snapshot?.media) ? decoded.snapshot.media.length : 0,
     })
     return send(response, 200, {
-      snapshot: snapshot.payloadJson,
+      snapshot: decoded.snapshot,
       sourceDeviceId: snapshot.sourceDeviceId,
     })
   }
@@ -989,9 +1013,19 @@ const route = async (request, response, context) => {
       where: { syncGroupId: device.syncGroupId },
     })
 
-    // Only a non-source device confirming receipt clears the snapshot + its media.
-    if (snapshot && snapshot.sourceDeviceId !== device.id) {
-      const media = Array.isArray(snapshot.payloadJson?.media) ? snapshot.payloadJson.media : []
+    const decoded = snapshot ? decodeSyncSnapshot(snapshot.payloadJson) : null
+    // Only the intended target can clear a targeted snapshot. This prevents an
+    // already-paired third device from consuming a new phone's full handoff.
+    if (
+      snapshot &&
+      decoded &&
+      canDeviceReceiveSnapshot({
+        sourceDeviceId: snapshot.sourceDeviceId,
+        targetDeviceId: decoded.targetDeviceId,
+        deviceId: device.id,
+      })
+    ) {
+      const media = Array.isArray(decoded.snapshot?.media) ? decoded.snapshot.media : []
       const hashes = [...new Set(media.map((item) => item?.sha256).filter((value) => typeof value === 'string'))]
 
       await prisma.$transaction([
@@ -1019,12 +1053,14 @@ const route = async (request, response, context) => {
       logRequest(context, 'info', 'sync.snapshot.ack', {
         cleared: true,
         sourceDeviceId: snapshot.sourceDeviceId,
+        targetDeviceId: decoded.targetDeviceId,
         mediaDeleted: hashes.length,
       })
     } else {
       logRequest(context, 'info', 'sync.snapshot.ack', {
         cleared: false,
         sourceDeviceId: snapshot?.sourceDeviceId ?? null,
+        targetDeviceId: decoded?.targetDeviceId ?? null,
       })
     }
 

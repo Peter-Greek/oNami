@@ -1,6 +1,7 @@
 import { createEmptyCard, fsrs, Rating, State, type Card as FsrsCard, type Grade } from 'ts-fsrs'
 
 import { createGlobalDecksClient, GLOBAL_DECKS_MAX_PUBLISH_CARDS } from './shared/globalDecks'
+import { getPairingSnapshotPlan } from './shared/syncPairing'
 import { shouldNotifyNativeTransfer } from './shared/transferNotifications'
 
 import type {
@@ -150,6 +151,8 @@ interface BrowserSyncSettings {
   backedUpEvents: number
   lastBackedUpAt: string | null
   seedSnapshotPending: boolean
+  seedSnapshotTargetDeviceId: string | null
+  receiveSnapshotPending: boolean
   syncRequested: boolean
 }
 
@@ -174,6 +177,8 @@ const SYNC_PROGRESS_KEY = 'onami.sync.progress'
 const TRANSFER_RECORDS_KEY = 'onami.transfer.records.v1'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
 const AUTO_SYNC_DELAY_MS = 500
+const SNAPSHOT_WAIT_ATTEMPTS = 45
+const SNAPSHOT_WAIT_DELAY_MS = 2_000
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const syncProgressListeners = new Set<(event: SyncProgressEvent) => void>()
 const transferProgressListeners = new Set<(event: TransferProgressEvent) => void>()
@@ -270,6 +275,8 @@ const readSyncSettings = (): BrowserSyncSettings => {
       backedUpEvents: typeof parsed.backedUpEvents === 'number' ? parsed.backedUpEvents : 0,
       lastBackedUpAt: parsed.lastBackedUpAt ?? null,
       seedSnapshotPending: Boolean(parsed.seedSnapshotPending),
+      seedSnapshotTargetDeviceId: parsed.seedSnapshotTargetDeviceId ?? null,
+      receiveSnapshotPending: Boolean(parsed.receiveSnapshotPending),
       syncRequested: Boolean(parsed.syncRequested),
     }
   } catch {
@@ -287,6 +294,8 @@ const readSyncSettings = (): BrowserSyncSettings => {
       backedUpEvents: 0,
       lastBackedUpAt: null,
       seedSnapshotPending: false,
+      seedSnapshotTargetDeviceId: null,
+      receiveSnapshotPending: false,
       syncRequested: false,
     }
   }
@@ -1886,7 +1895,14 @@ const uploadFullSnapshot = async (): Promise<void> => {
     current: totalItems,
     total: totalItems,
   })
-  await syncHostRequest('/sync/snapshot', { method: 'POST', token, body: { snapshot } })
+  await syncHostRequest('/sync/snapshot', {
+    method: 'POST',
+    token,
+    body: {
+      snapshot,
+      targetDeviceId: settings.seedSnapshotTargetDeviceId,
+    },
+  })
 }
 
 const maybeSeedSnapshot = async (): Promise<void> => {
@@ -1894,22 +1910,43 @@ const maybeSeedSnapshot = async (): Promise<void> => {
   if (!settings.seedSnapshotPending || !settings.syncGroupId) return
   try {
     await uploadFullSnapshot()
-    writeSyncSettings({ ...readSyncSettings(), seedSnapshotPending: false })
+    writeSyncSettings({
+      ...readSyncSettings(),
+      seedSnapshotPending: false,
+      seedSnapshotTargetDeviceId: null,
+    })
   } catch {
     // Leave the flag set so the next sync retries seeding the snapshot.
   }
 }
 
 const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
-  let response: SyncSnapshotResponse
-  try {
-    emitSyncProgress({ stage: 'snapshot-download', message: 'Checking for initial content snapshot.' })
-    response = await syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', { method: 'GET', token })
-  } catch {
-    // A host without snapshot support falls back to event-only sync.
-    return false
+  const waitForSnapshot = readSyncSettings().receiveSnapshotPending
+  let response: SyncSnapshotResponse | null = null
+  for (let attempt = 0; attempt < (waitForSnapshot ? SNAPSHOT_WAIT_ATTEMPTS : 1); attempt += 1) {
+    try {
+      emitSyncProgress({
+        stage: 'snapshot-download',
+        message: attempt === 0
+          ? 'Checking for initial content snapshot.'
+          : `Waiting for the source device to upload cards and media (${attempt + 1}/${SNAPSHOT_WAIT_ATTEMPTS}).`,
+        current: attempt,
+        total: waitForSnapshot ? SNAPSHOT_WAIT_ATTEMPTS : undefined,
+      })
+      response = await syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', { method: 'GET', token })
+    } catch (error) {
+      if (waitForSnapshot) throw error
+      // A host without snapshot support falls back to event-only sync.
+      return false
+    }
+    if (response.snapshot) break
+    if (!waitForSnapshot) return false
+    if (attempt === SNAPSHOT_WAIT_ATTEMPTS - 1) {
+      throw new Error('The source device has not finished uploading its full snapshot yet. Keep both devices online and retry sync.')
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, SNAPSHOT_WAIT_DELAY_MS))
   }
-  if (!response.snapshot) return false
+  if (!response?.snapshot) return false
 
   const totalItems =
     response.snapshot.decks.length +
@@ -2015,6 +2052,7 @@ const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
   // Confirm receipt so the host clears the snapshot bundle and its media.
   emitSyncProgress({ stage: 'ack', message: 'Acknowledging initial snapshot.' })
   await syncHostRequest('/sync/snapshot/ack', { method: 'POST', token, body: {} })
+  writeSyncSettings({ ...readSyncSettings(), receiveSnapshotPending: false })
   return true
 }
 
@@ -2429,10 +2467,6 @@ export const installBrowserOnami = async () => {
       },
       confirmPairing: async (input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult> => {
         const device = await ensureSyncDevice()
-        if (input.mode === 'copy-phone-to-desktop') {
-          writeSyncSettings({ ...readSyncSettings(), seedSnapshotPending: true })
-        }
-
         const result = await syncHostRequest<SyncConfirmPairingResult>('/pairing/confirm', {
           method: 'POST',
           body: {
@@ -2442,9 +2476,13 @@ export const installBrowserOnami = async () => {
           },
         })
         if (result.completed && result.syncGroupId) {
+          const snapshotPlan = getPairingSnapshotPlan(result, device.deviceId)
           writeSyncSettings({
             ...readSyncSettings(),
             syncGroupId: result.syncGroupId,
+            seedSnapshotPending: Boolean(snapshotPlan.uploadTargetDeviceId),
+            seedSnapshotTargetDeviceId: snapshotPlan.uploadTargetDeviceId,
+            receiveSnapshotPending: snapshotPlan.downloadPending,
           })
           const token = await requestSyncDeviceToken()
           writeSyncSettings({
@@ -2452,7 +2490,7 @@ export const installBrowserOnami = async () => {
             deviceToken: token.token,
             deviceTokenExpiresAt: token.expiresAt,
           })
-          if (input.mode === 'copy-phone-to-desktop') await maybeSeedSnapshot()
+          if (snapshotPlan.uploadTargetDeviceId) await maybeSeedSnapshot()
         }
         return result
       },
@@ -2625,7 +2663,12 @@ export const installBrowserOnami = async () => {
     const settings = readSyncSettings()
     if (
       settings.syncGroupId &&
-      (settings.syncRequested || settings.seedSnapshotPending || readSyncOutbox().length > 0)
+      (
+        settings.syncRequested ||
+        settings.seedSnapshotPending ||
+        settings.receiveSnapshotPending ||
+        readSyncOutbox().length > 0
+      )
     ) {
       void api.sync.syncNow().catch(() => {
         // The durable sync request stays queued for the next reconnect or launch.
