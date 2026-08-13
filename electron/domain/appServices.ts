@@ -50,8 +50,12 @@ import type {
   SyncMediaRecord,
   SyncProgressEvent,
   SyncRunResult,
+  SyncRunOptions,
   SyncSnapshotResponse,
   ThemeMode,
+  TransferKind,
+  TransferProgressEvent,
+  TransferStatus,
   SyncStartPairingResult,
   SyncStatus,
   UpdateCardInput,
@@ -76,12 +80,20 @@ interface StoredSyncSettings {
   // Set when this device becomes the snapshot source; cleared once a full
   // snapshot upload succeeds. Persisted so a failed seed is retried on next sync.
   seedSnapshotPending: boolean
+  syncRequested: boolean
+}
+
+interface StoredTransferRecord extends TransferProgressEvent {
+  targetId: string
+  targetName: string
+  result?: DeckSummary | GlobalDeckSummary | SyncRunResult
 }
 
 const AI_SETTINGS_KEY = 'ai.settings'
 const APP_SETTINGS_KEY = 'app.settings'
 const SYNC_SETTINGS_KEY = 'sync.settings'
 const GLOBAL_DECKS_SETTINGS_KEY = 'globalDecks.settings'
+const TRANSFERS_SETTINGS_KEY = 'transfers.records.v1'
 const DEFAULT_AI_MODEL = 'gpt-4o-mini'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
 const DEFAULT_APP_SETTINGS: AppSettings = {
@@ -115,12 +127,115 @@ export class AppServices {
   private readonly sessions = new Map<string, StudySessionRuntime>()
   private autoSyncTimer: NodeJS.Timeout | null = null
   private syncInFlight: Promise<SyncRunResult> | null = null
+  private readonly transferListeners = new Set<(event: TransferProgressEvent) => void>()
+  private readonly globalTransfersInFlight = new Set<string>()
   private readonly globalDecks = createGlobalDecksClient({
     installationId: () => this.getInstallationId(),
   })
 
   constructor(private readonly database: OnamiDatabase) {
     this.scheduler = new SchedulerService(database)
+  }
+
+  startBackgroundTransfers(): void {
+    const resumeTimer = setTimeout(() => {
+      void this.resumePendingTransfers()
+      const sync = this.getStoredSyncSettings()
+      if (
+        sync.syncGroupId &&
+        (sync.syncRequested || sync.seedSnapshotPending || this.database.getPendingSyncEventCount() > 0)
+      ) {
+        void this.syncNow().catch(() => {
+          // The durable request remains set for the next launch.
+        })
+      }
+    }, 0)
+    resumeTimer.unref?.()
+  }
+
+  onTransferProgress(listener: (event: TransferProgressEvent) => void): () => void {
+    this.transferListeners.add(listener)
+    return () => this.transferListeners.delete(listener)
+  }
+
+  getTransferStatus(): TransferStatus {
+    const records = this.getStoredTransferRecords().sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    return {
+      active: records.find((record) =>
+        record.state === 'queued' || record.state === 'running' || record.state === 'paused'
+      ) ?? null,
+      recent: records.slice(0, 12),
+    }
+  }
+
+  private getStoredTransferRecords(): StoredTransferRecord[] {
+    return this.database.getSettingsValue<StoredTransferRecord[]>(TRANSFERS_SETTINGS_KEY, [])
+  }
+
+  private saveStoredTransferRecords(records: StoredTransferRecord[]): void {
+    const active = records.filter((record) => record.state !== 'completed' && record.state !== 'error')
+    const recent = records
+      .filter((record) => record.state === 'completed' || record.state === 'error')
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, 12)
+    this.database.setSettingsValue(TRANSFERS_SETTINGS_KEY, [...active, ...recent])
+  }
+
+  private createTransfer(kind: TransferKind, targetId: string, targetName: string): StoredTransferRecord {
+    const title = kind === 'browse-upload'
+      ? `Uploading ${targetName}`
+      : kind === 'browse-download'
+        ? `Downloading ${targetName}`
+        : 'Syncing oNami'
+    const record: StoredTransferRecord = {
+      id: `${kind}-${randomUUID()}`,
+      kind,
+      state: 'queued',
+      title,
+      message: 'Queued and ready to continue in the background.',
+      targetId,
+      targetName,
+      updatedAt: new Date().toISOString(),
+    }
+    this.saveStoredTransferRecords([...this.getStoredTransferRecords(), record])
+    this.notifyTransfer(record)
+    return record
+  }
+
+  private updateTransfer(
+    id: string,
+    update: Partial<Omit<StoredTransferRecord, 'id' | 'kind' | 'targetId'>>
+  ): StoredTransferRecord {
+    const records = this.getStoredTransferRecords()
+    const index = records.findIndex((record) => record.id === id)
+    if (index < 0) throw new Error(`Transfer ${id} is no longer available.`)
+    const next: StoredTransferRecord = { ...records[index], ...update, updatedAt: new Date().toISOString() }
+    records[index] = next
+    this.saveStoredTransferRecords(records)
+    this.notifyTransfer(next)
+    return next
+  }
+
+  private notifyTransfer(event: TransferProgressEvent): void {
+    for (const listener of this.transferListeners) listener(event)
+  }
+
+  private async resumePendingTransfers(): Promise<void> {
+    const pending = this.getStoredTransferRecords()
+      .filter((record) => record.kind !== 'sync' && record.state !== 'completed' && record.state !== 'error')
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))
+    for (const record of pending) {
+      try {
+        this.updateTransfer(record.id, {
+          state: 'queued',
+          message: 'Transfer restored after interruption.',
+        })
+        if (record.kind === 'browse-upload') await this.publishGlobalDeck(record.targetId, record)
+        else await this.addGlobalDeckToLibrary(record.targetId, record)
+      } catch {
+        // Each operation records its own paused state for the next launch.
+      }
+    }
   }
 
   getMediaPath(mediaId: string): string | null {
@@ -295,7 +410,10 @@ export class AppServices {
    * Publishes a local deck as a card snapshot. Only card content and the deck
    * name leave the device — scheduling, review history and settings never do.
    */
-  async publishGlobalDeck(localDeckId: string): Promise<GlobalDeckSummary> {
+  async publishGlobalDeck(
+    localDeckId: string,
+    resumeRecord?: StoredTransferRecord
+  ): Promise<GlobalDeckSummary> {
     const deck = this.database.getDeck(localDeckId)
     if (deck.cards.length === 0) throw new Error('That deck has no cards to publish yet.')
     if (deck.cards.length > GLOBAL_DECKS_MAX_PUBLISH_CARDS) {
@@ -352,7 +470,47 @@ export class AppServices {
       return bytes ? [{ sha256: item.sha256, mimeType: item.mimeType, dataBase64: bytes.toString('base64') }] : []
     })
 
-    return this.globalDecks.publish({ sourceDeckId: deck.id, name: deck.name, decks, media, mediaBlobs })
+    const transfer = resumeRecord ?? this.createTransfer('browse-upload', localDeckId, deck.name)
+    if (this.globalTransfersInFlight.has(transfer.id)) {
+      throw new Error('That Browse upload is already running.')
+    }
+    this.globalTransfersInFlight.add(transfer.id)
+    try {
+      this.updateTransfer(transfer.id, {
+        state: 'running',
+        title: `Uploading ${deck.name}`,
+        message: 'Preparing deck contents.',
+        current: 0,
+        total: Math.max(1, mediaBlobs.length + 2),
+      })
+      const result = await this.globalDecks.publish(
+        { sourceDeckId: deck.id, name: deck.name, decks, media, mediaBlobs },
+        (progress) => this.updateTransfer(transfer.id, {
+          state: 'running',
+          message: progress.message,
+          current: progress.current,
+          total: progress.total,
+          itemName: progress.itemName,
+        })
+      )
+      this.updateTransfer(transfer.id, {
+        state: 'completed',
+        title: `Uploaded ${result.name}`,
+        message: `Published ${result.cardCount} card${result.cardCount === 1 ? '' : 's'}.`,
+        current: Math.max(1, mediaBlobs.length + 2),
+        total: Math.max(1, mediaBlobs.length + 2),
+        result,
+      })
+      return result
+    } catch (error) {
+      this.updateTransfer(transfer.id, {
+        state: 'paused',
+        message: `${error instanceof Error ? error.message : String(error)} The upload will resume next time oNami opens.`,
+      })
+      throw error
+    } finally {
+      this.globalTransfersInFlight.delete(transfer.id)
+    }
   }
 
   heartGlobalDeck(globalDeckId: string, hearted: boolean): Promise<GlobalDeckHeartResult> {
@@ -363,52 +521,130 @@ export class AppServices {
    * Copies a published deck into the local library as a brand new deck, so it
    * starts unscheduled and never collides with the copy the publisher has.
    */
-  async addGlobalDeckToLibrary(globalDeckId: string): Promise<DeckSummary> {
-    const detail = await this.globalDecks.get(globalDeckId)
-    const totalCards = detail.decks.reduce((total, item) => total + item.cards.length, 0)
-    if (totalCards === 0) throw new Error('That deck has no cards to add.')
-
-    const mediaIdMap = new Map<string, string>()
-    for (const media of detail.media) {
-      const blob = await this.globalDecks.downloadMedia(media.sha256)
-      const localId = this.database.saveGlobalMediaBlob(
-        {
-          id: media.sourceMediaId,
-          sha256: media.sha256,
-          mimeType: media.mimeType,
-          byteSize: media.byteSize,
-          originalName: media.originalName,
-        },
-        Buffer.from(blob.dataBase64, 'base64')
-      )
-      mediaIdMap.set(media.sourceMediaId, localId)
+  async addGlobalDeckToLibrary(
+    globalDeckId: string,
+    resumeRecord?: StoredTransferRecord
+  ): Promise<DeckSummary> {
+    const transfer = resumeRecord ?? this.createTransfer('browse-download', globalDeckId, 'deck')
+    if (this.globalTransfersInFlight.has(transfer.id)) {
+      throw new Error('That Browse download is already running.')
     }
-
-    const localDeckIds = new Map<string, string>()
-    const pending = [...detail.decks]
-    let rootDeck: DeckSummary | null = null
-    while (pending.length > 0) {
-      const index = pending.findIndex((item) => !item.parentSourceDeckId || localDeckIds.has(item.parentSourceDeckId))
-      if (index < 0) throw new Error('That global deck has an invalid subdeck hierarchy.')
-      const [item] = pending.splice(index, 1)
-      const created = this.createDeck({
-        name: item.parentSourceDeckId ? item.name : this.uniqueLocalDeckName(item.name),
-        parentId: item.parentSourceDeckId ? localDeckIds.get(item.parentSourceDeckId) : null,
+    this.globalTransfersInFlight.add(transfer.id)
+    try {
+      this.updateTransfer(transfer.id, { state: 'running', message: 'Fetching deck details.' })
+      const detail = await this.globalDecks.get(globalDeckId)
+      const totalCards = detail.decks.reduce((total, item) => total + item.cards.length, 0)
+      if (totalCards === 0) throw new Error('That deck has no cards to add.')
+      const total = Math.max(1, detail.media.length + detail.decks.length + totalCards)
+      this.updateTransfer(transfer.id, {
+        state: 'running',
+        title: `Downloading ${detail.name}`,
+        targetName: detail.name,
+        message: 'Preparing deck download.',
+        current: 0,
+        total,
       })
-      if (!item.parentSourceDeckId) rootDeck = created
-      localDeckIds.set(item.sourceDeckId, created.id)
-      for (const card of item.cards) {
-        this.createCard({
-          deckId: created.id,
-          noteType: card.noteType,
-          frontHtml: this.remapMediaIds(card.frontHtml, mediaIdMap),
-          backHtml: this.remapMediaIds(card.backHtml, mediaIdMap),
-          tags: card.tags,
+
+      const mediaIdMap = new Map<string, string>()
+      let completed = 0
+      for (const media of detail.media) {
+        if (!this.database.hasMediaHash(media.sha256)) {
+          this.updateTransfer(transfer.id, {
+            state: 'running',
+            message: `Downloading media ${completed + 1}/${detail.media.length}.`,
+            current: completed,
+            total,
+            itemName: media.originalName,
+          })
+          const blob = await this.globalDecks.downloadMedia(media.sha256)
+          const localId = this.database.saveGlobalMediaBlob(
+            {
+              id: media.sourceMediaId,
+              sha256: media.sha256,
+              mimeType: media.mimeType,
+              byteSize: media.byteSize,
+              originalName: media.originalName,
+            },
+            Buffer.from(blob.dataBase64, 'base64')
+          )
+          mediaIdMap.set(media.sourceMediaId, localId)
+        } else {
+          const local = this.database.listMediaRecords().find((item) => item.sha256 === media.sha256)
+          if (local) mediaIdMap.set(media.sourceMediaId, local.id)
+        }
+        completed += 1
+        this.updateTransfer(transfer.id, {
+          state: 'running',
+          message: `Media ready ${completed}/${detail.media.length}.`,
+          current: completed,
+          total,
+          itemName: media.originalName,
         })
       }
+
+      return this.database.importTransaction(() => {
+        const localDeckIds = new Map<string, string>()
+        const pending = [...detail.decks]
+        let rootDeck: DeckSummary | null = null
+        let applied = completed
+        while (pending.length > 0) {
+          const index = pending.findIndex((item) =>
+            !item.parentSourceDeckId || localDeckIds.has(item.parentSourceDeckId)
+          )
+          if (index < 0) throw new Error('That global deck has an invalid subdeck hierarchy.')
+          const [item] = pending.splice(index, 1)
+          const created = this.createDeck({
+            name: item.parentSourceDeckId ? item.name : this.uniqueLocalDeckName(item.name),
+            parentId: item.parentSourceDeckId ? localDeckIds.get(item.parentSourceDeckId) : null,
+          })
+          if (!item.parentSourceDeckId) rootDeck = created
+          localDeckIds.set(item.sourceDeckId, created.id)
+          applied += 1
+          this.updateTransfer(transfer.id, {
+            state: 'running',
+            message: `Adding deck ${item.name}.`,
+            current: applied,
+            total,
+            itemName: item.name,
+          })
+          for (const card of item.cards) {
+            this.createCard({
+              deckId: created.id,
+              noteType: card.noteType,
+              frontHtml: this.remapMediaIds(card.frontHtml, mediaIdMap),
+              backHtml: this.remapMediaIds(card.backHtml, mediaIdMap),
+              tags: card.tags,
+            })
+            applied += 1
+            this.updateTransfer(transfer.id, {
+              state: 'running',
+              message: `Adding cards ${Math.min(applied, total)}/${total}.`,
+              current: Math.min(applied, total),
+              total,
+            })
+          }
+        }
+        if (!rootDeck) throw new Error('That global deck has no root deck.')
+        const result = this.database.getDeckSummary(rootDeck.id)
+        this.updateTransfer(transfer.id, {
+          state: 'completed',
+          title: `Downloaded ${result.name}`,
+          message: `Added ${result.totalCards} card${result.totalCards === 1 ? '' : 's'} to your library.`,
+          current: total,
+          total,
+          result,
+        })
+        return result
+      })
+    } catch (error) {
+      this.updateTransfer(transfer.id, {
+        state: 'paused',
+        message: `${error instanceof Error ? error.message : String(error)} The download will resume next time oNami opens.`,
+      })
+      throw error
+    } finally {
+      this.globalTransfersInFlight.delete(transfer.id)
     }
-    if (!rootDeck) throw new Error('That global deck has no root deck.')
-    return this.database.getDeckSummary(rootDeck.id)
   }
 
   private extractMediaIds(html: string): string[] {
@@ -711,12 +947,51 @@ export class AppServices {
     return result
   }
 
-  syncNow(onProgress?: SyncProgressReporter): Promise<SyncRunResult> {
+  syncNow(options?: SyncRunOptions, onProgress?: SyncProgressReporter): Promise<SyncRunResult> {
     if (this.syncInFlight) return this.syncInFlight
-
-    const task = this.runSync(onProgress).finally(() => {
-      if (this.syncInFlight === task) this.syncInFlight = null
-    })
+    const stored = this.getStoredSyncSettings()
+    if (!stored.syncGroupId) return Promise.reject(new Error('Pair this device before syncing.'))
+    const persistent = !options?.background
+    const existing = persistent
+      ? this.getStoredTransferRecords().find(
+          (record) => record.kind === 'sync' && record.state !== 'completed' && record.state !== 'error'
+        )
+      : undefined
+    const transfer = !persistent
+      ? null
+      : existing
+        ? this.updateTransfer(existing.id, {
+            state: 'queued',
+            message: 'Sync queued and ready to continue in the background.',
+          })
+        : this.createTransfer('sync', 'sync', 'oNami')
+    if (persistent) this.saveStoredSyncSettings({ ...stored, syncRequested: true })
+    const report = (event: SyncProgressEvent) => {
+      onProgress?.(event)
+      if (transfer) this.updateTransfer(transfer.id, {
+        state: event.stage === 'complete' ? 'completed' : event.stage === 'error' ? 'paused' : 'running',
+        message: event.message,
+        current: event.current,
+        total: event.total,
+        itemName: event.itemName,
+      })
+    }
+    const task = this.runSync(report)
+      .then((result) => {
+        if (persistent) this.saveStoredSyncSettings({ ...this.getStoredSyncSettings(), syncRequested: false })
+        if (transfer) this.updateTransfer(transfer.id, { state: 'completed', result })
+        return result
+      })
+      .catch((error) => {
+        if (transfer) this.updateTransfer(transfer.id, {
+          state: 'paused',
+          message: `${error instanceof Error ? error.message : String(error)} Sync will resume next time oNami opens.`,
+        })
+        throw error
+      })
+      .finally(() => {
+        if (this.syncInFlight === task) this.syncInFlight = null
+      })
     this.syncInFlight = task
     return task
   }
@@ -1020,6 +1295,7 @@ export class AppServices {
       deviceToken: null,
       deviceTokenExpiresAt: null,
       seedSnapshotPending: false,
+      syncRequested: false,
     })
   }
 

@@ -518,6 +518,33 @@ export interface SyncProgressEvent {
   itemName?: string
 }
 
+export interface SyncRunOptions {
+  /** Routine polling stays silent; user-started and resumed syncs use foreground progress. */
+  background?: boolean
+}
+
+export type TransferKind = 'browse-upload' | 'browse-download' | 'sync'
+
+export type TransferState = 'queued' | 'running' | 'paused' | 'completed' | 'error'
+
+/** Durable, cross-process progress used by the UI and native OS notifications. */
+export interface TransferProgressEvent {
+  id: string
+  kind: TransferKind
+  state: TransferState
+  title: string
+  message: string
+  current?: number
+  total?: number
+  itemName?: string
+  updatedAt: string
+}
+
+export interface TransferStatus {
+  active: TransferProgressEvent | null
+  recent: TransferProgressEvent[]
+}
+
 export interface OnamiApi {
   decks: {
     create(input: CreateDeckInput): Promise<DeckSummary>
@@ -562,8 +589,12 @@ export interface OnamiApi {
     startPairing(): Promise<SyncStartPairingResult>
     joinPairing(input: SyncJoinPairingInput): Promise<SyncJoinPairingResult>
     confirmPairing(input: SyncConfirmPairingInput): Promise<SyncConfirmPairingResult>
-    syncNow(): Promise<SyncRunResult>
+    syncNow(options?: SyncRunOptions): Promise<SyncRunResult>
     onProgress(listener: (event: SyncProgressEvent) => void): () => void
+  }
+  transfers: {
+    getStatus(): Promise<TransferStatus>
+    onProgress(listener: (event: TransferProgressEvent) => void): () => void
   }
   stats: {
     get(filter?: StatsFilterInput): Promise<AppStats>

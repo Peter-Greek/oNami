@@ -2,7 +2,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import fs from 'node:fs'
 import os from 'node:os'
-import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, type OpenDialogOptions } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, Notification, protocol, type OpenDialogOptions } from 'electron'
 
 import type {
   AiGenerationOptions,
@@ -18,12 +18,16 @@ import type {
   StudySessionSettings,
   SyncConfirmPairingInput,
   SyncJoinPairingInput,
+  SyncRunOptions,
+  TransferProgressEvent,
   UpdateCardInput,
 } from '../src/shared/types'
 import type { AppServices } from './domain/appServices'
 
 let mainWindow: BrowserWindow | null = null
 let services: AppServices | null = null
+const activeTransferIds = new Set<string>()
+let quitAfterTransfers = false
 let logFilePath = path.join(os.tmpdir(), 'onami-startup.log')
 
 const log = (message: string, error?: unknown): void => {
@@ -42,6 +46,36 @@ const getServices = (): AppServices => {
   return services
 }
 
+const showTransferNotification = (event: TransferProgressEvent): void => {
+  if (event.kind === 'sync' || !Notification.isSupported()) return
+  if (event.state !== 'queued' && event.state !== 'completed' && event.state !== 'paused' && event.state !== 'error') {
+    return
+  }
+  new Notification({
+    title: event.title,
+    body: event.message,
+    icon: path.join(__dirname, '../build/icon.png'),
+    silent: event.state === 'queued',
+  }).show()
+}
+
+const handleTransferProgress = (event: TransferProgressEvent): void => {
+  if (event.state === 'queued' || event.state === 'running') activeTransferIds.add(event.id)
+  else activeTransferIds.delete(event.id)
+
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.webContents.isDestroyed()) window.webContents.send('transfers:progress', event)
+  }
+  const current = event.current ?? 0
+  const total = event.total ?? 0
+  if (activeTransferIds.size === 0) mainWindow?.setProgressBar(-1)
+  else if (total > 0) mainWindow?.setProgressBar(Math.min(1, Math.max(0, current / total)))
+  else mainWindow?.setProgressBar(2, { mode: 'indeterminate' })
+  showTransferNotification(event)
+
+  if (quitAfterTransfers && activeTransferIds.size === 0) app.quit()
+}
+
 const toggleDevTools = (target: BrowserWindow | null): void => {
   const webContents = target?.webContents
   if (!webContents) return
@@ -50,6 +84,7 @@ const toggleDevTools = (target: BrowserWindow | null): void => {
 }
 
 const createWindow = (): void => {
+  quitAfterTransfers = false
   log('Creating main window')
   mainWindow = new BrowserWindow({
     width: 560,
@@ -196,11 +231,12 @@ const registerIpc = (): void => {
   ipcMain.handle('sync:confirm-pairing', (_event, input: SyncConfirmPairingInput) =>
     getServices().confirmSyncPairing(input)
   )
-  ipcMain.handle('sync:sync-now', (event) =>
-    getServices().syncNow((progress) => {
+  ipcMain.handle('sync:sync-now', (event, options?: SyncRunOptions) =>
+    getServices().syncNow(options, (progress) => {
       if (!event.sender.isDestroyed()) event.sender.send('sync:progress', progress)
     })
   )
+  ipcMain.handle('transfers:get-status', () => getServices().getTransferStatus())
 
   ipcMain.handle('window:minimize', (event) => {
     BrowserWindow.fromWebContents(event.sender)?.minimize()
@@ -257,6 +293,8 @@ if (!gotSingleInstanceLock) {
       ])
       const database = new OnamiDatabase(path.join(userData, 'onami.sqlite'), path.join(userData, 'media'))
       services = new AppServices(database)
+      services.onTransferProgress(handleTransferProgress)
+      services.startBackgroundTransfers()
       registerMediaProtocol()
       registerIpc()
       createWindow()
@@ -276,5 +314,17 @@ if (!gotSingleInstanceLock) {
 }
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  if (process.platform === 'darwin') return
+  if (activeTransferIds.size > 0) {
+    quitAfterTransfers = true
+    if (Notification.isSupported()) {
+      new Notification({
+        title: 'oNami is continuing in the background',
+        body: 'Your download, upload, or sync will keep going and oNami will exit when it finishes.',
+        icon: path.join(__dirname, '../build/icon.png'),
+      }).show()
+    }
+    return
+  }
+  app.quit()
 })

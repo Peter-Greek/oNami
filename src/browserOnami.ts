@@ -48,10 +48,14 @@ import type {
   SyncReviewAnswerPayload,
   SyncReviewLogRecord,
   SyncRunResult,
+  SyncRunOptions,
   SyncSnapshotBundle,
   SyncSnapshotResponse,
   SyncStartPairingResult,
   ThemeMode,
+  TransferKind,
+  TransferProgressEvent,
+  TransferStatus,
   UpdateCardInput,
 } from './shared/types'
 
@@ -145,6 +149,7 @@ interface BrowserSyncSettings {
   backedUpEvents: number
   lastBackedUpAt: string | null
   seedSnapshotPending: boolean
+  syncRequested: boolean
 }
 
 interface BrowserSyncProgressState {
@@ -153,18 +158,30 @@ interface BrowserSyncProgressState {
   events: SyncProgressEvent[]
 }
 
+interface BrowserTransferRecord extends TransferProgressEvent {
+  targetId: string
+  targetName: string
+  result?: DeckSummary | GlobalDeckSummary | SyncRunResult
+  localDeckIds?: Record<string, string>
+  mediaIds?: Record<string, string>
+}
+
 const STORAGE_KEY = 'onami.android.mvp.v1'
 const SYNC_SETTINGS_KEY = 'onami.sync.settings'
 const SYNC_OUTBOX_KEY = 'onami.sync.outbox'
 const SYNC_PROGRESS_KEY = 'onami.sync.progress'
+const TRANSFER_RECORDS_KEY = 'onami.transfer.records.v1'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
 const AUTO_SYNC_DELAY_MS = 500
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const syncProgressListeners = new Set<(event: SyncProgressEvent) => void>()
+const transferProgressListeners = new Set<(event: TransferProgressEvent) => void>()
 let browserWakeLock: { release?: () => Promise<void> } | null = null
 let browserAutoSyncTimer: number | null = null
 let browserSyncInFlight: Promise<SyncRunResult> | null = null
-let browserAutoSyncRunner: (() => Promise<SyncRunResult>) | null = null
+let browserAutoSyncRunner: ((options?: SyncRunOptions) => Promise<SyncRunResult>) | null = null
+let browserTransferRunner: (() => Promise<void>) | null = null
+let browserTransferQueueInFlight: Promise<void> | null = null
 
 const defaultAppSettings: AppSettings = {
   audioVolume: 0.8,
@@ -252,6 +269,7 @@ const readSyncSettings = (): BrowserSyncSettings => {
       backedUpEvents: typeof parsed.backedUpEvents === 'number' ? parsed.backedUpEvents : 0,
       lastBackedUpAt: parsed.lastBackedUpAt ?? null,
       seedSnapshotPending: Boolean(parsed.seedSnapshotPending),
+      syncRequested: Boolean(parsed.syncRequested),
     }
   } catch {
     return {
@@ -268,6 +286,7 @@ const readSyncSettings = (): BrowserSyncSettings => {
       backedUpEvents: 0,
       lastBackedUpAt: null,
       seedSnapshotPending: false,
+      syncRequested: false,
     }
   }
 }
@@ -279,6 +298,114 @@ const writeSyncSettings = (settings: BrowserSyncSettings) => {
   }
   localStorage.setItem(SYNC_SETTINGS_KEY, JSON.stringify(next))
   localStorage.setItem('onami.sync.hostUrl', next.hostUrl)
+}
+
+const readTransferRecords = (): BrowserTransferRecord[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TRANSFER_RECORDS_KEY) || '[]') as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((record): record is BrowserTransferRecord =>
+      Boolean(
+        record &&
+          typeof record === 'object' &&
+          typeof record.id === 'string' &&
+          (record.kind === 'browse-upload' || record.kind === 'browse-download' || record.kind === 'sync') &&
+          typeof record.state === 'string' &&
+          typeof record.title === 'string' &&
+          typeof record.message === 'string' &&
+          typeof record.targetId === 'string' &&
+          typeof record.targetName === 'string'
+      )
+    )
+  } catch {
+    return []
+  }
+}
+
+const writeTransferRecords = (records: BrowserTransferRecord[]): void => {
+  const active = records.filter((record) => record.state !== 'completed' && record.state !== 'error')
+  const recent = records
+    .filter((record) => record.state === 'completed' || record.state === 'error')
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, 12)
+  localStorage.setItem(TRANSFER_RECORDS_KEY, JSON.stringify([...active, ...recent]))
+}
+
+const notifyNativeTransfer = (event: TransferProgressEvent): void => {
+  const bridge = window.onamiAndroid
+  if (!bridge) return
+  const current = Number.isFinite(event.current) ? Math.max(0, Math.trunc(event.current ?? 0)) : 0
+  const total = Number.isFinite(event.total) ? Math.max(0, Math.trunc(event.total ?? 0)) : 0
+  try {
+    if (event.state === 'queued' || event.state === 'running') {
+      bridge.updateTransfer(event.id, event.title, event.message, current, total)
+    } else if (event.state === 'paused') {
+      bridge.pauseTransfer(event.id, event.title, event.message)
+    } else {
+      const hasMore = readTransferRecords().some(
+        (record) => record.id !== event.id && record.state !== 'completed' && record.state !== 'error'
+      )
+      bridge.finishTransfer(event.id, event.title, event.message, event.state === 'completed', hasMore)
+    }
+  } catch {
+    // Native notifications are best-effort; the durable record remains authoritative.
+  }
+}
+
+const emitTransferProgress = (
+  id: string,
+  update: Partial<Omit<BrowserTransferRecord, 'id' | 'kind' | 'targetId' | 'targetName'>>
+): BrowserTransferRecord => {
+  const records = readTransferRecords()
+  const index = records.findIndex((record) => record.id === id)
+  if (index < 0) throw new Error(`Transfer ${id} is no longer available.`)
+  const next: BrowserTransferRecord = { ...records[index], ...update, updatedAt: nowIso() }
+  records[index] = next
+  writeTransferRecords(records)
+  const event: TransferProgressEvent = next
+  for (const listener of transferProgressListeners) listener(event)
+  notifyNativeTransfer(event)
+  return next
+}
+
+const createTransferRecord = (kind: TransferKind, targetId: string, targetName: string): BrowserTransferRecord => {
+  const id = `${kind}-${crypto.randomUUID()}`
+  const title = kind === 'browse-upload'
+    ? `Uploading ${targetName}`
+    : kind === 'browse-download'
+      ? `Downloading ${targetName}`
+      : 'Syncing oNami'
+  const record: BrowserTransferRecord = {
+    id,
+    kind,
+    state: 'queued',
+    title,
+    message: 'Queued and ready to continue in the background.',
+    targetId,
+    targetName,
+    updatedAt: nowIso(),
+  }
+  writeTransferRecords([...readTransferRecords(), record])
+  notifyNativeTransfer(record)
+  return record
+}
+
+const getTransferStatus = (): TransferStatus => {
+  const records = readTransferRecords().sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  return {
+    active: records.find((record) => record.state === 'running' || record.state === 'queued' || record.state === 'paused') ?? null,
+    recent: records.slice(0, 12),
+  }
+}
+
+const waitForTransfer = async <T,>(id: string): Promise<T> => {
+  while (true) {
+    const record = readTransferRecords().find((item) => item.id === id)
+    if (!record) throw new Error('The transfer record was lost before it completed.')
+    if (record.state === 'completed') return record.result as T
+    if (record.state === 'paused' || record.state === 'error') throw new Error(record.message)
+    await new Promise((resolve) => window.setTimeout(resolve, 150))
+  }
 }
 
 const readSyncOutbox = (): SyncEventRecord[] => {
@@ -397,6 +524,18 @@ const emitSyncProgress = (event: SyncProgressEvent) => {
     events: [event, ...current.events].slice(0, 20),
   })
   for (const listener of syncProgressListeners) listener(event)
+  const transfer = readTransferRecords().find(
+    (record) => record.kind === 'sync' && record.state !== 'completed' && record.state !== 'error'
+  )
+  if (transfer) {
+    emitTransferProgress(transfer.id, {
+      state: event.stage === 'complete' ? 'completed' : event.stage === 'error' ? 'paused' : 'running',
+      message: event.message,
+      current: event.current,
+      total: event.total,
+      itemName: event.itemName,
+    })
+  }
 }
 
 const scheduleBrowserAutoSync = () => {
@@ -592,6 +731,270 @@ const getInstallationId = (): string => {
 }
 
 const globalDecksClient = createGlobalDecksClient({ installationId: getInstallationId })
+
+const buildGlobalDeckPublishInput = (localDeckId: string) => {
+  const state = readState()
+  const deck = state.decks.find((item) => item.id === localDeckId)
+  if (!deck) throw new Error('Deck not found.')
+  const deckIds = new Set(getDescendantDeckIds(state, deck.id))
+  const selectedCards = state.cards.filter((card) => deckIds.has(card.deckId))
+  if (selectedCards.length === 0) throw new Error('That deck has no cards to publish yet.')
+  if (selectedCards.length > GLOBAL_DECKS_MAX_PUBLISH_CARDS) {
+    throw new Error(
+      `Decks up to ${GLOBAL_DECKS_MAX_PUBLISH_CARDS} cards can be published; this one has ${selectedCards.length}.`
+    )
+  }
+  const decks: GlobalDeckNode[] = state.decks
+    .filter((item) => deckIds.has(item.id))
+    .map((item) => ({
+      sourceDeckId: item.id,
+      parentSourceDeckId: item.id === deck.id ? null : item.parentId,
+      name: item.name,
+      cards: selectedCards
+        .filter((card) => card.deckId === item.id)
+        .map((card): GlobalDeckCard => ({
+          frontHtml: card.frontHtml,
+          backHtml: card.backHtml,
+          tags: card.tags,
+          noteType: card.noteType,
+        })),
+    }))
+  const mediaIds = new Set(selectedCards.flatMap((card) => extractMediaIds(`${card.frontHtml}\n${card.backHtml}`)))
+  const selectedMedia = state.media.filter((item) => mediaIds.has(item.id))
+  if (selectedMedia.length !== mediaIds.size) throw new Error('One or more deck media files are missing locally.')
+  const media: GlobalDeckMedia[] = selectedMedia.map((item) => ({
+    sourceMediaId: item.id,
+    sha256: item.sha256,
+    mimeType: item.mimeType,
+    byteSize: base64ByteLength(item.dataBase64),
+    originalName: item.originalName,
+  }))
+  const mediaBlobs: GlobalDeckMediaBlob[] = selectedMedia.map((item) => ({
+    sha256: item.sha256,
+    mimeType: item.mimeType,
+    dataBase64: item.dataBase64,
+  }))
+  return { sourceDeckId: deck.id, name: deck.name, decks, media, mediaBlobs }
+}
+
+const runBrowseUploadTransfer = async (record: BrowserTransferRecord): Promise<void> => {
+  const input = buildGlobalDeckPublishInput(record.targetId)
+  emitTransferProgress(record.id, {
+    state: 'running',
+    title: `Uploading ${input.name}`,
+    message: 'Preparing deck contents.',
+    current: 0,
+    total: Math.max(1, input.mediaBlobs.length + 2),
+  })
+  const published = await globalDecksClient.publish(input, (progress) => {
+    emitTransferProgress(record.id, {
+      state: 'running',
+      message: progress.message,
+      current: progress.current,
+      total: progress.total,
+      itemName: progress.itemName,
+    })
+  })
+  emitTransferProgress(record.id, {
+    state: 'completed',
+    title: `Uploaded ${published.name}`,
+    message: `Published ${published.cardCount} card${published.cardCount === 1 ? '' : 's'}.`,
+    current: Math.max(1, input.mediaBlobs.length + 2),
+    total: Math.max(1, input.mediaBlobs.length + 2),
+    result: published,
+  })
+}
+
+const runBrowseDownloadTransfer = async (initial: BrowserTransferRecord): Promise<void> => {
+  const detail = await globalDecksClient.get(initial.targetId)
+  const totalCards = detail.decks.reduce((total, item) => total + item.cards.length, 0)
+  if (totalCards === 0) throw new Error('That deck has no cards to add.')
+  const total = Math.max(1, detail.media.length + totalCards + detail.decks.length)
+  let record = emitTransferProgress(initial.id, {
+    state: 'running',
+    title: `Downloading ${detail.name}`,
+    message: 'Preparing deck download.',
+    current: 0,
+    total,
+  })
+
+  const mediaIds = { ...(record.mediaIds ?? {}) }
+  let completed = 0
+  for (const media of detail.media) {
+    const existing = readState().media.find((item) => item.sha256 === media.sha256)
+    if (existing) {
+      mediaIds[media.sourceMediaId] = existing.id
+      completed += 1
+      record = emitTransferProgress(record.id, {
+        state: 'running',
+        message: `Media ready ${completed}/${detail.media.length}.`,
+        current: completed,
+        total,
+        itemName: media.originalName,
+        mediaIds,
+      })
+      continue
+    }
+
+    const localId = mediaIds[media.sourceMediaId] ??
+      (readState().media.some((item) => item.id === media.sourceMediaId) ? makeId('media') : media.sourceMediaId)
+    mediaIds[media.sourceMediaId] = localId
+    record = emitTransferProgress(record.id, {
+      state: 'running',
+      message: `Downloading media ${completed + 1}/${detail.media.length}.`,
+      current: completed,
+      total,
+      itemName: media.originalName,
+      mediaIds,
+    })
+    const blob = await globalDecksClient.downloadMedia(media.sha256)
+    mutateState((state) => {
+      if (state.media.some((item) => item.sha256 === media.sha256)) return
+      state.media.push({
+        id: localId,
+        sha256: media.sha256,
+        mimeType: media.mimeType,
+        originalName: media.originalName,
+        dataBase64: blob.dataBase64,
+      })
+    })
+    await flushState()
+    completed += 1
+    emitTransferProgress(record.id, {
+      state: 'running',
+      message: `Saved media ${completed}/${detail.media.length}.`,
+      current: completed,
+      total,
+      itemName: media.originalName,
+      mediaIds,
+    })
+  }
+
+  const localDeckIds = { ...(record.localDeckIds ?? {}) }
+  for (const deck of detail.decks) localDeckIds[deck.sourceDeckId] ??= makeId('deck')
+  record = emitTransferProgress(record.id, { state: 'running', localDeckIds, mediaIds })
+  const rootSource = detail.decks.find((deck) => !deck.parentSourceDeckId)
+  if (!rootSource) throw new Error('That global deck has no root deck.')
+  const rootId = localDeckIds[rootSource.sourceDeckId]
+  const alreadyApplied = readState().decks.find((deck) => deck.id === rootId)
+  if (!alreadyApplied) {
+    mutateState((state) => {
+      const pending = [...detail.decks]
+      const created = new Set<string>()
+      const timestamp = nowIso()
+      while (pending.length > 0) {
+        const index = pending.findIndex((deck) => !deck.parentSourceDeckId || created.has(deck.parentSourceDeckId))
+        if (index < 0) throw new Error('That global deck has an invalid subdeck hierarchy.')
+        const [deck] = pending.splice(index, 1)
+        const deckId = localDeckIds[deck.sourceDeckId]
+        const parentId = deck.parentSourceDeckId ? localDeckIds[deck.parentSourceDeckId] : null
+        const storedDeck: StoredDeck = {
+          id: deckId,
+          parentId,
+          name: parentId ? deck.name : uniqueLocalDeckName(deck.name),
+          source: 'global-library',
+          unitTestScore: null,
+          unitTestedAt: null,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }
+        state.decks.push(storedDeck)
+        created.add(deck.sourceDeckId)
+        for (const [cardIndex, card] of deck.cards.entries()) {
+          const remap = (html: string) => html.replace(/onami-media:\/\/([^"')\s]+)/g, (original, rawId: string) => {
+            const localId = mediaIds[decodeURIComponent(rawId)]
+            return localId ? `onami-media://${encodeURIComponent(localId)}` : original
+          })
+          const storedCard: StoredCard = {
+            id: makeId('card'),
+            noteId: makeId('note'),
+            deckId,
+            deckNameSnapshot: storedDeck.name,
+            templateOrd: cardIndex,
+            noteType: card.noteType,
+            frontHtml: remap(card.frontHtml),
+            backHtml: remap(card.backHtml),
+            tags: card.tags,
+            fields: {},
+            state: 'New',
+            dueAt: null,
+            stability: 0,
+            difficulty: 0,
+            elapsedDays: 0,
+            scheduledDays: 0,
+            learningSteps: 0,
+            reps: 0,
+            lapses: 0,
+            successRate: 0,
+            lastRating: null,
+            lastReviewedAt: null,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          }
+          state.cards.push(storedCard)
+        }
+      }
+    })
+    await flushState()
+  }
+
+  const state = readState()
+  const root = state.decks.find((deck) => deck.id === rootId)
+  if (!root) throw new Error('The downloaded deck could not be saved.')
+  // Queue sync only after the imported state is durable. If the app is killed
+  // between the IndexedDB commit and this checkpoint, the running transfer is
+  // restored and safely queues these idempotent upserts on the next launch.
+  const importedDeckIds = new Set(Object.values(localDeckIds))
+  for (const deck of state.decks.filter((item) => importedDeckIds.has(item.id))) {
+    enqueueSyncEvent('deck', deck.id, 'deck.upsert', buildDeckSyncPayload(deck))
+  }
+  for (const card of state.cards.filter((item) => importedDeckIds.has(item.deckId))) {
+    enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
+  }
+  const result = toSummary(state, root)
+  emitTransferProgress(record.id, {
+    state: 'completed',
+    title: `Downloaded ${result.name}`,
+    message: `Added ${result.totalCards} card${result.totalCards === 1 ? '' : 's'} to your library.`,
+    current: total,
+    total,
+    result,
+    localDeckIds,
+    mediaIds,
+  })
+}
+
+const processBrowserTransferQueue = async (): Promise<void> => {
+  while (true) {
+    const record = readTransferRecords()
+      .filter((item) => item.kind !== 'sync' && (item.state === 'queued' || item.state === 'running'))
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))[0]
+    if (!record) return
+    try {
+      if (record.kind === 'browse-upload') await runBrowseUploadTransfer(record)
+      else await runBrowseDownloadTransfer(record)
+    } catch (error) {
+      emitTransferProgress(record.id, {
+        state: 'paused',
+        message: `${error instanceof Error ? error.message : String(error)} The transfer will resume when oNami reopens or reconnects.`,
+      })
+      return
+    }
+  }
+}
+
+const runBrowserTransferQueue = (): Promise<void> => {
+  if (browserTransferQueueInFlight) return browserTransferQueueInFlight
+  const task = (async () => {
+    const locks = navigator.locks
+    if (locks?.request) await locks.request('onami-transfer-runner', () => processBrowserTransferQueue())
+    else await processBrowserTransferQueue()
+  })().finally(() => {
+    if (browserTransferQueueInFlight === task) browserTransferQueueInFlight = null
+  })
+  browserTransferQueueInFlight = task
+  return task
+}
 
 /** Keeps repeated adds of the same library deck distinguishable. */
 const uniqueLocalDeckName = (name: string): string => {
@@ -1705,108 +2108,18 @@ export const installBrowserOnami = async () => {
     globalDecks: {
       list: (search: string) => globalDecksClient.list(search),
       publish: async (localDeckId: string): Promise<GlobalDeckSummary> => {
-        const state = readState()
-        const deck = state.decks.find((item) => item.id === localDeckId)
+        const deck = readState().decks.find((item) => item.id === localDeckId)
         if (!deck) throw new Error('Deck not found.')
-        const deckIds = new Set(getDescendantDeckIds(state, deck.id))
-        // Card content only: scheduling and review history stay on the device.
-        const selectedCards = state.cards.filter((card) => deckIds.has(card.deckId))
-        if (selectedCards.length === 0) throw new Error('That deck has no cards to publish yet.')
-        if (selectedCards.length > GLOBAL_DECKS_MAX_PUBLISH_CARDS) {
-          throw new Error(
-            `Decks up to ${GLOBAL_DECKS_MAX_PUBLISH_CARDS} cards can be published; this one has ${selectedCards.length}.`
-          )
-        }
-        const decks: GlobalDeckNode[] = state.decks
-          .filter((item) => deckIds.has(item.id))
-          .map((item) => ({
-            sourceDeckId: item.id,
-            parentSourceDeckId: item.id === deck.id ? null : item.parentId,
-            name: item.name,
-            cards: selectedCards
-              .filter((card) => card.deckId === item.id)
-              .map((card): GlobalDeckCard => ({
-                frontHtml: card.frontHtml,
-                backHtml: card.backHtml,
-                tags: card.tags,
-                noteType: card.noteType,
-              })),
-          }))
-        const mediaIds = new Set(selectedCards.flatMap((card) => extractMediaIds(`${card.frontHtml}\n${card.backHtml}`)))
-        const selectedMedia = state.media.filter((item) => mediaIds.has(item.id))
-        if (selectedMedia.length !== mediaIds.size) throw new Error('One or more deck media files are missing locally.')
-        const media: GlobalDeckMedia[] = selectedMedia.map((item) => ({
-          sourceMediaId: item.id,
-          sha256: item.sha256,
-          mimeType: item.mimeType,
-          byteSize: base64ByteLength(item.dataBase64),
-          originalName: item.originalName,
-        }))
-        const mediaBlobs: GlobalDeckMediaBlob[] = selectedMedia.map((item) => ({
-          sha256: item.sha256,
-          mimeType: item.mimeType,
-          dataBase64: item.dataBase64,
-        }))
-        return globalDecksClient.publish({ sourceDeckId: deck.id, name: deck.name, decks, media, mediaBlobs })
+        buildGlobalDeckPublishInput(localDeckId)
+        const transfer = createTransferRecord('browse-upload', localDeckId, deck.name)
+        void runBrowserTransferQueue()
+        return waitForTransfer<GlobalDeckSummary>(transfer.id)
       },
       heart: (globalDeckId: string, hearted: boolean) => globalDecksClient.heart(globalDeckId, hearted),
       addToLibrary: async (globalDeckId: string): Promise<DeckSummary> => {
-        const detail = await globalDecksClient.get(globalDeckId)
-        const totalCards = detail.decks.reduce((total, item) => total + item.cards.length, 0)
-        if (totalCards === 0) throw new Error('That deck has no cards to add.')
-        const mediaIdMap = new Map<string, string>()
-        for (const media of detail.media) {
-          const blob = await globalDecksClient.downloadMedia(media.sha256)
-          mutateState((state) => {
-            const existing = state.media.find((item) => item.sha256 === media.sha256)
-            if (existing) {
-              mediaIdMap.set(media.sourceMediaId, existing.id)
-              return
-            }
-            const id = state.media.some((item) => item.id === media.sourceMediaId)
-              ? makeId('media')
-              : media.sourceMediaId
-            state.media.push({
-              id,
-              sha256: media.sha256,
-              mimeType: media.mimeType,
-              originalName: media.originalName,
-              dataBase64: blob.dataBase64,
-            })
-            mediaIdMap.set(media.sourceMediaId, id)
-          })
-        }
-        const localDeckIds = new Map<string, string>()
-        const pending = [...detail.decks]
-        let created: DeckSummary | null = null
-        while (pending.length > 0) {
-          const index = pending.findIndex((item) => !item.parentSourceDeckId || localDeckIds.has(item.parentSourceDeckId))
-          if (index < 0) throw new Error('That global deck has an invalid subdeck hierarchy.')
-          const [item] = pending.splice(index, 1)
-          const localDeck = await api.decks.create({
-            name: item.parentSourceDeckId ? item.name : uniqueLocalDeckName(item.name),
-            parentId: item.parentSourceDeckId ? localDeckIds.get(item.parentSourceDeckId) : null,
-          })
-          if (!item.parentSourceDeckId) created = localDeck
-          localDeckIds.set(item.sourceDeckId, localDeck.id)
-          for (const card of item.cards) {
-            const remap = (html: string) => html.replace(/onami-media:\/\/([^"')\s]+)/g, (original, rawId: string) => {
-              const localId = mediaIdMap.get(decodeURIComponent(rawId))
-              return localId ? `onami-media://${encodeURIComponent(localId)}` : original
-            })
-            await api.cards.create({
-              deckId: localDeck.id,
-              noteType: card.noteType,
-              frontHtml: remap(card.frontHtml),
-              backHtml: remap(card.backHtml),
-              tags: card.tags,
-            })
-          }
-        }
-        if (!created) throw new Error('That global deck has no root deck.')
-        const state = readState()
-        const deck = state.decks.find((item) => item.id === created.id)
-        return deck ? toSummary(state, deck) : created
+        const transfer = createTransferRecord('browse-download', globalDeckId, 'deck')
+        void runBrowserTransferQueue()
+        return waitForTransfer<DeckSummary>(transfer.id)
       },
     },
     cards: {
@@ -2141,14 +2454,30 @@ export const installBrowserOnami = async () => {
         }
         return result
       },
-      syncNow: async (): Promise<SyncRunResult> => {
+      syncNow: async (options?: SyncRunOptions): Promise<SyncRunResult> => {
         if (browserSyncInFlight) return browserSyncInFlight
 
-        const task = (async (): Promise<SyncRunResult> => {
+        const persistent = !options?.background
+        const existingTransfer = persistent
+          ? readTransferRecords().find(
+              (record) => record.kind === 'sync' && record.state !== 'completed' && record.state !== 'error'
+            )
+          : undefined
+        const transfer = !persistent
+          ? null
+          : existingTransfer
+            ? emitTransferProgress(existingTransfer.id, {
+                state: 'queued',
+                message: 'Sync queued and ready to continue in the background.',
+              })
+            : createTransferRecord('sync', 'sync', 'oNami')
+        if (persistent) writeSyncSettings({ ...readSyncSettings(), syncRequested: true })
+
+        const execute = async (): Promise<SyncRunResult> => {
           const settings = readSyncSettings()
           if (!settings.syncGroupId) throw new Error('Pair this device before syncing.')
 
-          await acquireSyncWakeLock()
+            if (persistent) await acquireSyncWakeLock()
           try {
             const token = await getValidSyncDeviceToken()
             emitSyncProgress({ stage: 'pairing', message: 'Sync device is paired.' })
@@ -2215,7 +2544,7 @@ export const installBrowserOnami = async () => {
               message: `Sync complete. Sent ${pushedEvents}, received ${pulledEvents}, applied ${appliedEvents}.`,
             })
 
-            return {
+            const result = {
               pushedEvents,
               pulledEvents,
               appliedEvents,
@@ -2224,6 +2553,9 @@ export const installBrowserOnami = async () => {
               backedUpEvents: readSyncSettings().backedUpEvents,
               lastBackedUpAt: readSyncSettings().lastBackedUpAt,
             }
+            if (persistent) writeSyncSettings({ ...readSyncSettings(), syncRequested: false })
+            if (transfer) emitTransferProgress(transfer.id, { state: 'completed', result })
+            return result
           } catch (error) {
             emitSyncProgress({
               stage: 'error',
@@ -2231,9 +2563,12 @@ export const installBrowserOnami = async () => {
             })
             throw error
           } finally {
-            await releaseSyncWakeLock()
+            if (persistent) await releaseSyncWakeLock()
           }
-        })()
+        }
+        const task = navigator.locks?.request
+          ? navigator.locks.request('onami-transfer-runner', execute)
+          : execute()
 
         browserSyncInFlight = task
         try {
@@ -2246,6 +2581,15 @@ export const installBrowserOnami = async () => {
         syncProgressListeners.add(listener)
         return () => {
           syncProgressListeners.delete(listener)
+        }
+      },
+    },
+    transfers: {
+      getStatus: async () => getTransferStatus(),
+      onProgress: (listener) => {
+        transferProgressListeners.add(listener)
+        return () => {
+          transferProgressListeners.delete(listener)
         }
       },
     },
@@ -2263,5 +2607,29 @@ export const installBrowserOnami = async () => {
   }
 
   browserAutoSyncRunner = api.sync.syncNow
+  browserTransferRunner = runBrowserTransferQueue
   window.onami = api
+
+  const resumePendingTransfers = () => {
+    const records = readTransferRecords()
+    for (const record of records) {
+      if (record.state !== 'paused' && record.state !== 'running') continue
+      emitTransferProgress(record.id, {
+        state: 'queued',
+        message: `${record.kind === 'sync' ? 'Sync' : 'Transfer'} restored after interruption.`,
+      })
+    }
+    void browserTransferRunner?.()
+    const settings = readSyncSettings()
+    if (
+      settings.syncGroupId &&
+      (settings.syncRequested || settings.seedSnapshotPending || readSyncOutbox().length > 0)
+    ) {
+      void api.sync.syncNow().catch(() => {
+        // The durable sync request stays queued for the next reconnect or launch.
+      })
+    }
+  }
+  resumePendingTransfers()
+  window.addEventListener('online', resumePendingTransfers)
 }

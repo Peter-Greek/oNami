@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 
-import type { OnamiApi, SyncProgressEvent } from '../src/shared/types'
+import type { OnamiApi, SyncProgressEvent, TransferProgressEvent } from '../src/shared/types'
 
 const api: OnamiApi = {
   decks: {
@@ -47,12 +47,22 @@ const api: OnamiApi = {
     startPairing: () => ipcRenderer.invoke('sync:start-pairing'),
     joinPairing: (input) => ipcRenderer.invoke('sync:join-pairing', input),
     confirmPairing: (input) => ipcRenderer.invoke('sync:confirm-pairing', input),
-    syncNow: () => ipcRenderer.invoke('sync:sync-now'),
+    syncNow: (options) => ipcRenderer.invoke('sync:sync-now', options),
     onProgress: (listener) => {
       const wrapped = (_event: IpcRendererEvent, progress: SyncProgressEvent) => listener(progress)
       ipcRenderer.on('sync:progress', wrapped)
       return () => {
         ipcRenderer.removeListener('sync:progress', wrapped)
+      }
+    },
+  },
+  transfers: {
+    getStatus: () => ipcRenderer.invoke('transfers:get-status'),
+    onProgress: (listener) => {
+      const wrapped = (_event: IpcRendererEvent, progress: TransferProgressEvent) => listener(progress)
+      ipcRenderer.on('transfers:progress', wrapped)
+      return () => {
+        ipcRenderer.removeListener('transfers:progress', wrapped)
       }
     },
   },

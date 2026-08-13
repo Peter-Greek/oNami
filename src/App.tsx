@@ -59,6 +59,7 @@ import type {
   SyncStartPairingResult,
   SyncStatus,
   ThemeMode,
+  TransferProgressEvent,
 } from './shared/types'
 import './App.css'
 
@@ -396,6 +397,7 @@ function App() {
   const [studyCardMode, setStudyCardMode] = useState(false)
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings)
   const [systemTheme, setSystemTheme] = useState<'light' | 'dark'>('light')
+  const [activeTransfer, setActiveTransfer] = useState<TransferProgressEvent | null>(null)
   const autoSyncRunningRef = useRef(false)
 
   const load = useCallback(async (deckId = selectedDeckId) => {
@@ -423,7 +425,7 @@ function App() {
         const status = await window.onami.sync.getStatus()
         if (!status.paired) return
 
-        const result = await window.onami.sync.syncNow()
+        const result = await window.onami.sync.syncNow({ background: true })
         if (disposed) return
         if (result.appliedEvents > 0) await load()
       } catch {
@@ -454,6 +456,18 @@ function App() {
   useEffect(() => {
     window.onami.settings.get().then(setAppSettings).catch(() => undefined)
   }, [])
+
+  useEffect(() => {
+    window.onami.transfers.getStatus().then((status) => setActiveTransfer(status.active)).catch(() => undefined)
+    return window.onami.transfers.onProgress((event) => {
+      if (event.state === 'queued' || event.state === 'running' || event.state === 'paused') {
+        setActiveTransfer(event)
+      } else {
+        setActiveTransfer((current) => current?.id === event.id ? null : current)
+        if (event.kind === 'browse-download' && event.state === 'completed') void load()
+      }
+    })
+  }, [load])
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
@@ -631,6 +645,18 @@ function App() {
         )}
 
         <div className={`content${inStudyCardMode ? ' content-study-session' : ''}`}>
+          {activeTransfer && (
+            <div className={`transfer-banner ${activeTransfer.state}`} aria-live="polite">
+              <div>
+                <strong>{activeTransfer.title}</strong>
+                <span>{activeTransfer.message}</span>
+              </div>
+              <progress
+                max={Math.max(1, activeTransfer.total ?? 1)}
+                value={activeTransfer.total ? Math.min(activeTransfer.current ?? 0, activeTransfer.total) : undefined}
+              />
+            </div>
+          )}
           {message && <div className="notice">{message}</div>}
           {view === 'study' && (
             <StudyView

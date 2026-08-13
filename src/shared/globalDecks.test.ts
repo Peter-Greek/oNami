@@ -203,6 +203,28 @@ describe('createGlobalDecksClient', () => {
     expect(urls[2].endsWith('/global-decks')).toBe(true)
   })
 
+  it('reports live upload progress through media and publish completion', async () => {
+    const sha256 = 'b'.repeat(64)
+    vi.stubGlobal('fetch', vi.fn<FetchFn>(async (input) => {
+      const url = String(input)
+      if (url.endsWith('/global-decks/media/check')) return jsonResponse({ missingSha256: [sha256] })
+      if (url.endsWith(`/global-decks/media/${sha256}`)) return jsonResponse({ sha256 })
+      return jsonResponse({ id: 'deck-1', name: 'Deck', cardCount: 1, publishedAt: '2026-01-01T00:00:00.000Z' })
+    }))
+    const progress = vi.fn()
+    const client = createGlobalDecksClient({ installationId: () => 'install-1' })
+
+    await client.publish({
+      sourceDeckId: 'local-1', name: 'Deck',
+      decks: [{ sourceDeckId: 'local-1', parentSourceDeckId: null, name: 'Deck', cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }] }],
+      media: [{ sourceMediaId: 'm1', sha256, mimeType: 'image/png', byteSize: 1, originalName: 'x.png' }],
+      mediaBlobs: [{ sha256, mimeType: 'image/png', dataBase64: 'eA==' }],
+    }, progress)
+
+    expect(progress.mock.calls.map(([event]) => event.current)).toEqual([0, 1, 2, 3])
+    expect(progress.mock.calls.at(-1)?.[0]).toMatchObject({ message: 'Deck published.', current: 3, total: 3 })
+  })
+
   it('surfaces the host error message', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ error: 'Deck name taken.' }, false, 409)))
 

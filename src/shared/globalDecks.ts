@@ -33,10 +33,19 @@ export interface GlobalDeckPublishInput {
 export interface GlobalDecksClient {
   list(search: string): Promise<GlobalDeckSummary[]>
   get(globalDeckId: string): Promise<GlobalDeckDetail>
-  publish(input: GlobalDeckPublishInput): Promise<GlobalDeckSummary>
+  publish(input: GlobalDeckPublishInput, onProgress?: GlobalDeckProgressReporter): Promise<GlobalDeckSummary>
   heart(globalDeckId: string, hearted: boolean): Promise<GlobalDeckHeartResult>
   downloadMedia(sha256: string): Promise<GlobalDeckMediaBlob>
 }
+
+export interface GlobalDeckProgress {
+  message: string
+  current: number
+  total: number
+  itemName?: string
+}
+
+export type GlobalDeckProgressReporter = (progress: GlobalDeckProgress) => void
 
 const asString = (value: unknown, fallback = ''): string => (typeof value === 'string' ? value : fallback)
 
@@ -247,8 +256,10 @@ export const createGlobalDecksClient = (options: {
       return detail
     },
 
-    publish: async (input) => {
+    publish: async (input, onProgress) => {
       const publisherId = await options.installationId()
+      const total = Math.max(1, input.mediaBlobs.length + 2)
+      onProgress?.({ message: 'Checking which media files need uploading.', current: 0, total })
       const check = await request<{ missingSha256?: unknown }>('/global-decks/media/check', {
         method: 'POST',
         body: { media: input.media },
@@ -258,13 +269,24 @@ export const createGlobalDecksClient = (options: {
           ? check.missingSha256.filter((value): value is string => typeof value === 'string')
           : []
       )
-      for (const blob of input.mediaBlobs) {
-        if (!missing.has(blob.sha256)) continue
-        await request(`/global-decks/media/${blob.sha256}`, {
-          method: 'POST',
-          body: { mimeType: blob.mimeType, dataBase64: blob.dataBase64 },
+      for (const [index, blob] of input.mediaBlobs.entries()) {
+        const item = input.media.find((media) => media.sha256 === blob.sha256)
+        onProgress?.({
+          message: missing.has(blob.sha256)
+            ? `Uploading media ${index + 1}/${input.mediaBlobs.length}.`
+            : `Media already uploaded ${index + 1}/${input.mediaBlobs.length}.`,
+          current: index + 1,
+          total,
+          itemName: item?.originalName,
         })
+        if (missing.has(blob.sha256)) {
+          await request(`/global-decks/media/${blob.sha256}`, {
+            method: 'POST',
+            body: { mimeType: blob.mimeType, dataBase64: blob.dataBase64 },
+          })
+        }
       }
+      onProgress?.({ message: 'Publishing deck contents.', current: input.mediaBlobs.length + 1, total })
       const payload = await request<unknown>('/global-decks', {
         method: 'POST',
         body: {
@@ -276,6 +298,7 @@ export const createGlobalDecksClient = (options: {
         },
       })
       const summary = toGlobalDeckSummary(unwrapDeck(payload))
+      onProgress?.({ message: 'Deck published.', current: total, total })
       if (!summary) {
         // The deck is published; only the echoed row was unusable.
         return {

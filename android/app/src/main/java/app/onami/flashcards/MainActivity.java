@@ -25,6 +25,8 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        TransferService.attachActivity(this);
+
         int nightMode = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
         applySystemBarTheme(nightMode == Configuration.UI_MODE_NIGHT_YES);
 
@@ -122,6 +124,33 @@ public class MainActivity extends Activity {
         public void setSystemBarTheme(boolean dark) {
             runOnUiThread(() -> applySystemBarTheme(dark));
         }
+
+        @JavascriptInterface
+        public void updateTransfer(String id, String title, String message, int current, int total) {
+            TransferService.update(MainActivity.this, id, title, message, current, total);
+        }
+
+        @JavascriptInterface
+        public void pauseTransfer(String id, String title, String message) {
+            TransferService.pause(MainActivity.this, id, title, message);
+        }
+
+        @JavascriptInterface
+        public void finishTransfer(
+            String id,
+            String title,
+            String message,
+            boolean succeeded,
+            boolean hasMore
+        ) {
+            TransferService.finish(MainActivity.this, id, title, message, succeeded, hasMore);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (!isChangingConfigurations()) TransferService.resumeHeadlessIfNeeded(this);
+        super.onDestroy();
     }
 
     @Override
