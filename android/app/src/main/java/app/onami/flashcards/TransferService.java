@@ -154,6 +154,14 @@ public class TransferService extends Service {
                     buildNotification(title, message, 0, 0, true, true)
                 );
             } else {
+                // Every intent is dispatched with startForegroundService on
+                // Android 8+. Even a duplicate terminal intent must promote
+                // itself before stopping, or Android can terminate the app with
+                // ForegroundServiceDidNotStartInTimeException.
+                startForeground(
+                    FOREGROUND_NOTIFICATION_ID,
+                    buildNotification(title, message, 1, 1, true, false)
+                );
                 preferences.edit().clear().apply();
                 stopForeground(true);
                 notificationManager().notify(

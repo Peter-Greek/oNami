@@ -1,6 +1,7 @@
 import { createEmptyCard, fsrs, Rating, State, type Card as FsrsCard, type Grade } from 'ts-fsrs'
 
 import { createGlobalDecksClient, GLOBAL_DECKS_MAX_PUBLISH_CARDS } from './shared/globalDecks'
+import { shouldNotifyNativeTransfer } from './shared/transferNotifications'
 
 import type {
   AiGenerationResult,
@@ -359,12 +360,13 @@ const emitTransferProgress = (
   const records = readTransferRecords()
   const index = records.findIndex((record) => record.id === id)
   if (index < 0) throw new Error(`Transfer ${id} is no longer available.`)
-  const next: BrowserTransferRecord = { ...records[index], ...update, updatedAt: nowIso() }
+  const previous = records[index]
+  const next: BrowserTransferRecord = { ...previous, ...update, updatedAt: nowIso() }
   records[index] = next
   writeTransferRecords(records)
   const event: TransferProgressEvent = next
   for (const listener of transferProgressListeners) listener(event)
-  notifyNativeTransfer(event)
+  if (shouldNotifyNativeTransfer(previous.state, next.state)) notifyNativeTransfer(event)
   return next
 }
 
