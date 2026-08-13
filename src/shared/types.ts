@@ -415,6 +415,10 @@ export interface SyncSnapshotBundle {
 export interface SyncSnapshotResponse {
   snapshot: SyncSnapshotBundle | null
   sourceDeviceId: string | null
+  /** False while the source is still uploading media from the published manifest. */
+  uploadComplete?: boolean
+  /** Media blobs already available for the target to download in parallel. */
+  availableMediaSha256?: string[]
 }
 
 export interface SyncMediaBlob {

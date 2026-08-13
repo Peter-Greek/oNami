@@ -195,12 +195,16 @@ The host verifies the signature against the paired device's stored public key.
 
 ## Full Snapshot Handoff
 
-When a fresh device pairs, the source device uploads a one-time full-data bundle
-(decks, cards with their current review state, the entire review-log history that
-drives stats/streak, and media metadata) via `POST /sync/snapshot`, and uploads
-each referenced media blob via `POST /media` (content-addressed by SHA-256). The
-fresh device pulls the bundle with `GET /sync/snapshot`, downloads blobs with
-`GET /media/:sha256`, then calls `POST /sync/snapshot/ack`, which deletes the
+When a fresh device pairs, the source device first publishes a one-time full-data
+manifest (decks, cards with their current review state, the entire review-log
+history that drives stats/streak, and media metadata) via `POST /sync/snapshot`.
+It then uploads referenced media blobs in bounded parallel batches via
+`POST /media` (content-addressed by SHA-256), and marks the manifest complete.
+The target polls `GET /sync/snapshot`, applies cards as soon as the manifest
+exists, and downloads each available media batch while the source is still
+uploading. There is no fixed polling-attempt limit; durable client checkpoints
+resume the process after an interruption. Once the source is complete and every
+blob is stored, the target calls `POST /sync/snapshot/ack`, which deletes the
 snapshot row **and its media blobs** from the host. A snapshot is addressed to
 the newly paired target so an existing third device cannot consume it. All later
 changes flow through the incremental `/sync/events` log. There is one pending

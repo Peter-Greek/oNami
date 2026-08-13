@@ -9,7 +9,12 @@ import { PrismaClient } from '@prisma/client'
 
 import { parseByteRange, resolveAndroidDownload } from './downloads.js'
 import { selectPairingSnapshotDirection } from './pairing.js'
-import { canDeviceReceiveSnapshot, decodeSyncSnapshot, encodeSyncSnapshot } from './syncSnapshots.js'
+import {
+  canDeviceReceiveSnapshot,
+  decodeSyncSnapshot,
+  encodeSyncSnapshot,
+  listAvailableSnapshotMedia,
+} from './syncSnapshots.js'
 import {
   GLOBAL_DECK_LIMITS,
   globalDeckResponse,
@@ -936,6 +941,7 @@ const route = async (request, response, context) => {
     const snapshot = body.snapshot
     if (!snapshot || typeof snapshot !== 'object') throw httpError(400, 'snapshot object is required.')
     const targetDeviceId = optionalString(body, 'targetDeviceId')
+    const uploadComplete = typeof body.uploadComplete === 'boolean' ? body.uploadComplete : true
     if (targetDeviceId) {
       const target = await prisma.device.findUnique({ where: { id: targetDeviceId } })
       if (!target || target.syncGroupId !== device.syncGroupId || target.revokedAt) {
@@ -943,7 +949,7 @@ const route = async (request, response, context) => {
       }
       if (target.id === device.id) throw httpError(400, 'Snapshot source and target must be different devices.')
     }
-    const payloadJson = encodeSyncSnapshot(snapshot, targetDeviceId)
+    const payloadJson = encodeSyncSnapshot(snapshot, targetDeviceId, uploadComplete)
 
     await prisma.syncSnapshot.upsert({
       where: { syncGroupId: device.syncGroupId },
@@ -962,6 +968,7 @@ const route = async (request, response, context) => {
       media: Array.isArray(snapshot.media) ? snapshot.media.length : 0,
       sourceDeviceId: device.id,
       targetDeviceId,
+      uploadComplete,
     })
     return send(response, 200, { ok: true })
   }
@@ -995,14 +1002,32 @@ const route = async (request, response, context) => {
       found: true,
       sourceDeviceId: snapshot.sourceDeviceId,
       targetDeviceId: decoded.targetDeviceId,
+      uploadComplete: decoded.uploadComplete,
       decks: Array.isArray(decoded.snapshot?.decks) ? decoded.snapshot.decks.length : 0,
       cards: Array.isArray(decoded.snapshot?.cards) ? decoded.snapshot.cards.length : 0,
       reviewLogs: Array.isArray(decoded.snapshot?.reviewLogs) ? decoded.snapshot.reviewLogs.length : 0,
       media: Array.isArray(decoded.snapshot?.media) ? decoded.snapshot.media.length : 0,
     })
+    const manifestMedia = Array.isArray(decoded.snapshot?.media) ? decoded.snapshot.media : []
+    const manifestHashes = manifestMedia
+      .map((item) => item?.sha256)
+      .filter((value) => typeof value === 'string')
+    const storedMedia = await prisma.mediaObject.findMany({
+      where: {
+        syncGroupId: device.syncGroupId,
+        ...(manifestHashes.length > 0 ? { sha256: { in: manifestHashes } } : {}),
+      },
+      select: { sha256: true },
+    })
+    const availableMediaSha256 = listAvailableSnapshotMedia(
+      manifestMedia,
+      storedMedia.map((item) => item.sha256)
+    )
     return send(response, 200, {
       snapshot: decoded.snapshot,
       sourceDeviceId: snapshot.sourceDeviceId,
+      uploadComplete: decoded.uploadComplete,
+      availableMediaSha256,
     })
   }
 
@@ -1019,6 +1044,7 @@ const route = async (request, response, context) => {
     if (
       snapshot &&
       decoded &&
+      decoded.uploadComplete &&
       canDeviceReceiveSnapshot({
         sourceDeviceId: snapshot.sourceDeviceId,
         targetDeviceId: decoded.targetDeviceId,
@@ -1054,6 +1080,7 @@ const route = async (request, response, context) => {
         cleared: true,
         sourceDeviceId: snapshot.sourceDeviceId,
         targetDeviceId: decoded.targetDeviceId,
+        uploadComplete: decoded.uploadComplete,
         mediaDeleted: hashes.length,
       })
     } else {
@@ -1061,6 +1088,7 @@ const route = async (request, response, context) => {
         cleared: false,
         sourceDeviceId: snapshot?.sourceDeviceId ?? null,
         targetDeviceId: decoded?.targetDeviceId ?? null,
+        uploadComplete: decoded?.uploadComplete ?? null,
       })
     }
 

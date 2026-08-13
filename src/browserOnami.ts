@@ -1,6 +1,11 @@
 import { createEmptyCard, fsrs, Rating, State, type Card as FsrsCard, type Grade } from 'ts-fsrs'
 
 import { createGlobalDecksClient, GLOBAL_DECKS_MAX_PUBLISH_CARDS } from './shared/globalDecks'
+import {
+  getAvailableSnapshotMedia,
+  selectAvailableMediaBatch,
+  SNAPSHOT_MEDIA_BATCH_SIZE,
+} from './shared/snapshotTransfer'
 import { getPairingSnapshotPlan } from './shared/syncPairing'
 import { shouldNotifyNativeTransfer } from './shared/transferNotifications'
 
@@ -177,8 +182,7 @@ const SYNC_PROGRESS_KEY = 'onami.sync.progress'
 const TRANSFER_RECORDS_KEY = 'onami.transfer.records.v1'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
 const AUTO_SYNC_DELAY_MS = 500
-const SNAPSHOT_WAIT_ATTEMPTS = 45
-const SNAPSHOT_WAIT_DELAY_MS = 2_000
+const SNAPSHOT_POLL_DELAY_MS = 1_500
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const syncProgressListeners = new Set<(event: SyncProgressEvent) => void>()
 const transferProgressListeners = new Set<(event: TransferProgressEvent) => void>()
@@ -1873,19 +1877,49 @@ const uploadFullSnapshot = async (): Promise<void> => {
     total: totalItems,
   })
 
-  for (const [index, media] of state.media.entries()) {
-    emitSyncProgress({
-      stage: 'snapshot-upload',
-      message: `Uploading media ${index + 1}/${state.media.length}.`,
-      current: index + 1,
-      total: state.media.length,
-      itemType: 'media',
-      itemName: media.originalName,
-    })
-    await syncHostRequest('/media', {
+  const publishManifest = (uploadComplete: boolean) =>
+    syncHostRequest('/sync/snapshot', {
       method: 'POST',
       token,
-      body: { sha256: media.sha256, mimeType: media.mimeType, dataBase64: media.dataBase64 },
+      body: {
+        snapshot,
+        targetDeviceId: settings.seedSnapshotTargetDeviceId,
+        uploadComplete,
+      },
+    })
+
+  // Publish the manifest first so the target can apply cards immediately and
+  // begin downloading each media batch as soon as it reaches the host.
+  await publishManifest(false)
+  const mediaByHash = new Map(state.media.map((media) => [media.sha256, media]))
+  for (let index = 0; index < snapshot.media.length; index += SNAPSHOT_MEDIA_BATCH_SIZE) {
+    const batch = snapshot.media.slice(index, index + SNAPSHOT_MEDIA_BATCH_SIZE)
+    emitSyncProgress({
+      stage: 'snapshot-upload',
+      message: `Uploading media ${index + 1}-${Math.min(index + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
+      current: index,
+      total: snapshot.media.length,
+      itemType: 'media',
+      itemName: batch[0]?.originalName,
+    })
+    await Promise.all(
+      batch.map((metadata) => {
+        const media = mediaByHash.get(metadata.sha256)
+        if (!media) throw new Error(`Media ${metadata.originalName} is missing from local storage.`)
+        return syncHostRequest('/media', {
+          method: 'POST',
+          token,
+          body: { sha256: media.sha256, mimeType: media.mimeType, dataBase64: media.dataBase64 },
+        })
+      })
+    )
+    emitSyncProgress({
+      stage: 'snapshot-upload',
+      message: `Uploaded media ${Math.min(index + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
+      current: Math.min(index + batch.length, snapshot.media.length),
+      total: snapshot.media.length,
+      itemType: 'media',
+      itemName: batch[batch.length - 1]?.originalName,
     })
   }
 
@@ -1895,43 +1929,31 @@ const uploadFullSnapshot = async (): Promise<void> => {
     current: totalItems,
     total: totalItems,
   })
-  await syncHostRequest('/sync/snapshot', {
-    method: 'POST',
-    token,
-    body: {
-      snapshot,
-      targetDeviceId: settings.seedSnapshotTargetDeviceId,
-    },
-  })
+  await publishManifest(true)
 }
 
 const maybeSeedSnapshot = async (): Promise<void> => {
   const settings = readSyncSettings()
   if (!settings.seedSnapshotPending || !settings.syncGroupId) return
-  try {
-    await uploadFullSnapshot()
-    writeSyncSettings({
-      ...readSyncSettings(),
-      seedSnapshotPending: false,
-      seedSnapshotTargetDeviceId: null,
-    })
-  } catch {
-    // Leave the flag set so the next sync retries seeding the snapshot.
-  }
+  await uploadFullSnapshot()
+  writeSyncSettings({
+    ...readSyncSettings(),
+    seedSnapshotPending: false,
+    seedSnapshotTargetDeviceId: null,
+  })
 }
 
 const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
   const waitForSnapshot = readSyncSettings().receiveSnapshotPending
-  let response: SyncSnapshotResponse | null = null
-  for (let attempt = 0; attempt < (waitForSnapshot ? SNAPSHOT_WAIT_ATTEMPTS : 1); attempt += 1) {
+  let response: SyncSnapshotResponse
+  let waitingForManifest = false
+  while (true) {
     try {
       emitSyncProgress({
         stage: 'snapshot-download',
-        message: attempt === 0
-          ? 'Checking for initial content snapshot.'
-          : `Waiting for the source device to upload cards and media (${attempt + 1}/${SNAPSHOT_WAIT_ATTEMPTS}).`,
-        current: attempt,
-        total: waitForSnapshot ? SNAPSHOT_WAIT_ATTEMPTS : undefined,
+        message: waitingForManifest
+          ? 'Waiting for the source device to publish its card and media manifest.'
+          : 'Checking for initial content snapshot.',
       })
       response = await syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', { method: 'GET', token })
     } catch (error) {
@@ -1941,113 +1963,160 @@ const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
     }
     if (response.snapshot) break
     if (!waitForSnapshot) return false
-    if (attempt === SNAPSHOT_WAIT_ATTEMPTS - 1) {
-      throw new Error('The source device has not finished uploading its full snapshot yet. Keep both devices online and retry sync.')
-    }
-    await new Promise<void>((resolve) => window.setTimeout(resolve, SNAPSHOT_WAIT_DELAY_MS))
+    waitingForManifest = true
+    await new Promise<void>((resolve) => window.setTimeout(resolve, SNAPSHOT_POLL_DELAY_MS))
   }
-  if (!response?.snapshot) return false
+  const snapshot = response.snapshot
 
   const totalItems =
-    response.snapshot.decks.length +
-    response.snapshot.cards.length +
-    response.snapshot.reviewLogs.length +
-    response.snapshot.media.length
+    snapshot.decks.length +
+    snapshot.cards.length +
+    snapshot.reviewLogs.length +
+    snapshot.media.length
   emitSyncProgress({
     stage: 'snapshot-download',
-    message: `Downloading initial snapshot with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
+    message: `Received snapshot manifest with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
     current: 0,
     total: totalItems,
   })
 
+  // Cards and review history do not need to wait for media. Persist them as
+  // soon as the source publishes the manifest while both devices stream blobs.
   let state = readState()
-  let downloadedMediaCount = response.snapshot.media.filter((media) =>
-    state.media.some((item) => item.sha256 === media.sha256)
-  ).length
-  if (downloadedMediaCount > 0 && downloadedMediaCount < response.snapshot.media.length) {
-    emitSyncProgress({
-      stage: 'snapshot-download',
-      message: `Resuming media download ${downloadedMediaCount}/${response.snapshot.media.length}.`,
-      current: downloadedMediaCount,
-      total: response.snapshot.media.length,
-      itemType: 'media',
-    })
-  }
-
-  for (const media of response.snapshot.media) {
-    state = readState()
-    if (state.media.some((item) => item.sha256 === media.sha256)) continue
-    emitSyncProgress({
-      stage: 'snapshot-download',
-      message: `Downloading media ${downloadedMediaCount + 1}/${response.snapshot.media.length}.`,
-      current: downloadedMediaCount + 1,
-      total: response.snapshot.media.length,
-      itemType: 'media',
-      itemName: media.originalName,
-    })
-    const blob = await syncHostRequest<SyncMediaBlob>(`/media/${media.sha256}`, { method: 'GET', token })
-    state = readState()
-    if (state.media.some((item) => item.sha256 === media.sha256)) {
-      downloadedMediaCount += 1
-      continue
-    }
-    state.media.push({
-      id: media.id,
-      sha256: media.sha256,
-      mimeType: media.mimeType,
-      originalName: media.originalName,
-      dataBase64: blob.dataBase64,
-    })
-    writeState(state)
-    // Wait for the blob to hit IndexedDB before the next download so an
-    // interruption resumes from here rather than re-fetching this media.
-    await flushState()
-    downloadedMediaCount += 1
-    emitSyncProgress({
-      stage: 'snapshot-download',
-      message: `Saved media ${downloadedMediaCount}/${response.snapshot.media.length}.`,
-      current: downloadedMediaCount,
-      total: response.snapshot.media.length,
-      itemType: 'media',
-      itemName: media.originalName,
-    })
-  }
-  for (const [index, deck] of response.snapshot.decks.entries()) {
+  for (const [index, deck] of snapshot.decks.entries()) {
     emitSyncProgress({
       stage: 'apply',
-      message: `Applying deck ${index + 1}/${response.snapshot.decks.length}: ${deck.name}.`,
+      message: `Applying deck ${index + 1}/${snapshot.decks.length}: ${deck.name}.`,
       current: index + 1,
-      total: response.snapshot.decks.length,
+      total: snapshot.decks.length,
       itemType: 'deck',
       itemName: deck.name,
     })
   }
-  for (const [index, card] of response.snapshot.cards.entries()) {
+  for (const [index, card] of snapshot.cards.entries()) {
     emitSyncProgress({
       stage: 'apply',
-      message: `Applying card ${index + 1}/${response.snapshot.cards.length}.`,
+      message: `Applying card ${index + 1}/${snapshot.cards.length}.`,
       current: index + 1,
-      total: response.snapshot.cards.length,
+      total: snapshot.cards.length,
       itemType: 'card',
       itemName: card.card.id,
     })
   }
-  if (response.snapshot.reviewLogs.length > 0) {
+  if (snapshot.reviewLogs.length > 0) {
     emitSyncProgress({
       stage: 'apply',
-      message: `Applying ${response.snapshot.reviewLogs.length} review history entr${response.snapshot.reviewLogs.length === 1 ? 'y' : 'ies'}.`,
-      current: response.snapshot.reviewLogs.length,
-      total: response.snapshot.reviewLogs.length,
+      message: `Applying ${snapshot.reviewLogs.length} review history entr${snapshot.reviewLogs.length === 1 ? 'y' : 'ies'}.`,
+      current: snapshot.reviewLogs.length,
+      total: snapshot.reviewLogs.length,
       itemType: 'review',
     })
   }
-
-  state = readState()
-  applySnapshotBundle(state, response.snapshot)
+  applySnapshotBundle(state, snapshot)
   writeState(state)
-  // Only ack once the applied decks/cards are durable — the ack lets the host
-  // delete the snapshot, so losing this write would lose the data entirely.
   await flushState()
+
+  const persistMediaAliases = async (): Promise<void> => {
+    const current = readState()
+    let changed = false
+    for (const media of snapshot.media) {
+      if (current.media.some((item) => item.id === media.id)) continue
+      const existing = current.media.find((item) => item.sha256 === media.sha256)
+      if (!existing) continue
+      current.media.push({
+        ...existing,
+        id: media.id,
+        mimeType: media.mimeType,
+        originalName: media.originalName,
+      })
+      changed = true
+    }
+    if (changed) {
+      writeState(current)
+      await flushState()
+    }
+  }
+  await persistMediaAliases()
+
+  while (true) {
+    state = readState()
+    const downloadedSha256 = new Set(
+      snapshot.media
+        .filter((media) => state.media.some((item) => item.id === media.id && item.sha256 === media.sha256))
+        .map((media) => media.sha256)
+    )
+    const batch = selectAvailableMediaBatch(
+      snapshot.media,
+      downloadedSha256,
+      getAvailableSnapshotMedia(response, snapshot.media)
+    )
+
+    if (batch.length > 0) {
+      emitSyncProgress({
+        stage: 'snapshot-download',
+        message: `Downloading available media batch ${downloadedSha256.size + 1}-${Math.min(downloadedSha256.size + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
+        current: downloadedSha256.size,
+        total: snapshot.media.length,
+        itemType: 'media',
+        itemName: batch[0]?.originalName,
+      })
+      const downloads = await Promise.all(
+        batch.map(async (media) => ({
+          media,
+          blob: await syncHostRequest<SyncMediaBlob>(`/media/${media.sha256}`, { method: 'GET', token }),
+        }))
+      )
+      state = readState()
+      for (const { media, blob } of downloads) {
+        if (state.media.some((item) => item.id === media.id)) continue
+        state.media.push({
+          id: media.id,
+          sha256: media.sha256,
+          mimeType: media.mimeType,
+          originalName: media.originalName,
+          dataBase64: blob.dataBase64,
+        })
+      }
+      writeState(state)
+      // Each completed batch is durable before requesting the next one, so a
+      // process death resumes from the last saved batch without re-downloading.
+      await flushState()
+      await persistMediaAliases()
+      const downloadedMediaCount = snapshot.media.filter((media) =>
+        readState().media.some((item) => item.id === media.id && item.sha256 === media.sha256)
+      ).length
+      emitSyncProgress({
+        stage: 'snapshot-download',
+        message: `Saved media ${downloadedMediaCount}/${snapshot.media.length}.`,
+        current: downloadedMediaCount,
+        total: snapshot.media.length,
+        itemType: 'media',
+        itemName: batch[batch.length - 1]?.originalName,
+      })
+    }
+
+    const downloadedMediaCount = snapshot.media.filter((media) =>
+      readState().media.some((item) => item.id === media.id && item.sha256 === media.sha256)
+    ).length
+    if (downloadedMediaCount === snapshot.media.length && response.uploadComplete !== false) break
+
+    if (batch.length === 0) {
+      emitSyncProgress({
+        stage: 'snapshot-download',
+        message: `Waiting for the next uploaded media batch. Saved ${downloadedMediaCount}/${snapshot.media.length}.`,
+        current: downloadedMediaCount,
+        total: snapshot.media.length,
+        itemType: 'media',
+      })
+      await new Promise<void>((resolve) => window.setTimeout(resolve, SNAPSHOT_POLL_DELAY_MS))
+    }
+
+    const nextResponse = await syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', { method: 'GET', token })
+    if (!nextResponse.snapshot) {
+      throw new Error('The full snapshot is no longer available. Restart pairing to continue.')
+    }
+    response = nextResponse
+  }
 
   // Confirm receipt so the host clears the snapshot bundle and its media.
   emitSyncProgress({ stage: 'ack', message: 'Acknowledging initial snapshot.' })
@@ -2490,7 +2559,6 @@ export const installBrowserOnami = async () => {
             deviceToken: token.token,
             deviceTokenExpiresAt: token.expiresAt,
           })
-          if (snapshotPlan.uploadTargetDeviceId) await maybeSeedSnapshot()
         }
         return result
       },
