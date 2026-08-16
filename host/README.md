@@ -143,6 +143,10 @@ POST /global-decks/:id/heart
 POST /global-decks/media/check
 POST /global-decks/media/:sha256
 GET  /global-decks/media/:sha256
+GET  /records?since=<version>&limit=<n>
+POST /records
+GET  /review-log?since=<version>&limit=<n>
+POST /review-log
 POST /blobs/check
 HEAD /blob/:sha256
 PATCH /blob/:sha256
@@ -198,6 +202,72 @@ The host verifies the signature against the paired device's stored public key.
    modes follow the selected platform direction.
 6. Each device requests a device token.
 7. Devices push local outbox events, pull remote events, and ack the cursor.
+
+## Records
+
+One keyed row per thing in a library — a deck, a card, a media reference —
+stored in `sync_records` under `(sync_group_id, kind, record_id)`.
+
+Re-saving a card **replaces** its row rather than appending another, so the
+table stays the size of the library instead of the size of its edit history.
+That is what the append-only `sync_events` table could not do.
+
+```text
+POST /records     { "records": [ envelope, ... ] }
+                  -> { accepted, superseded, nextCursor }
+GET  /records?since=<version>&limit=<n>
+                  -> { records: [ ... ], nextCursor }
+```
+
+An envelope is:
+
+```json
+{
+  "kind": "card",
+  "recordId": "card-uuid",
+  "updatedAt": "2026-08-15T12:00:00.000Z",
+  "deleted": false,
+  "mergeRank": 42,
+  "payload": {},
+  "blobRefs": ["<sha256>"]
+}
+```
+
+**A new device pulls from version 0 through the same endpoint every other
+device uses.** There is no snapshot, no source and target device, no polling and
+no acknowledgement — hydration and ongoing sync are one code path, and both
+resume a page at a time.
+
+Each accepted write takes a fresh sequence value, so a device that had already
+caught up is told about the change, and versions stay unique so a page boundary
+can never skip a record.
+
+### Merge rule
+
+`mergeRank` decides a conflict before timestamps are consulted. For a card it is
+its review count. Clocks between devices disagree, and plain last-writer-wins
+lets a desktop that has been closed for a week overwrite reviews done on a phone
+that morning — silently undoing study. Ranking by reviews first means the device
+that has studied more never loses to one that has studied less.
+
+Deletions compare on time alone, so a heavily studied card can still be deleted.
+An exact tie keeps what is stored, which makes a retried push a no-op.
+
+The host enforces this itself rather than trusting clients, so a device running
+an old build cannot undo newer study. The rule lives in
+`src/shared/sync/records.js` — plain JavaScript with a `.d.ts` beside it, so the
+host and both clients run byte-identical logic.
+
+### Review log
+
+Reviews are genuinely append-only and drive stats and streaks, so they have
+their own stream in `review_log_entries`, pulled by the same cursor pattern.
+Re-pushing an entry already stored is ignored rather than duplicated.
+
+```text
+POST /review-log  { "entries": [ ... ] }  -> { accepted }
+GET  /review-log?since=<version>&limit=<n> -> { entries, nextCursor }
+```
 
 ## Blob Store
 

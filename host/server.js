@@ -15,6 +15,12 @@ import {
   planBlobCheck,
   resolveBlobPatch,
 } from './blobs.js'
+import {
+  dedupeRecordBatch,
+  nextCursorFrom,
+  resolveRecordConflict,
+  validateRecordEnvelope,
+} from '../src/shared/sync/records.js'
 import { parseByteRange, resolveAndroidDownload } from './downloads.js'
 import { loadEnvFile } from './env.js'
 import { sweepBlobs } from './gc.js'
@@ -44,6 +50,9 @@ const config = {
   tokenTtlMs: Number(process.env.ONAMI_DEVICE_TOKEN_TTL_MS ?? 7 * 24 * 60 * 60 * 1000),
   maxJsonBytes: Number(process.env.ONAMI_MAX_JSON_BYTES ?? 1024 * 1024),
   maxGlobalDeckJsonBytes: Number(process.env.ONAMI_MAX_GLOBAL_DECK_JSON_BYTES ?? 8 * 1024 * 1024),
+  // A record push carries card HTML, so it needs more headroom than a plain
+  // control-plane call but far less than a media blob.
+  maxRecordsJsonBytes: Number(process.env.ONAMI_MAX_RECORDS_JSON_BYTES ?? 16 * 1024 * 1024),
   // Full-data snapshots and single media blobs are much larger than incremental events.
   maxBlobBytes: Number(process.env.ONAMI_MAX_BLOB_BYTES ?? 64 * 1024 * 1024),
   // One resumable upload chunk. Large enough to be efficient, small enough that
@@ -286,6 +295,9 @@ const optionalDate = (body, key) => {
   if (!Number.isFinite(date.getTime())) throw httpError(400, `${key} must be a valid timestamp.`)
   return date
 }
+
+/** Bounds one push so a huge library arrives as pages, each of which resumes. */
+const MAX_RECORDS_PER_PUSH = 500
 
 const allowedEntityTypes = new Set(['deck', 'card', 'review'])
 const allowedEventTypes = new Set(['deck.upsert', 'deck.delete', 'card.upsert', 'card.delete', 'review.answer'])
@@ -1057,6 +1069,184 @@ const route = async (request, response, context) => {
 
     logRequest(context, 'info', 'sync.ack', { lastEventId })
     return send(response, 200, { ok: true })
+  }
+
+  // ---- Records ----
+  //
+  // One keyed row per deck, card, and media reference. Replaces both the
+  // append-only event log and the one-time snapshot handoff: a brand new device
+  // pulls from version 0 through the same endpoint an established device uses.
+
+  if (request.method === 'POST' && url.pathname === '/records') {
+    const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
+    const body = await readJson(request, config.maxRecordsJsonBytes)
+    if (!Array.isArray(body.records)) throw httpError(400, 'records must be an array.')
+    if (body.records.length > MAX_RECORDS_PER_PUSH) {
+      throw httpError(400, `A push may contain at most ${MAX_RECORDS_PER_PUSH} records.`)
+    }
+
+    for (const [index, candidate] of body.records.entries()) {
+      const problem = validateRecordEnvelope(candidate, index)
+      if (problem) throw httpError(400, `records[${problem.index}]: ${problem.reason}`)
+    }
+
+    // Collapsed first so one push cannot contain two writes to the same record.
+    const incoming = dedupeRecordBatch(body.records)
+    let accepted = 0
+    let superseded = 0
+
+    for (const record of incoming) {
+      const where = {
+        syncGroupId_kind_recordId: {
+          syncGroupId: device.syncGroupId,
+          kind: record.kind,
+          recordId: record.recordId,
+        },
+      }
+      const existing = await prisma.syncRecord.findUnique({
+        where,
+        select: { updatedAt: true, mergeRank: true, deleted: true },
+      })
+
+      // The merge rule is enforced here, not only on the client, so a device
+      // running an old build cannot overwrite newer study from another device.
+      if (
+        resolveRecordConflict(
+          existing
+            ? {
+                updatedAt: existing.updatedAt.toISOString(),
+                mergeRank: existing.mergeRank,
+                deleted: existing.deleted,
+              }
+            : null,
+          record
+        ) === 'keep-existing'
+      ) {
+        superseded += 1
+        continue
+      }
+
+      const data = {
+        updatedAt: new Date(record.updatedAt),
+        deleted: record.deleted,
+        mergeRank: record.mergeRank,
+        payloadJson: record.payload ?? {},
+        blobRefs: (record.blobRefs ?? []).map((hash) => hash.toLowerCase()),
+      }
+      // Replaced rather than updated in place so the row takes a fresh sequence
+      // value. Every accepted write must get a higher version than anything
+      // already pulled, or a device that synced before this change would never
+      // be told about it. Versions must also be unique: if two records shared
+      // one, a page boundary landing between them would skip the second
+      // forever.
+      await prisma.$transaction([
+        prisma.syncRecord.deleteMany({
+          where: { syncGroupId: device.syncGroupId, kind: record.kind, recordId: record.recordId },
+        }),
+        prisma.syncRecord.create({
+          data: { syncGroupId: device.syncGroupId, kind: record.kind, recordId: record.recordId, ...data },
+        }),
+      ])
+      accepted += 1
+
+      for (const hash of data.blobRefs) {
+        await addBlobRef(hash, 'sync-group', device.syncGroupId).catch(() => undefined)
+      }
+    }
+
+    const highest = await prisma.syncRecord.aggregate({
+      where: { syncGroupId: device.syncGroupId },
+      _max: { version: true },
+    })
+    const nextCursor = Number(highest._max.version ?? 0)
+
+    logRequest(context, 'info', 'records.push', {
+      received: body.records.length,
+      accepted,
+      superseded,
+      nextCursor,
+    })
+    return send(response, 200, { accepted, superseded, nextCursor })
+  }
+
+  if (request.method === 'GET' && url.pathname === '/records') {
+    const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
+    const since = Math.max(0, Number(url.searchParams.get('since') ?? 0) || 0)
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 500), 1), 1000)
+
+    const rows = await prisma.syncRecord.findMany({
+      where: { syncGroupId: device.syncGroupId, version: { gt: since } },
+      orderBy: { version: 'asc' },
+      take: limit,
+    })
+
+    const records = rows.map((row) => ({
+      kind: row.kind,
+      recordId: row.recordId,
+      version: Number(row.version),
+      updatedAt: row.updatedAt.toISOString(),
+      deleted: row.deleted,
+      mergeRank: row.mergeRank,
+      payload: row.payloadJson,
+      blobRefs: row.blobRefs,
+    }))
+
+    logRequest(context, 'info', 'records.pull', { since, limit, returned: records.length })
+    return send(response, 200, {
+      records,
+      nextCursor: nextCursorFrom(records, since),
+    })
+  }
+
+  if (request.method === 'POST' && url.pathname === '/review-log') {
+    const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
+    const body = await readJson(request, config.maxRecordsJsonBytes)
+    if (!Array.isArray(body.entries)) throw httpError(400, 'entries must be an array.')
+    if (body.entries.length > MAX_RECORDS_PER_PUSH) {
+      throw httpError(400, `A push may contain at most ${MAX_RECORDS_PER_PUSH} entries.`)
+    }
+
+    let accepted = 0
+    for (const entry of body.entries) {
+      const entryId = requiredString(entry, 'id')
+      const cardId = requiredString(entry, 'cardId')
+      const reviewedAt = optionalDate(entry, 'reviewedAt')
+      if (!reviewedAt) throw httpError(400, 'reviewedAt must be a valid timestamp.')
+
+      // Reviews are immutable, so a re-push of one already stored is a no-op
+      // rather than a duplicate. That makes retrying a batch free.
+      const result = await prisma.reviewLogEntry.createMany({
+        data: [{ syncGroupId: device.syncGroupId, entryId, cardId, reviewedAt, payloadJson: entry }],
+        skipDuplicates: true,
+      })
+      accepted += result.count
+    }
+
+    logRequest(context, 'info', 'reviewLog.push', { received: body.entries.length, accepted })
+    return send(response, 200, { accepted })
+  }
+
+  if (request.method === 'GET' && url.pathname === '/review-log') {
+    const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
+    const since = Math.max(0, Number(url.searchParams.get('since') ?? 0) || 0)
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 500), 1), 2000)
+
+    const rows = await prisma.reviewLogEntry.findMany({
+      where: { syncGroupId: device.syncGroupId, version: { gt: since } },
+      orderBy: { version: 'asc' },
+      take: limit,
+    })
+    const entries = rows.map((row) => ({ ...row.payloadJson, version: Number(row.version) }))
+
+    logRequest(context, 'info', 'reviewLog.pull', { since, limit, returned: entries.length })
+    return send(response, 200, {
+      entries,
+      nextCursor: entries.reduce((highest, entry) => Math.max(highest, entry.version), since),
+    })
   }
 
   // ---- Content-addressed blob store ----

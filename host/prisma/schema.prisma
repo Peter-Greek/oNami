@@ -14,6 +14,8 @@ model SyncGroup {
 
   devices      Device[]
   events       SyncEvent[]
+  records      SyncRecord[]
+  reviewLog    ReviewLogEntry[]
   cursors      DeviceCursor[]
   mediaObjects MediaObject[]
   snapshot     SyncSnapshot?
@@ -125,6 +127,56 @@ model SyncSnapshot {
   syncGroup SyncGroup @relation(fields: [syncGroupId], references: [id], onDelete: Cascade)
 
   @@map("sync_snapshots")
+}
+
+/// One row per thing in a library: a deck, a card, a media reference.
+///
+/// Keyed by (syncGroupId, kind, recordId), so re-saving a card replaces its row
+/// instead of appending another. The table stays the size of the library rather
+/// than the size of its edit history, which is what let sync_events grow without
+/// bound. `version` comes from a global sequence and only has to be increasing,
+/// so a device pulls everything after the version it last acknowledged.
+///
+/// A brand new device pulls from version 0 through the same endpoint every other
+/// device uses, which is what replaces the whole snapshot handoff.
+model SyncRecord {
+  syncGroupId String   @map("sync_group_id") @db.Uuid
+  kind        String
+  recordId    String   @map("record_id")
+  version     BigInt   @default(autoincrement())
+  /// The writing device's clock, used to order writes of equal rank.
+  updatedAt   DateTime @map("updated_at")
+  deleted     Boolean  @default(false)
+  /// Higher wins before time is consulted. For a card this is its review count,
+  /// so a device that has studied more never loses to one that has studied less.
+  mergeRank   Int      @default(0) @map("merge_rank")
+  payloadJson Json     @map("payload_json")
+  blobRefs    String[] @map("blob_refs")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  syncGroup SyncGroup @relation(fields: [syncGroupId], references: [id], onDelete: Cascade)
+
+  @@id([syncGroupId, kind, recordId])
+  @@index([syncGroupId, version])
+  @@map("sync_records")
+}
+
+/// Reviews, which are genuinely append-only and drive stats and streaks.
+/// Immutable and small, so a cursor pull resumes for free.
+model ReviewLogEntry {
+  version       BigInt   @id @default(autoincrement())
+  syncGroupId   String   @map("sync_group_id") @db.Uuid
+  entryId       String   @map("entry_id")
+  cardId        String   @map("card_id")
+  reviewedAt    DateTime @map("reviewed_at")
+  payloadJson   Json     @map("payload_json")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  syncGroup SyncGroup @relation(fields: [syncGroupId], references: [id], onDelete: Cascade)
+
+  @@unique([syncGroupId, entryId])
+  @@index([syncGroupId, version])
+  @@map("review_log_entries")
 }
 
 /// Content-addressed blob store, shared by device sync and the published deck
