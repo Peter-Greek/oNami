@@ -1168,11 +1168,28 @@ const route = async (request, response, context) => {
       }
 
       fs.renameSync(partPath, mediaBlobPath(sha256))
+      const mimeType = optionalString(request.headers, 'content-type') ?? 'application/octet-stream'
       await prisma.blob.update({
         where: { sha256 },
         data: { receivedBytes, byteSize: receivedBytes, complete: true },
       })
       await addBlobRef(sha256, 'sync-group', device.syncGroupId)
+
+      // Mirror into the legacy table so a device still on the previous build
+      // can fetch this file through `GET /media/:sha256`. Without this, an
+      // updated desktop and an un-updated phone cannot exchange media.
+      await prisma.mediaObject.upsert({
+        where: { syncGroupId_sha256: { syncGroupId: device.syncGroupId, sha256 } },
+        create: {
+          syncGroupId: device.syncGroupId,
+          sha256,
+          byteSize: receivedBytes,
+          mimeType,
+          storageKey: sha256,
+        },
+        update: { byteSize: receivedBytes, mimeType, storageKey: sha256 },
+      })
+
       return { status: 200, sha256, offset: receivedBytes, complete: true }
     })
 

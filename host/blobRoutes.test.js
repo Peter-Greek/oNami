@@ -68,7 +68,12 @@ const prismaStub = {
       ) ?? null,
     deleteMany: async () => undefined,
   },
-  mediaObject: { upsert: async () => undefined, findMany: async () => [] },
+  mediaObject: {
+    upsert: async ({ where, create }) => {
+      db.mediaObjects.set(`${where.syncGroupId_sha256.syncGroupId}|${where.syncGroupId_sha256.sha256}`, create)
+    },
+    findMany: async () => [...db.mediaObjects.values()],
+  },
 }
 
 vi.mock('@prisma/client', () => ({ PrismaClient: class { constructor() { return prismaStub } } }))
@@ -183,6 +188,17 @@ describe('resumable blob upload', () => {
 
     expect(response.status).toBe(400)
     expect(fs.existsSync(path.join(mediaDir, `${payloadHash}.part`))).toBe(false)
+  })
+
+  it('stays reachable through the legacy media route for un-updated devices', async () => {
+    await patchChunk(payloadHash, payload, 0, payload.length)
+
+    // A device still on the previous build asks for this file the old way.
+    expect(db.mediaObjects.get(`${SYNC_GROUP_ID}|${payloadHash}`)).toMatchObject({
+      sha256: payloadHash,
+      byteSize: payload.length,
+      mimeType: 'audio/mpeg',
+    })
   })
 
   it('refuses an upload without a device token', async () => {
