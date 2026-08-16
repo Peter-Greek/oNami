@@ -6,13 +6,19 @@ The host is a small relay service for oNami sync. It should hold sync-group data
 
 ## Core Design
 
-Use a mailbox/event-log model:
+A keyed, versioned record store:
 
 ```text
-Device A local DB -> push events -> Host event log -> pull events -> Device B local DB
+Device A local DB -> push records -> Host record store -> pull records -> Device B local DB
 ```
 
-Each device writes local changes first, records them in a sync outbox, and pushes them when online. The host stores events per sync group. Each device pulls events after its last acknowledged cursor and applies them to its local SQLite database.
+Each device writes local changes first, queues them in a keyed outbox, and pushes when online. The host keeps **one row per thing** — a deck, a card, a media reference — so re-saving a card replaces its row rather than appending another. The store stays the size of the library, not the size of its edit history.
+
+Each device pulls everything after the version it last saw. **A brand new device pulls from version 0 through the same endpoint every other device uses**, so hydration and ongoing sync are one code path. There is no snapshot, no source or target device, and nothing to acknowledge.
+
+Conflicts resolve on `mergeRank` before timestamps. For a card that is its review count: device clocks disagree, and last-writer-wins lets a desktop closed for a week overwrite reviews done on a phone that morning. Ranking by reviews first means the device that has studied more never loses. Deletions compare on time alone, so a studied card stays deletable. The host enforces this rather than trusting clients.
+
+Reviews are genuinely append-only and drive stats and streaks, so they have their own cursor-pulled stream.
 
 ## Service Components
 
