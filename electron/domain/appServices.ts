@@ -8,15 +8,17 @@ import { z } from 'zod'
 
 import { ApkgImporter } from './apkgImporter'
 import { createGlobalDecksClient, GLOBAL_DECKS_MAX_PUBLISH_CARDS } from '../../src/shared/globalDecks'
+import { createBlobClient, MEDIA_BATCH_SIZE, type BlobClient } from '../../src/shared/sync/blobClient'
 import {
-  getAvailableSnapshotMedia,
-  selectAvailableMediaBatch,
-  SNAPSHOT_MEDIA_BATCH_SIZE,
-} from '../../src/shared/snapshotTransfer'
-import { getPairingSnapshotPlan } from '../../src/shared/syncPairing'
-import { createBlobClient, type BlobClient } from '../../src/shared/sync/blobClient'
+  cardToRecord,
+  deckToRecord,
+  mediaToRecord,
+  readReviewLogEntry,
+  tombstone,
+} from '../../src/shared/sync/recordMapping'
+import type { RecordPage, SyncRecordEnvelope } from '../../src/shared/sync/records'
 import { createTransport, type Transport } from '../../src/shared/sync/transport'
-import { OnamiDatabase, type RemoteSyncEvent } from './database'
+import { OnamiDatabase } from './database'
 import { SchedulerService, selectCardsForMode, type StudySessionRuntime } from './scheduler'
 import type {
   AiGenerationOptions,
@@ -48,17 +50,14 @@ import type {
   SyncConfirmPairingInput,
   SyncConfirmPairingResult,
   SyncBackupState,
-  SyncEntityType,
-  SyncEventPayload,
-  SyncEventType,
   SyncHealthResult,
   SyncJoinPairingInput,
   SyncJoinPairingResult,
   SyncMediaRecord,
+  SyncReviewLogRecord,
   SyncProgressEvent,
   SyncRunResult,
   SyncRunOptions,
-  SyncSnapshotResponse,
   ThemeMode,
   TransferKind,
   TransferProgressEvent,
@@ -84,11 +83,12 @@ interface StoredSyncSettings {
   syncGroupId: string | null
   deviceToken: string | null
   deviceTokenExpiresAt: string | null
-  // Set when this device becomes the snapshot source; cleared once a full
-  // snapshot upload succeeds. Persisted so a failed seed is retried on next sync.
-  seedSnapshotPending: boolean
-  seedSnapshotTargetDeviceId: string | null
-  receiveSnapshotPending: boolean
+  /**
+   * Whether this device has queued its existing library for the first push.
+   * Replaces the snapshot seed/receive flags: there is no handoff to arrange,
+   * only a one-time backfill of what was here before syncing started.
+   */
+  libraryQueued: boolean
   syncRequested: boolean
 }
 
@@ -105,7 +105,10 @@ const GLOBAL_DECKS_SETTINGS_KEY = 'globalDecks.settings'
 const TRANSFERS_SETTINGS_KEY = 'transfers.records.v1'
 const DEFAULT_AI_MODEL = 'gpt-4o-mini'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
-const SNAPSHOT_POLL_DELAY_MS = 1_500
+/** Records per page, in both directions. Each page is durable on arrival. */
+const RECORD_PAGE_SIZE = 500
+/** Record and media traffic retries far longer than a control-plane call. */
+const TRANSFER_ATTEMPTS = 50
 const DEFAULT_APP_SETTINGS: AppSettings = {
   audioVolume: 0.8,
   themeMode: 'system',
@@ -157,9 +160,8 @@ export class AppServices {
         sync.syncGroupId &&
         (
           sync.syncRequested ||
-          sync.seedSnapshotPending ||
-          sync.receiveSnapshotPending ||
-          this.database.getPendingSyncEventCount() > 0
+          !sync.libraryQueued ||
+          this.database.getPendingRecordCount() > 0
         )
       ) {
         void this.syncNow().catch(() => {
@@ -267,7 +269,7 @@ export class AppServices {
 
   deleteDeck(deckId: string): void {
     this.database.deleteDeck(deckId)
-    this.queueSyncEvent('deck', deckId, 'deck.delete', {})
+    this.queueRecord(tombstone('deck', deckId))
   }
 
   resetDeckScheduling(deckId: string): void {
@@ -300,7 +302,7 @@ export class AppServices {
 
   deleteCard(cardId: string): void {
     this.database.deleteCard(cardId)
-    this.queueSyncEvent('card', cardId, 'card.delete', {})
+    this.queueRecord(tombstone('card', cardId))
   }
 
   importApkg(filePath: string, options: ImportApkgOptions): ImportResult {
@@ -404,7 +406,7 @@ export class AppServices {
 
       const resultDeckId = firstDeckId || firstCardDeckId || fallbackDeckId
       const deckName = resultDeckId ? this.database.getDeckSummary(resultDeckId).name : parsed.rootDeckName
-      this.queueFullSyncSnapshot()
+      this.queueImportedRecords()
       return {
         deckId: resultDeckId,
         deckName,
@@ -735,7 +737,6 @@ export class AppServices {
   answer(input: AnswerInput): AnswerResult {
     const session = this.sessions.get(input.sessionId)
     if (!session) throw new Error('Study session not found.')
-    const previous = this.database.getReviewState(input.cardId)
     const result = this.scheduler.answer(input, session)
 
     if (session.mode === 'unit-test') {
@@ -744,22 +745,10 @@ export class AppServices {
       return result
     }
 
-    const reviewedAt = this.database.getReviewState(input.cardId)?.lastReviewedAt ?? new Date().toISOString()
-    this.queueSyncEvent(
-      'review',
-      input.cardId,
-      'review.answer',
-      this.database.buildReviewAnswerSyncPayload({
-        cardId: input.cardId,
-        reviewedAt,
-        rating: input.rating,
-        elapsedMs: input.elapsedMs ?? 0,
-        revealMs: input.revealMs ?? 0,
-        answerMs: input.answerMs ?? 0,
-        previousDueAt: previous?.dueAt ?? null,
-        nextDueAt: result.nextDueAt,
-      })
-    )
+    // Answering does two things that sync separately: it moves the card's
+    // scheduling, which is a record whose rank rises with each review, and it
+    // appends to the review log, which is picked up by the unsent-review push.
+    this.queueCardUpsert(input.cardId)
     return result
   }
 
@@ -942,20 +931,20 @@ export class AppServices {
     })
 
     if (result.completed && result.syncGroupId) {
-      const snapshotPlan = getPairingSnapshotPlan(result, device.deviceId)
+      // Pairing now only establishes the sync group. Both devices push their
+      // records and pull each other's, which merges the libraries; there is no
+      // source, target, or direction to arrange.
       this.saveStoredSyncSettings({
         ...this.getStoredSyncSettings(),
         syncGroupId: result.syncGroupId,
-        seedSnapshotPending: Boolean(snapshotPlan.uploadTargetDeviceId),
-        seedSnapshotTargetDeviceId: snapshotPlan.uploadTargetDeviceId,
-        receiveSnapshotPending: snapshotPlan.downloadPending,
       })
-      const token = await this.requestSyncDeviceToken()
-      this.saveStoredSyncSettings({
-        ...this.getStoredSyncSettings(),
-        deviceToken: token.token,
-        deviceTokenExpiresAt: token.expiresAt,
-      })
+      await this.requestSyncDeviceToken().then((token) =>
+        this.saveStoredSyncSettings({
+          ...this.getStoredSyncSettings(),
+          deviceToken: token.token,
+          deviceTokenExpiresAt: token.expiresAt,
+        })
+      )
     }
 
     return result
@@ -1010,6 +999,16 @@ export class AppServices {
     return task
   }
 
+  /**
+   * One sync: push what changed, pull what is new, fetch any media the new
+   * records reference.
+   *
+   * A device that has never pushed queues its whole library first, and a device
+   * that has never pulled starts from cursor zero. Neither is a special case —
+   * there is no snapshot, no source and target device, and no handoff to
+   * acknowledge. Both directions page, and every page is durable, so an
+   * interruption resumes at the last page rather than the beginning.
+   */
   private async runSync(onProgress?: SyncProgressReporter): Promise<SyncRunResult> {
     const stored = this.getStoredSyncSettings()
     if (!stored.syncGroupId) throw new Error('Pair this device before syncing.')
@@ -1017,317 +1016,186 @@ export class AppServices {
     const token = await this.getValidSyncDeviceToken()
     onProgress?.({ stage: 'pairing', message: 'Sync device is paired.' })
 
-    // If this device is the snapshot source, (re)seed the one-time bundle. If it
-    // is a fresh device, hydrate from the source's snapshot. These are mutually
-    // exclusive in practice — a source has no snapshot to pull, a target has no
-    // pending seed — so ordering is safe.
-    await this.maybeSeedSnapshot(onProgress)
-    const hydratedFromSnapshot = await this.hydrateFromSnapshot(token, onProgress)
+    this.ensureLibraryQueued()
 
-    let pushedEvents = 0
+    let pushed = 0
     while (true) {
-      const pending = this.database.listPendingSyncEvents(100)
+      const pending = this.database.listPendingRecords(RECORD_PAGE_SIZE)
       if (pending.length === 0) break
       onProgress?.({
         stage: 'push',
-        message: `Uploading local events ${pushedEvents + 1}-${pushedEvents + pending.length}.`,
-        current: pushedEvents,
-        total: pushedEvents + pending.length,
-        itemType: 'event',
+        message: `Uploading changes ${pushed + 1}-${pushed + pending.length}.`,
+        current: pushed,
+        total: pushed + this.database.getPendingRecordCount(),
+        itemType: 'card',
       })
-      await this.syncHostRequest<{ accepted: number; highestAcceptedSequence: number }>('/sync/events', {
+      await this.syncHostRequest<{ accepted: number; superseded: number; nextCursor: number }>('/records', {
         method: 'POST',
         token,
-        body: { events: pending },
+        body: { records: pending },
+        attempts: TRANSFER_ATTEMPTS,
       })
-      this.database.markSyncEventsPushed(pending.map((event) => event.eventId))
-      pushedEvents += pending.length
-      onProgress?.({
-        stage: 'push',
-        message: `Uploaded ${pushedEvents} local event${pushedEvents === 1 ? '' : 's'}.`,
-        current: pushedEvents,
-        total: pushedEvents + this.database.getPendingSyncEventCount(),
-        itemType: 'event',
-      })
+      this.database.markRecordsPushed(pending)
+      pushed += pending.length
     }
 
-    let pulledEvents = 0
-    let appliedEvents = 0
-    let cursor = this.database.getSyncHostCursor()
+    let sentReviews = 0
+    while (true) {
+      const entries = this.database.listUnsentReviewLogs(RECORD_PAGE_SIZE)
+      if (entries.length === 0) break
+      await this.syncHostRequest<{ accepted: number }>('/review-log', {
+        method: 'POST',
+        token,
+        body: { entries },
+        attempts: TRANSFER_ATTEMPTS,
+      })
+      this.database.markReviewLogsSent(entries.map((entry) => entry.id))
+      sentReviews += entries.length
+    }
 
+    let pulled = 0
+    let applied = 0
+    let cursor = this.database.getRecordCursor()
     while (true) {
       onProgress?.({
         stage: 'pull',
-        message: `Checking host updates after cursor ${cursor}.`,
-        current: pulledEvents,
-        itemType: 'event',
+        message: cursor === 0 ? 'Fetching your library.' : 'Checking for changes.',
+        current: pulled,
+        itemType: 'card',
       })
-      const result = await this.syncHostRequest<{
-        events: RemoteSyncEvent[]
-        nextCursor: number
-      }>(`/sync/events?after=${cursor}&limit=100`, {
-        method: 'GET',
-        token,
+      const page = await this.syncHostRequest<RecordPage>(
+        `/records?since=${cursor}&limit=${RECORD_PAGE_SIZE}`,
+        { method: 'GET', token, attempts: TRANSFER_ATTEMPTS }
+      )
+      if (page.records.length === 0) break
+
+      const result = this.database.applyRecordPage(page.records)
+      applied += result.applied
+      pulled += page.records.length
+      // Advanced only after the page is committed, so an interruption re-reads
+      // that page instead of skipping it.
+      cursor = page.nextCursor
+      this.database.setRecordCursor(cursor)
+
+      onProgress?.({
+        stage: 'apply',
+        message: `Applied ${applied} item${applied === 1 ? '' : 's'}.`,
+        current: applied,
+        total: pulled,
+        itemType: 'card',
       })
-
-      pulledEvents += result.events.length
-      for (const event of result.events) {
-        onProgress?.({
-          stage: 'apply',
-          message: `Applying ${event.eventType} update.`,
-          current: appliedEvents + 1,
-          total: pulledEvents,
-          itemType: event.entityType,
-          itemName: event.entityId,
-        })
-        if (this.database.applyRemoteSyncEvent(event)) appliedEvents += 1
-      }
-      cursor = result.nextCursor
-      this.database.setSyncHostCursor(cursor)
-
-      if (result.events.length < 100) break
+      if (page.records.length < RECORD_PAGE_SIZE) break
     }
 
-    onProgress?.({ stage: 'ack', message: `Acknowledging host cursor ${cursor}.`, current: cursor })
-    await this.syncHostRequest<{ ok: boolean }>('/sync/ack', {
-      method: 'POST',
-      token,
-      body: { lastEventId: cursor },
-    })
+    let reviewCursor = this.database.getReviewLogCursor()
+    while (true) {
+      const page = await this.syncHostRequest<{ entries: unknown[]; nextCursor: number }>(
+        `/review-log?since=${reviewCursor}&limit=${RECORD_PAGE_SIZE}`,
+        { method: 'GET', token, attempts: TRANSFER_ATTEMPTS }
+      )
+      if (page.entries.length === 0) break
+      const entries = page.entries
+        .map((entry) => readReviewLogEntry(entry))
+        .filter((entry): entry is SyncReviewLogRecord => entry !== null)
+      this.database.applyReviewLogEntries(entries)
+      reviewCursor = page.nextCursor
+      this.database.setReviewLogCursor(reviewCursor)
+      if (page.entries.length < RECORD_PAGE_SIZE) break
+    }
 
-    if (appliedEvents > 0 || hydratedFromSnapshot) this.sessions.clear()
+    await this.uploadMissingMedia(onProgress)
+    await this.downloadMissingMedia(onProgress)
+
+    if (applied > 0) this.sessions.clear()
     onProgress?.({
       stage: 'complete',
-      message: `Sync complete. Sent ${pushedEvents}, received ${pulledEvents}, applied ${appliedEvents}.`,
+      message: `Sync complete. Sent ${pushed}, received ${pulled}, applied ${applied}.`,
     })
 
     return {
-      pushedEvents,
-      pulledEvents,
-      appliedEvents,
-      pendingEvents: this.database.getPendingSyncEventCount(),
-      lastHostCursor: this.database.getSyncHostCursor(),
+      pushedEvents: pushed + sentReviews,
+      pulledEvents: pulled,
+      appliedEvents: applied,
+      pendingEvents: this.database.getPendingRecordCount(),
+      lastHostCursor: this.database.getRecordCursor(),
       ...this.database.getSyncBackupSummary(),
     }
   }
 
-  private async maybeSeedSnapshot(onProgress?: SyncProgressReporter): Promise<void> {
+  /**
+   * Queues the whole library the first time this device syncs. After that only
+   * actual edits are queued — the previous build re-queued every card in the
+   * library after every import, which is what filled the host's event table.
+   */
+  private ensureLibraryQueued(): void {
     const stored = this.getStoredSyncSettings()
-    if (!stored.seedSnapshotPending || !stored.syncGroupId) return
-    await this.uploadFullSnapshot(onProgress)
-    this.saveStoredSyncSettings({
-      ...this.getStoredSyncSettings(),
-      seedSnapshotPending: false,
-      seedSnapshotTargetDeviceId: null,
-    })
+    if (stored.libraryQueued) return
+    this.database.enqueueRecords(this.database.buildLibraryRecords())
+    this.saveStoredSyncSettings({ ...this.getStoredSyncSettings(), libraryQueued: true })
   }
 
-  private async uploadFullSnapshot(onProgress?: SyncProgressReporter): Promise<void> {
-    const stored = this.getStoredSyncSettings()
-    if (!stored.deviceId || !stored.syncGroupId) return
+  /**
+   * Uploads any media this device holds that the host does not.
+   *
+   * A media record tells other devices a file exists; this puts the bytes where
+   * they can fetch them. The host is asked which hashes it is missing first, so
+   * a file already uploaded by another device is never sent twice, and a
+   * partially uploaded one continues from its offset.
+   */
+  private async uploadMissingMedia(onProgress?: SyncProgressReporter): Promise<void> {
+    const local = this.database.listMediaRecords()
+    if (local.length === 0) return
 
-    const token = await this.getValidSyncDeviceToken()
-    const snapshot = this.database.buildFullSnapshot()
-    const totalItems = snapshot.decks.length + snapshot.cards.length + snapshot.reviewLogs.length + snapshot.media.length
-    onProgress?.({
-      stage: 'snapshot-upload',
-      message: `Preparing full snapshot with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
-      current: 0,
-      total: totalItems,
-    })
+    const plan = await this.blobs.check(local.map((media) => media.sha256))
+    const needed = new Set([...plan.missing, ...plan.partial.map((item) => item.sha256)])
+    const pending = local.filter((media) => needed.has(media.sha256))
+    if (pending.length === 0) return
 
-    const publishManifest = (uploadComplete: boolean) =>
-      this.syncHostRequest<{ ok: boolean }>('/sync/snapshot', {
-        method: 'POST',
-        token,
-        body: {
-          snapshot,
-          targetDeviceId: stored.seedSnapshotTargetDeviceId,
-          uploadComplete,
-        },
-      })
-
-    // Publish first, then upload bounded batches so the target can download in
-    // parallel with the source instead of waiting for the entire upload.
-    await publishManifest(false)
-    for (let index = 0; index < snapshot.media.length; index += SNAPSHOT_MEDIA_BATCH_SIZE) {
-      const batch = snapshot.media.slice(index, index + SNAPSHOT_MEDIA_BATCH_SIZE)
+    for (let index = 0; index < pending.length; index += MEDIA_BATCH_SIZE) {
+      const batch = pending.slice(index, index + MEDIA_BATCH_SIZE)
       onProgress?.({
         stage: 'snapshot-upload',
-        message: `Uploading media ${index + 1}-${Math.min(index + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
+        message: `Uploading media ${index + 1}-${Math.min(index + batch.length, pending.length)} of ${pending.length}.`,
         current: index,
-        total: snapshot.media.length,
+        total: pending.length,
         itemType: 'media',
         itemName: batch[0]?.originalName,
       })
       await Promise.all(batch.map((media) => this.uploadMediaBlob(media)))
-      onProgress?.({
-        stage: 'snapshot-upload',
-        message: `Uploaded media ${Math.min(index + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
-        current: Math.min(index + batch.length, snapshot.media.length),
-        total: snapshot.media.length,
-        itemType: 'media',
-        itemName: batch[batch.length - 1]?.originalName,
-      })
     }
-
-    onProgress?.({
-      stage: 'snapshot-upload',
-      message: `Uploading full snapshot ${totalItems}/${totalItems}.`,
-      current: totalItems,
-      total: totalItems,
-    })
-    await publishManifest(true)
-  }
-
-  private async hydrateFromSnapshot(token: string, onProgress?: SyncProgressReporter): Promise<boolean> {
-    const waitForSnapshot = this.getStoredSyncSettings().receiveSnapshotPending
-    let response: SyncSnapshotResponse
-    let waitingForManifest = false
-    while (true) {
-      try {
-        onProgress?.({
-          stage: 'snapshot-download',
-          message: waitingForManifest
-            ? 'Waiting for the source device to publish its card and media manifest.'
-            : 'Checking for initial content snapshot.',
-        })
-        response = await this.syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', {
-          method: 'GET',
-          token,
-        })
-      } catch (error) {
-        if (waitForSnapshot) throw error
-        // A host without snapshot support falls back to event-only sync.
-        return false
-      }
-      if (response.snapshot) break
-      if (!waitForSnapshot) return false
-      waitingForManifest = true
-      await new Promise<void>((resolve) => setTimeout(resolve, SNAPSHOT_POLL_DELAY_MS))
-    }
-    const snapshot = response.snapshot
-
-    const totalItems =
-      snapshot.decks.length +
-      snapshot.cards.length +
-      snapshot.reviewLogs.length +
-      snapshot.media.length
-    onProgress?.({
-      stage: 'snapshot-download',
-      message: `Received snapshot manifest with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
-      current: 0,
-      total: totalItems,
-    })
-
-    // Apply cards immediately; media streams independently in durable batches.
-    for (const [index, deck] of snapshot.decks.entries()) {
-      onProgress?.({
-        stage: 'apply',
-        message: `Applying deck ${index + 1}/${snapshot.decks.length}: ${deck.name}.`,
-        current: index + 1,
-        total: snapshot.decks.length,
-        itemType: 'deck',
-        itemName: deck.name,
-      })
-    }
-    for (const [index, card] of snapshot.cards.entries()) {
-      onProgress?.({
-        stage: 'apply',
-        message: `Applying card ${index + 1}/${snapshot.cards.length}.`,
-        current: index + 1,
-        total: snapshot.cards.length,
-        itemType: 'card',
-        itemName: card.card.id,
-      })
-    }
-    if (snapshot.reviewLogs.length > 0) {
-      onProgress?.({
-        stage: 'apply',
-        message: `Applying ${snapshot.reviewLogs.length} review history entr${snapshot.reviewLogs.length === 1 ? 'y' : 'ies'}.`,
-        current: snapshot.reviewLogs.length,
-        total: snapshot.reviewLogs.length,
-        itemType: 'review',
-      })
-    }
-    this.database.applySnapshot(snapshot)
-
-    while (true) {
-      const downloadedSha256 = new Set(
-        snapshot.media.filter((media) => this.database.hasMediaHash(media.sha256)).map((media) => media.sha256)
-      )
-      const batch = selectAvailableMediaBatch(
-        snapshot.media,
-        downloadedSha256,
-        getAvailableSnapshotMedia(response, snapshot.media)
-      )
-
-      if (batch.length > 0) {
-        onProgress?.({
-          stage: 'snapshot-download',
-          message: `Downloading available media batch ${downloadedSha256.size + 1}-${Math.min(downloadedSha256.size + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
-          current: downloadedSha256.size,
-          total: snapshot.media.length,
-          itemType: 'media',
-          itemName: batch[0]?.originalName,
-        })
-        await Promise.all(batch.map((media) => this.downloadMediaBlob(media)))
-        const downloadedMediaCount = snapshot.media.filter((media) =>
-          this.database.hasMediaHash(media.sha256)
-        ).length
-        onProgress?.({
-          stage: 'snapshot-download',
-          message: `Saved media ${downloadedMediaCount}/${snapshot.media.length}.`,
-          current: downloadedMediaCount,
-          total: snapshot.media.length,
-          itemType: 'media',
-          itemName: batch[batch.length - 1]?.originalName,
-        })
-      }
-
-      const downloadedMediaCount = snapshot.media.filter((media) =>
-        this.database.hasMediaHash(media.sha256)
-      ).length
-      if (downloadedMediaCount === snapshot.media.length && response.uploadComplete !== false) break
-
-      if (batch.length === 0) {
-        onProgress?.({
-          stage: 'snapshot-download',
-          message: `Waiting for the next uploaded media batch. Saved ${downloadedMediaCount}/${snapshot.media.length}.`,
-          current: downloadedMediaCount,
-          total: snapshot.media.length,
-          itemType: 'media',
-        })
-        await new Promise<void>((resolve) => setTimeout(resolve, SNAPSHOT_POLL_DELAY_MS))
-      }
-
-      const nextResponse = await this.syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', {
-        method: 'GET',
-        token,
-      })
-      if (!nextResponse.snapshot) {
-        throw new Error('The full snapshot is no longer available. Restart pairing to continue.')
-      }
-      response = nextResponse
-    }
-
-    // Confirm receipt so the host can clean up the snapshot bundle and its media.
-    onProgress?.({ stage: 'ack', message: 'Acknowledging initial snapshot.' })
-    await this.syncHostRequest<{ ok: boolean }>('/sync/snapshot/ack', {
-      method: 'POST',
-      token,
-      body: {},
-    })
-    this.saveStoredSyncSettings({ ...this.getStoredSyncSettings(), receiveSnapshotPending: false })
-    return true
   }
 
   /**
-   * Uploads one media file, resuming from whatever the host already holds.
-   *
-   * Transfers retry indefinitely: a phone that loses signal mid-file should
-   * continue when it returns, not surface an error the user has to act on.
+   * Fetches any media the applied records reference but this device lacks.
+   * Derived by comparing what records described against what is stored, so it
+   * is correct after any interruption without a separate download queue.
    */
+  private async downloadMissingMedia(onProgress?: SyncProgressReporter): Promise<void> {
+    const missing = this.database.listMissingMedia()
+    if (missing.length === 0) return
+
+    for (let index = 0; index < missing.length; index += MEDIA_BATCH_SIZE) {
+      const batch = missing.slice(index, index + MEDIA_BATCH_SIZE)
+      onProgress?.({
+        stage: 'snapshot-download',
+        message: `Downloading media ${index + 1}-${Math.min(index + batch.length, missing.length)} of ${missing.length}.`,
+        current: index,
+        total: missing.length,
+        itemType: 'media',
+        itemName: batch[0]?.originalName,
+      })
+      await Promise.all(batch.map((media) => this.downloadMediaBlob(media)))
+    }
+
+    onProgress?.({
+      stage: 'snapshot-download',
+      message: `Saved ${missing.length} media file${missing.length === 1 ? '' : 's'}.`,
+      current: missing.length,
+      total: missing.length,
+      itemType: 'media',
+    })
+  }
+
   private async uploadMediaBlob(media: SyncMediaRecord, onProgress?: (sent: number) => void): Promise<void> {
     const data = this.database.readMediaBytesByHash(media.sha256)
     if (!data) throw new Error(`Media ${media.originalName} is missing from local storage.`)
@@ -1465,9 +1333,7 @@ export class AppServices {
       syncGroupId: null,
       deviceToken: null,
       deviceTokenExpiresAt: null,
-      seedSnapshotPending: false,
-      seedSnapshotTargetDeviceId: null,
-      receiveSnapshotPending: false,
+      libraryQueued: false,
       syncRequested: false,
     })
   }
@@ -1520,40 +1386,41 @@ export class AppServices {
   }
 
   private queueDeckUpsert(deckId: string): void {
-    this.queueSyncEvent('deck', deckId, 'deck.upsert', this.database.buildDeckSyncPayload(deckId))
+    this.queueRecord(deckToRecord(this.database.buildDeckSyncPayload(deckId).deck))
   }
 
   private queueCardUpsert(cardId: string): void {
-    this.queueSyncEvent('card', cardId, 'card.upsert', this.database.buildCardSyncPayload(cardId))
+    this.queueRecord(cardToRecord(this.database.buildCardSyncPayload(cardId)))
   }
 
-  private queueFullSyncSnapshot(): void {
+  /**
+   * Queues one record for the next sync.
+   *
+   * Keyed by what it describes, so editing the same card twice before a sync
+   * replaces the queued row rather than queueing a second copy. The previous
+   * build appended an event per edit and re-queued the entire library after
+   * every import.
+   */
+  /**
+   * Queues everything an import created or changed: its decks, its cards, and
+   * the media they reference. The previous build re-queued the entire library
+   * after every import, which is what filled the host's event table.
+   */
+  private queueImportedRecords(): void {
     const stored = this.getStoredSyncSettings()
     if (!stored.deviceId || !stored.syncGroupId) return
-
-    for (const deck of this.database.listSyncDeckPayloads()) {
-      this.queueSyncEvent('deck', deck.deck.id, 'deck.upsert', deck)
-    }
-    for (const card of this.database.listSyncCardPayloads()) {
-      this.queueSyncEvent('card', card.card.id, 'card.upsert', card)
-    }
+    this.database.enqueueRecords([
+      ...this.database.listSyncDeckPayloads().map((payload) => deckToRecord(payload.deck)),
+      ...this.database.listSyncCardPayloads().map(cardToRecord),
+      ...this.database.listMediaRecords().map(mediaToRecord),
+    ])
+    this.scheduleAutoSync()
   }
 
-  private queueSyncEvent(
-    entityType: SyncEntityType,
-    entityId: string,
-    eventType: SyncEventType,
-    payload: SyncEventPayload
-  ): void {
+  private queueRecord(record: SyncRecordEnvelope): void {
     const stored = this.getStoredSyncSettings()
     if (!stored.deviceId || !stored.syncGroupId) return
-    this.database.enqueueSyncEvent({
-      deviceId: stored.deviceId,
-      entityType,
-      entityId,
-      eventType,
-      payload,
-    })
+    this.database.enqueueRecord(record)
     this.scheduleAutoSync()
   }
 

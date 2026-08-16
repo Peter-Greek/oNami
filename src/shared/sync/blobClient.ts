@@ -19,6 +19,13 @@ import {
   nextChunkBytes,
 } from './transport'
 
+/**
+ * Files transferred at once. This was three while every transfer was fragile —
+ * one failure restarted the whole run, so small batches limited the damage.
+ * Transfers now resume from a byte offset, so it is sized for throughput.
+ */
+export const MEDIA_BATCH_SIZE = 6
+
 export interface BlobDescriptor {
   sha256: string
   byteSize: number

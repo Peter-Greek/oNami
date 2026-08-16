@@ -1,13 +1,19 @@
 import { createEmptyCard, fsrs, Rating, State, type Card as FsrsCard, type Grade } from 'ts-fsrs'
 
 import { createGlobalDecksClient, GLOBAL_DECKS_MAX_PUBLISH_CARDS } from './shared/globalDecks'
+import { createBlobClient, MEDIA_BATCH_SIZE } from './shared/sync/blobClient'
 import {
-  getAvailableSnapshotMedia,
-  selectAvailableMediaBatch,
-  SNAPSHOT_MEDIA_BATCH_SIZE,
-} from './shared/snapshotTransfer'
-import { getPairingSnapshotPlan } from './shared/syncPairing'
-import { createBlobClient } from './shared/sync/blobClient'
+  buildLibraryRecords,
+  cardToRecord,
+  deckToRecord,
+  readCardRecord,
+  readDeckRecord,
+  readMediaRecord,
+  readReviewLogEntry,
+  tombstone,
+} from './shared/sync/recordMapping'
+import { validateRecordEnvelope } from './shared/sync/records'
+import type { RecordPage, StoredSyncRecord, SyncRecordEnvelope } from './shared/sync/records'
 import { createTransport } from './shared/sync/transport'
 import { shouldNotifyNativeTransfer } from './shared/transferNotifications'
 
@@ -42,23 +48,15 @@ import type {
   SyncCardUpsertPayload,
   SyncConfirmPairingInput,
   SyncConfirmPairingResult,
-  SyncDeckRecord,
   SyncDeckUpsertPayload,
-  SyncEntityType,
-  SyncEventRecord,
-  SyncEventPayload,
-  SyncEventType,
   SyncHealthResult,
   SyncJoinPairingInput,
   SyncJoinPairingResult,
   SyncMediaRecord,
   SyncProgressEvent,
-  SyncReviewAnswerPayload,
   SyncReviewLogRecord,
   SyncRunResult,
   SyncRunOptions,
-  SyncSnapshotBundle,
-  SyncSnapshotResponse,
   SyncStartPairingResult,
   ThemeMode,
   TransferKind,
@@ -152,13 +150,26 @@ interface BrowserSyncSettings {
   syncGroupId: string | null
   deviceToken: string | null
   deviceTokenExpiresAt: string | null
+  /**
+   * Cursor into the old event log. Kept only so an existing install's backup
+   * indicator still reads correctly; nothing pulls with it any more.
+   */
   lastHostCursor: number
-  nextSyncSequence: number
+  /**
+   * Cursor into the record stream. Deliberately separate from lastHostCursor:
+   * an upgrading device already holds a high event cursor, and reusing it would
+   * start the record pull past most of the library and silently skip it.
+   */
+  recordCursor: number
+  reviewLogCursor: number
   backedUpEvents: number
   lastBackedUpAt: string | null
-  seedSnapshotPending: boolean
-  seedSnapshotTargetDeviceId: string | null
-  receiveSnapshotPending: boolean
+  /**
+   * Whether this phone has queued its existing library for the first push.
+   * Replaces the snapshot seed/receive flags: there is no handoff to arrange,
+   * only a one-time backfill of what was here before syncing started.
+   */
+  libraryQueued: boolean
   syncRequested: boolean
 }
 
@@ -178,13 +189,17 @@ interface BrowserTransferRecord extends TransferProgressEvent {
 
 const STORAGE_KEY = 'onami.android.mvp.v1'
 const SYNC_SETTINGS_KEY = 'onami.sync.settings'
-const SYNC_OUTBOX_KEY = 'onami.sync.outbox'
 const SYNC_PROGRESS_KEY = 'onami.sync.progress'
 const TRANSFER_RECORDS_KEY = 'onami.transfer.records.v1'
 const DEFAULT_SYNC_HOST_URL = 'http://147.135.31.128:41729'
 const AUTO_SYNC_DELAY_MS = 500
-const SNAPSHOT_POLL_DELAY_MS = 1_500
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const RECORD_OUTBOX_KEY = 'onami.sync.records.outbox.v1'
+const MEDIA_INDEX_KEY = 'onami.sync.media.index.v1'
+const REVIEW_SENT_KEY = 'onami.sync.reviews.sent.v1'
+/** Records per page, in both directions. Each page is durable on arrival. */
+const RECORD_PAGE_SIZE = 500
+/** Record and media traffic retries far longer than a control-plane call. */
+const TRANSFER_ATTEMPTS = 50
 const syncProgressListeners = new Set<(event: SyncProgressEvent) => void>()
 const transferProgressListeners = new Set<(event: TransferProgressEvent) => void>()
 let browserWakeLock: { release?: () => Promise<void> } | null = null
@@ -275,13 +290,11 @@ const readSyncSettings = (): BrowserSyncSettings => {
       deviceToken: parsed.deviceToken ?? null,
       deviceTokenExpiresAt: parsed.deviceTokenExpiresAt ?? null,
       lastHostCursor: typeof parsed.lastHostCursor === 'number' ? parsed.lastHostCursor : 0,
-      nextSyncSequence:
-        typeof parsed.nextSyncSequence === 'number' && parsed.nextSyncSequence > 0 ? parsed.nextSyncSequence : 1,
+      recordCursor: typeof parsed.recordCursor === 'number' ? parsed.recordCursor : 0,
+      reviewLogCursor: typeof parsed.reviewLogCursor === 'number' ? parsed.reviewLogCursor : 0,
       backedUpEvents: typeof parsed.backedUpEvents === 'number' ? parsed.backedUpEvents : 0,
       lastBackedUpAt: parsed.lastBackedUpAt ?? null,
-      seedSnapshotPending: Boolean(parsed.seedSnapshotPending),
-      seedSnapshotTargetDeviceId: parsed.seedSnapshotTargetDeviceId ?? null,
-      receiveSnapshotPending: Boolean(parsed.receiveSnapshotPending),
+      libraryQueued: Boolean(parsed.libraryQueued),
       syncRequested: Boolean(parsed.syncRequested),
     }
   } catch {
@@ -295,12 +308,11 @@ const readSyncSettings = (): BrowserSyncSettings => {
       deviceToken: null,
       deviceTokenExpiresAt: null,
       lastHostCursor: 0,
-      nextSyncSequence: 1,
+      recordCursor: 0,
+      reviewLogCursor: 0,
       backedUpEvents: 0,
       lastBackedUpAt: null,
-      seedSnapshotPending: false,
-      seedSnapshotTargetDeviceId: null,
-      receiveSnapshotPending: false,
+      libraryQueued: false,
       syncRequested: false,
     }
   }
@@ -424,86 +436,6 @@ const waitForTransfer = async <T,>(id: string): Promise<T> => {
   }
 }
 
-const readSyncOutbox = (): SyncEventRecord[] => {
-  try {
-    const raw = localStorage.getItem(SYNC_OUTBOX_KEY)
-    const parsed = raw ? JSON.parse(raw) : []
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((event): event is SyncEventRecord =>
-      Boolean(
-        event &&
-          typeof event.eventId === 'string' &&
-          typeof event.sourceDeviceId === 'string' &&
-          typeof event.sequence === 'number' &&
-          typeof event.entityType === 'string' &&
-          typeof event.entityId === 'string' &&
-          typeof event.eventType === 'string' &&
-          typeof event.createdAt === 'string'
-      )
-    )
-  } catch {
-    return []
-  }
-}
-
-const writeSyncOutbox = (events: SyncEventRecord[]) => {
-  localStorage.setItem(SYNC_OUTBOX_KEY, JSON.stringify(events))
-}
-
-const isUuid = (value: unknown): value is string => typeof value === 'string' && UUID_PATTERN.test(value)
-
-const isValidTimestamp = (value: unknown): value is string =>
-  typeof value === 'string' && Number.isFinite(Date.parse(value))
-
-const normalizeSyncOutboxForUpload = (): SyncEventRecord[] => {
-  const settings = readSyncSettings()
-  const events = readSyncOutbox().sort((left, right) => left.sequence - right.sequence)
-  const usedSequences = new Set<number>()
-  let nextSequence = 1
-  let changed = false
-
-  const normalized = events.map((event) => {
-    const next: SyncEventRecord = { ...event }
-
-    if (!isUuid(next.eventId)) {
-      next.eventId = crypto.randomUUID()
-      changed = true
-    }
-    if (settings.deviceId && next.sourceDeviceId !== settings.deviceId) {
-      next.sourceDeviceId = settings.deviceId
-      changed = true
-    }
-    if (!Number.isInteger(next.sequence) || next.sequence <= 0 || usedSequences.has(next.sequence)) {
-      while (usedSequences.has(nextSequence)) nextSequence += 1
-      next.sequence = nextSequence
-      changed = true
-    }
-    usedSequences.add(next.sequence)
-    nextSequence = Math.max(nextSequence, next.sequence + 1)
-
-    if (!isValidTimestamp(next.createdAt)) {
-      next.createdAt = nowIso()
-      changed = true
-    }
-    if (!next.payload || typeof next.payload !== 'object' || Array.isArray(next.payload)) {
-      next.payload = {}
-      changed = true
-    }
-
-    return next
-  })
-
-  if (changed) {
-    writeSyncOutbox(normalized)
-    const highestSequence = Math.max(0, ...normalized.map((event) => event.sequence))
-    if (readSyncSettings().nextSyncSequence <= highestSequence) {
-      writeSyncSettings({ ...readSyncSettings(), nextSyncSequence: highestSequence + 1 })
-    }
-  }
-
-  return normalized
-}
-
 const readSyncProgressState = (): BrowserSyncProgressState => {
   try {
     const raw = localStorage.getItem(SYNC_PROGRESS_KEY)
@@ -572,15 +504,15 @@ const syncStatusFromSettings = (settings: BrowserSyncSettings) => {
     deviceName: settings.deviceName,
     syncGroupId: settings.syncGroupId,
     paired: Boolean(settings.syncGroupId),
-    pendingEvents: readSyncOutbox().length,
-    lastHostCursor: settings.lastHostCursor,
+    pendingEvents: readRecordOutbox().length,
+    lastHostCursor: settings.recordCursor,
     backedUpEvents: settings.backedUpEvents,
     lastBackedUpAt: settings.lastBackedUpAt,
     backupState: !settings.syncGroupId
       ? ('not-paired' as const)
-      : readSyncOutbox().length > 0
+      : readRecordOutbox().length > 0
         ? ('needs-sync' as const)
-        : settings.backedUpEvents > 0 || settings.lastHostCursor > 0
+        : settings.backedUpEvents > 0 || settings.recordCursor > 0
           ? ('backed-up' as const)
           : ('no-data' as const),
     activeProgress: progress.active ? (progress.events[0] ?? null) : null,
@@ -966,10 +898,10 @@ const runBrowseDownloadTransfer = async (initial: BrowserTransferRecord): Promis
   // restored and safely queues these idempotent upserts on the next launch.
   const importedDeckIds = new Set(Object.values(localDeckIds))
   for (const deck of state.decks.filter((item) => importedDeckIds.has(item.id))) {
-    enqueueSyncEvent('deck', deck.id, 'deck.upsert', buildDeckSyncPayload(deck))
+    enqueueRecord(deckToRecord(buildDeckSyncPayload(deck).deck))
   }
   for (const card of state.cards.filter((item) => importedDeckIds.has(item.deckId))) {
-    enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
+    enqueueRecord(cardToRecord(buildCardSyncPayload(card)))
   }
   const result = toSummary(state, root)
   emitTransferProgress(record.id, {
@@ -1594,17 +1526,6 @@ const getStats = (state: StoredState, filter?: StatsFilterInput): AppStats => {
   }
 }
 
-interface RemoteSyncEvent {
-  hostEventId: number
-  eventId: string
-  sourceDeviceId: string
-  sequence: number
-  entityType: SyncEntityType
-  entityId: string
-  eventType: SyncEventType
-  payload: SyncEventPayload
-  createdAt: string
-}
 
 const normalizeNoteType = (value: string): NoteTypeName => {
   const lower = value.toLowerCase()
@@ -1672,165 +1593,9 @@ const applyCardUpsert = (state: StoredState, payload: SyncCardUpsertPayload): bo
   return true
 }
 
-const applyReviewAnswer = (state: StoredState, event: RemoteSyncEvent): boolean => {
-  const payload = event.payload as SyncReviewAnswerPayload
-  const card = state.cards.find((item) => item.id === payload.cardId)
-  if (!card) return false
-  const reviewState = payload.reviewState
-  card.state = reviewState.state
-  card.dueAt = reviewState.dueAt
-  card.stability = reviewState.stability
-  card.difficulty = reviewState.difficulty
-  card.elapsedDays = reviewState.elapsedDays
-  card.scheduledDays = reviewState.scheduledDays
-  card.learningSteps = reviewState.learningSteps
-  card.reps = reviewState.reps
-  card.lapses = reviewState.lapses
-  card.successRate = reviewState.successRate
-  card.lastRating = reviewState.lastRating
-  card.lastReviewedAt = reviewState.lastReviewedAt
-  card.updatedAt = payload.reviewedAt
-  if (!state.reviewLog.some((log) => log.id === event.eventId)) {
-    state.reviewLog.push({
-      id: event.eventId,
-      cardId: payload.cardId,
-      reviewedAt: payload.reviewedAt,
-      rating: payload.rating,
-      elapsedMs: payload.elapsedMs,
-      revealMs: payload.revealMs,
-      answerMs: payload.answerMs,
-      previousDueAt: payload.previousDueAt,
-      nextDueAt: payload.nextDueAt,
-    })
-  }
-  return true
-}
-
-const applyRemoteSyncEvent = (state: StoredState, event: RemoteSyncEvent): boolean => {
-  switch (event.eventType) {
-    case 'deck.upsert':
-      return applyDeckUpsert(state, event.payload as SyncDeckUpsertPayload)
-    case 'deck.delete': {
-      const deckIds = new Set(getDescendantDeckIds(state, event.entityId))
-      const removedCardIds = new Set(
-        state.cards.filter((card) => deckIds.has(card.deckId)).map((card) => card.id)
-      )
-      const changed =
-        state.decks.some((deck) => deckIds.has(deck.id)) || removedCardIds.size > 0
-      state.decks = state.decks.filter((deck) => !deckIds.has(deck.id))
-      state.cards = state.cards.filter((card) => !deckIds.has(card.deckId))
-      state.reviewLog = state.reviewLog.filter((log) => !removedCardIds.has(log.cardId))
-      return changed
-    }
-    case 'card.upsert':
-      return applyCardUpsert(state, event.payload as SyncCardUpsertPayload)
-    case 'card.delete': {
-      const changed = state.cards.some((card) => card.id === event.entityId)
-      state.cards = state.cards.filter((card) => card.id !== event.entityId)
-      state.reviewLog = state.reviewLog.filter((log) => log.cardId !== event.entityId)
-      return changed
-    }
-    case 'review.answer':
-      return applyReviewAnswer(state, event)
-    default:
-      return false
-  }
-}
-
 const base64ByteLength = (base64: string): number => {
   const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0
   return Math.max(0, Math.floor((base64.length * 3) / 4) - padding)
-}
-
-const buildSnapshot = (state: StoredState): SyncSnapshotBundle => ({
-  version: 1,
-  decks: state.decks.map(
-    (deck): SyncDeckRecord => ({
-      id: deck.id,
-      parentId: deck.parentId,
-      name: deck.name,
-      source: deck.source,
-      sourceId: null,
-      unitTestScore: deck.unitTestScore,
-      unitTestedAt: deck.unitTestedAt,
-      createdAt: deck.createdAt,
-      updatedAt: deck.updatedAt,
-    })
-  ),
-  cards: state.cards.map(
-    (card): SyncCardUpsertPayload => ({
-      version: 1,
-      note: {
-        id: card.noteId,
-        deckId: card.deckId,
-        noteType: card.noteType,
-        fields: card.fields,
-        tags: card.tags,
-        sourceGuid: null,
-        createdAt: card.createdAt,
-        updatedAt: card.updatedAt,
-      },
-      card: {
-        id: card.id,
-        noteId: card.noteId,
-        deckId: card.deckId,
-        templateOrd: card.templateOrd,
-        frontHtml: card.frontHtml,
-        backHtml: card.backHtml,
-        mediaRefs: extractMediaIds(`${card.frontHtml}\n${card.backHtml}`),
-        sourceCardId: null,
-        statsResetAt: null,
-        createdAt: card.createdAt,
-        updatedAt: card.updatedAt,
-      },
-      reviewState: {
-        dueAt: card.dueAt,
-        state: card.state,
-        stability: card.stability,
-        difficulty: card.difficulty,
-        elapsedDays: card.elapsedDays,
-        scheduledDays: card.scheduledDays,
-        learningSteps: card.learningSteps,
-        reps: card.reps,
-        lapses: card.lapses,
-        successRate: card.successRate,
-        lastRating: card.lastRating,
-        lastReviewedAt: card.lastReviewedAt,
-      },
-    })
-  ),
-  reviewLogs: state.reviewLog.map(
-    (log): SyncReviewLogRecord => ({
-      id: log.id,
-      cardId: log.cardId,
-      reviewedAt: log.reviewedAt,
-      rating: log.rating,
-      elapsedMs: log.elapsedMs,
-      revealMs: log.revealMs,
-      answerMs: log.answerMs,
-      previousDueAt: log.previousDueAt,
-      nextDueAt: log.nextDueAt,
-    })
-  ),
-  media: state.media.map(
-    (media): SyncMediaRecord => ({
-      id: media.id,
-      sha256: media.sha256,
-      mimeType: media.mimeType,
-      byteSize: base64ByteLength(media.dataBase64),
-      originalName: media.originalName,
-    })
-  ),
-})
-
-const applySnapshotBundle = (state: StoredState, bundle: SyncSnapshotBundle): void => {
-  for (const deck of bundle.decks) applyDeckUpsert(state, { version: 1, deck })
-  for (const card of bundle.cards) applyCardUpsert(state, card)
-  for (const log of bundle.reviewLogs) {
-    if (!state.reviewLog.some((entry) => entry.id === log.id)) {
-      state.reviewLog.push({ ...log })
-    }
-  }
 }
 
 const buildDeckSyncPayload = (deck: StoredDeck): SyncDeckUpsertPayload => ({
@@ -1889,150 +1654,320 @@ const buildCardSyncPayload = (card: StoredCard): SyncCardUpsertPayload => ({
   },
 })
 
-const buildReviewAnswerSyncPayload = (input: {
-  card: StoredCard
-  reviewedAt: string
-  rating: ReviewRating
-  elapsedMs: number
-  revealMs: number
-  answerMs: number
-  previousDueAt: string | null
-  nextDueAt: string | null
-}): SyncReviewAnswerPayload => ({
-  version: 1,
-  cardId: input.card.id,
-  reviewedAt: input.reviewedAt,
-  rating: input.rating,
-  elapsedMs: input.elapsedMs,
-  revealMs: input.revealMs,
-  answerMs: input.answerMs,
-  previousDueAt: input.previousDueAt,
-  nextDueAt: input.nextDueAt,
-  reviewState: buildCardSyncPayload(input.card).reviewState,
-})
+const readRecordOutbox = (): SyncRecordEnvelope[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RECORD_OUTBOX_KEY) || '[]') as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((record): record is SyncRecordEnvelope => validateRecordEnvelope(record) === null)
+  } catch {
+    return []
+  }
+}
 
-const enqueueSyncEvent = (
-  entityType: SyncEntityType,
-  entityId: string,
-  eventType: SyncEventType,
-  payload: SyncEventPayload
-): void => {
+const writeRecordOutbox = (records: SyncRecordEnvelope[]): void => {
+  localStorage.setItem(RECORD_OUTBOX_KEY, JSON.stringify(records))
+}
+
+const enqueueRecord = (record: SyncRecordEnvelope): void => {
   const settings = readSyncSettings()
   if (!settings.deviceId || !settings.syncGroupId) return
 
-  const outbox = readSyncOutbox()
-  const sequence = Math.max(settings.nextSyncSequence, ...outbox.map((event) => event.sequence + 1), 1)
-  const event: SyncEventRecord = {
-    eventId: crypto.randomUUID(),
-    sourceDeviceId: settings.deviceId,
-    sequence,
-    entityType,
-    entityId,
-    eventType,
-    payload,
-    createdAt: nowIso(),
-  }
-
-  writeSyncOutbox([...outbox, event])
-  writeSyncSettings({
-    ...settings,
-    nextSyncSequence: sequence + 1,
-  })
+  const key = `${record.kind}|${record.recordId}`
+  const outbox = readRecordOutbox().filter((item) => `${item.kind}|${item.recordId}` !== key)
+  writeRecordOutbox([...outbox, record])
   scheduleBrowserAutoSync()
 }
 
-const markSyncEventsPushed = (eventIds: string[]): void => {
-  if (eventIds.length === 0) return
-  const sent = new Set(eventIds)
-  const current = readSyncOutbox()
-  const remaining = current.filter((event) => !sent.has(event.eventId))
-  const removedCount = current.length - remaining.length
-  if (removedCount === 0) return
-
-  const timestamp = nowIso()
-  writeSyncOutbox(remaining)
-  writeSyncSettings({
-    ...readSyncSettings(),
-    backedUpEvents: readSyncSettings().backedUpEvents + removedCount,
-    lastBackedUpAt: timestamp,
-  })
-}
-
-const pushPendingSyncEvents = async (token: string): Promise<number> => {
-  let pushedEvents = 0
-  while (true) {
-    const pending = normalizeSyncOutboxForUpload().slice(0, 100)
-    if (pending.length === 0) break
-
-    emitSyncProgress({
-      stage: 'push',
-      message: `Uploading local events ${pushedEvents + 1}-${pushedEvents + pending.length}.`,
-      current: pushedEvents,
-      total: pushedEvents + pending.length,
-      itemType: 'event',
-    })
-    await syncHostRequest<{ accepted: number; highestAcceptedSequence: number }>('/sync/events', {
-      method: 'POST',
-      token,
-      body: { events: pending },
-    })
-    markSyncEventsPushed(pending.map((event) => event.eventId))
-    pushedEvents += pending.length
-    emitSyncProgress({
-      stage: 'push',
-      message: `Uploaded ${pushedEvents} local event${pushedEvents === 1 ? '' : 's'}.`,
-      current: pushedEvents,
-      total: pushedEvents + readSyncOutbox().length,
-      itemType: 'event',
-    })
-  }
-  return pushedEvents
-}
-
-const uploadFullSnapshot = async (): Promise<void> => {
+const enqueueRecords = (records: SyncRecordEnvelope[]): void => {
   const settings = readSyncSettings()
   if (!settings.deviceId || !settings.syncGroupId) return
 
-  const token = await getValidSyncDeviceToken()
-  const state = readState()
-  const snapshot = buildSnapshot(state)
-  const totalItems = snapshot.decks.length + snapshot.cards.length + snapshot.reviewLogs.length + snapshot.media.length
-  emitSyncProgress({
-    stage: 'snapshot-upload',
-    message: `Preparing full snapshot with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
-    current: 0,
-    total: totalItems,
+  const byKey = new Map(readRecordOutbox().map((item) => [`${item.kind}|${item.recordId}`, item]))
+  for (const record of records) byKey.set(`${record.kind}|${record.recordId}`, record)
+  writeRecordOutbox([...byKey.values()])
+  scheduleBrowserAutoSync()
+}
+
+/**
+ * Clears rows only if nothing re-queued them while the push was in flight, so
+ * an edit made during a slow upload is not silently dropped.
+ */
+const markRecordsPushed = (pushed: SyncRecordEnvelope[]): void => {
+  if (pushed.length === 0) return
+  const sent = new Map(pushed.map((record) => [`${record.kind}|${record.recordId}`, record]))
+  const remaining = readRecordOutbox().filter((record) => {
+    const match = sent.get(`${record.kind}|${record.recordId}`)
+    return !match || match.updatedAt !== record.updatedAt || match.mergeRank !== record.mergeRank
+  })
+  const removed = readRecordOutbox().length - remaining.length
+  if (removed === 0) return
+
+  writeRecordOutbox(remaining)
+  writeSyncSettings({
+    ...readSyncSettings(),
+    backedUpEvents: readSyncSettings().backedUpEvents + removed,
+    lastBackedUpAt: nowIso(),
+  })
+}
+
+/** Everything this library holds, for a device that has never pushed. */
+const buildLibraryRecordsFromState = (state: StoredState): SyncRecordEnvelope[] =>
+  buildLibraryRecords({
+    decks: state.decks.map((deck) => buildDeckSyncPayload(deck).deck),
+    cards: state.cards.map((card) => buildCardSyncPayload(card)),
+    media: state.media.map((media) => ({
+      id: media.id,
+      sha256: media.sha256,
+      mimeType: media.mimeType,
+      byteSize: base64ByteLength(media.dataBase64),
+      originalName: media.originalName,
+    })),
   })
 
-  const publishManifest = (uploadComplete: boolean) =>
-    syncHostRequest('/sync/snapshot', {
+/**
+ * Applies one page of records. A record whose payload cannot be read is skipped
+ * rather than thrown, so one bad row cannot wedge sync for every device.
+ */
+const applyRecordPage = (state: StoredState, records: StoredSyncRecord[]): { applied: number; skipped: number } => {
+  let applied = 0
+  let skipped = 0
+
+  for (const record of records) {
+    if (record.kind === 'deck') {
+      if (record.deleted) {
+        state.decks = state.decks.filter((deck) => deck.id !== record.recordId)
+      } else {
+        const deck = readDeckRecord(record)
+        if (!deck) {
+          skipped += 1
+          continue
+        }
+        applyDeckUpsert(state, { version: 1, deck })
+      }
+    } else if (record.kind === 'card') {
+      if (record.deleted) {
+        state.cards = state.cards.filter((card) => card.id !== record.recordId)
+      } else {
+        const payload = readCardRecord(record)
+        if (!payload) {
+          skipped += 1
+          continue
+        }
+        applyCardUpsert(state, payload)
+      }
+    } else if (record.kind === 'media') {
+      const media = readMediaRecord(record)
+      if (!media) {
+        skipped += 1
+        continue
+      }
+      const index = readMediaIndex().filter((item) => item.sha256 !== media.sha256)
+      writeMediaIndex(record.deleted ? index : [...index, media])
+    } else {
+      skipped += 1
+      continue
+    }
+    applied += 1
+  }
+
+  return { applied, skipped }
+}
+
+/**
+ * Media this library is supposed to have, learned from media records. Compared
+ * against what is actually stored to decide what to download, so an interrupted
+ * download is retried without re-reading the record stream.
+ */
+const readMediaIndex = (): SyncMediaRecord[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(MEDIA_INDEX_KEY) || '[]') as unknown
+    return Array.isArray(parsed) ? (parsed as SyncMediaRecord[]).filter((item) => typeof item?.sha256 === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+const writeMediaIndex = (media: SyncMediaRecord[]): void => {
+  localStorage.setItem(MEDIA_INDEX_KEY, JSON.stringify(media))
+}
+
+const listMissingMedia = (): SyncMediaRecord[] => {
+  const stored = new Set(readState().media.map((item) => item.sha256))
+  return readMediaIndex().filter((item) => !stored.has(item.sha256))
+}
+
+/** Reviews already sent, so the append-only stream is pushed once each. */
+const readSentReviewIds = (): Set<string> => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(REVIEW_SENT_KEY) || '[]') as unknown
+    return new Set(Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
+const markReviewsSent = (ids: string[]): void => {
+  const sent = readSentReviewIds()
+  for (const id of ids) sent.add(id)
+  localStorage.setItem(REVIEW_SENT_KEY, JSON.stringify([...sent]))
+}
+
+const listUnsentReviewLogs = (limit = 500): SyncReviewLogRecord[] => {
+  const sent = readSentReviewIds()
+  return readState()
+    .reviewLog.filter((entry) => !sent.has(entry.id))
+    .slice(0, limit)
+    .map((entry) => ({ ...entry }))
+}
+
+/**
+ * One sync: push what changed, pull what is new, move the media those records
+ * reference.
+ *
+ * A phone that has never pushed queues its whole library first, and a phone
+ * that has never pulled starts from cursor zero. Neither is a special case —
+ * there is no snapshot to seed, poll for, or acknowledge, and no source or
+ * target device to arrange.
+ */
+const pushPendingRecords = async (token: string): Promise<number> => {
+  let pushed = 0
+  while (true) {
+    const pending = readRecordOutbox().slice(0, RECORD_PAGE_SIZE)
+    if (pending.length === 0) break
+    emitSyncProgress({
+      stage: 'push',
+      message: `Uploading changes ${pushed + 1}-${pushed + pending.length}.`,
+      current: pushed,
+      total: pushed + readRecordOutbox().length,
+      itemType: 'card',
+    })
+    await syncHostRequest('/records', {
       method: 'POST',
       token,
-      body: {
-        snapshot,
-        targetDeviceId: settings.seedSnapshotTargetDeviceId,
-        uploadComplete,
-      },
+      body: { records: pending },
+      attempts: TRANSFER_ATTEMPTS,
     })
+    markRecordsPushed(pending)
+    pushed += pending.length
+  }
+  return pushed
+}
 
-  // Publish the manifest first so the target can apply cards immediately and
-  // begin downloading each media batch as soon as it reaches the host.
-  await publishManifest(false)
-  const mediaByHash = new Map(state.media.map((media) => [media.sha256, media]))
-  for (let index = 0; index < snapshot.media.length; index += SNAPSHOT_MEDIA_BATCH_SIZE) {
-    const batch = snapshot.media.slice(index, index + SNAPSHOT_MEDIA_BATCH_SIZE)
+const pushPendingReviewLogs = async (token: string): Promise<number> => {
+  let sent = 0
+  while (true) {
+    const entries = listUnsentReviewLogs(RECORD_PAGE_SIZE)
+    if (entries.length === 0) break
+    await syncHostRequest('/review-log', {
+      method: 'POST',
+      token,
+      body: { entries },
+      attempts: TRANSFER_ATTEMPTS,
+    })
+    markReviewsSent(entries.map((entry) => entry.id))
+    sent += entries.length
+  }
+  return sent
+}
+
+const pullRecords = async (token: string): Promise<{ pulled: number; applied: number }> => {
+  let pulled = 0
+  let applied = 0
+  let cursor = readSyncSettings().recordCursor
+
+  while (true) {
+    emitSyncProgress({
+      stage: 'pull',
+      message: cursor === 0 ? 'Fetching your library.' : 'Checking for changes.',
+      current: pulled,
+      itemType: 'card',
+    })
+    const page = await syncHostRequest<RecordPage>(
+      `/records?since=${cursor}&limit=${RECORD_PAGE_SIZE}`,
+      { method: 'GET', token, attempts: TRANSFER_ATTEMPTS }
+    )
+    if (page.records.length === 0) break
+
+    const state = readState()
+    const result = applyRecordPage(state, page.records)
+    writeState(state)
+    // Persisted before the cursor advances, so a crash re-reads this page
+    // rather than skipping past it.
+    await flushState()
+
+    applied += result.applied
+    pulled += page.records.length
+    cursor = page.nextCursor
+    writeSyncSettings({ ...readSyncSettings(), recordCursor: cursor })
+
+    emitSyncProgress({
+      stage: 'apply',
+      message: `Applied ${applied} item${applied === 1 ? '' : 's'}.`,
+      current: applied,
+      total: pulled,
+      itemType: 'card',
+    })
+    if (page.records.length < RECORD_PAGE_SIZE) break
+  }
+
+  return { pulled, applied }
+}
+
+const pullReviewLogs = async (token: string): Promise<void> => {
+  let cursor = readSyncSettings().reviewLogCursor
+  while (true) {
+    const page = await syncHostRequest<{ entries: unknown[]; nextCursor: number }>(
+      `/review-log?since=${cursor}&limit=${RECORD_PAGE_SIZE}`,
+      { method: 'GET', token, attempts: TRANSFER_ATTEMPTS }
+    )
+    if (page.entries.length === 0) break
+
+    const state = readState()
+    const applied: string[] = []
+    for (const raw of page.entries) {
+      const entry = readReviewLogEntry(raw)
+      if (!entry) continue
+      if (!state.cards.some((card) => card.id === entry.cardId)) continue
+      if (state.reviewLog.some((existing) => existing.id === entry.id)) continue
+      state.reviewLog.push({ ...entry })
+      applied.push(entry.id)
+    }
+    writeState(state)
+    await flushState()
+    // A review that arrived from elsewhere must not be pushed back out.
+    markReviewsSent(applied)
+
+    cursor = page.nextCursor
+    writeSyncSettings({ ...readSyncSettings(), reviewLogCursor: cursor })
+    if (page.entries.length < RECORD_PAGE_SIZE) break
+  }
+}
+
+/**
+ * Uploads any media this phone holds that the host does not. The host is asked
+ * which hashes it is missing first, so a file another device already uploaded
+ * is never sent twice and a partial one continues from its offset.
+ */
+const uploadMissingMedia = async (): Promise<void> => {
+  const state = readState()
+  if (state.media.length === 0) return
+
+  const plan = await syncBlobs.check(state.media.map((media) => media.sha256))
+  const needed = new Set([...plan.missing, ...plan.partial.map((item) => item.sha256)])
+  const pending = state.media.filter((media) => needed.has(media.sha256))
+
+  for (let index = 0; index < pending.length; index += MEDIA_BATCH_SIZE) {
+    const batch = pending.slice(index, index + MEDIA_BATCH_SIZE)
     emitSyncProgress({
       stage: 'snapshot-upload',
-      message: `Uploading media ${index + 1}-${Math.min(index + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
+      message: `Uploading media ${index + 1}-${Math.min(index + batch.length, pending.length)} of ${pending.length}.`,
       current: index,
-      total: snapshot.media.length,
+      total: pending.length,
       itemType: 'media',
       itemName: batch[0]?.originalName,
     })
     await Promise.all(
-      batch.map((metadata) => {
-        const media = mediaByHash.get(metadata.sha256)
-        if (!media) throw new Error(`Media ${metadata.originalName} is missing from local storage.`)
+      batch.map((media) => {
         const bytes = bytesFromBase64(media.dataBase64)
         return syncBlobs.upload({
           blob: {
@@ -2045,202 +1980,34 @@ const uploadFullSnapshot = async (): Promise<void> => {
         })
       })
     )
+  }
+}
+
+/** Fetches media the applied records reference but this phone lacks. */
+const downloadMissingMedia = async (): Promise<void> => {
+  const missing = listMissingMedia()
+  for (const [index, media] of missing.entries()) {
     emitSyncProgress({
-      stage: 'snapshot-upload',
-      message: `Uploaded media ${Math.min(index + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
-      current: Math.min(index + batch.length, snapshot.media.length),
-      total: snapshot.media.length,
+      stage: 'snapshot-download',
+      message: `Downloading media ${index + 1} of ${missing.length}.`,
+      current: index,
+      total: missing.length,
       itemType: 'media',
-      itemName: batch[batch.length - 1]?.originalName,
+      itemName: media.originalName,
     })
+    await downloadMediaToState(media)
   }
-
-  emitSyncProgress({
-    stage: 'snapshot-upload',
-    message: `Uploading full snapshot ${totalItems}/${totalItems}.`,
-    current: totalItems,
-    total: totalItems,
-  })
-  await publishManifest(true)
 }
 
-const maybeSeedSnapshot = async (): Promise<void> => {
+/**
+ * Queues the whole library the first time this phone syncs. After that only
+ * actual edits are queued.
+ */
+const ensureLibraryQueued = (): void => {
   const settings = readSyncSettings()
-  if (!settings.seedSnapshotPending || !settings.syncGroupId) return
-  await uploadFullSnapshot()
-  writeSyncSettings({
-    ...readSyncSettings(),
-    seedSnapshotPending: false,
-    seedSnapshotTargetDeviceId: null,
-  })
-}
-
-const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
-  const waitForSnapshot = readSyncSettings().receiveSnapshotPending
-  let response: SyncSnapshotResponse
-  let waitingForManifest = false
-  while (true) {
-    try {
-      emitSyncProgress({
-        stage: 'snapshot-download',
-        message: waitingForManifest
-          ? 'Waiting for the source device to publish its card and media manifest.'
-          : 'Checking for initial content snapshot.',
-      })
-      response = await syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', { method: 'GET', token })
-    } catch (error) {
-      if (waitForSnapshot) throw error
-      // A host without snapshot support falls back to event-only sync.
-      return false
-    }
-    if (response.snapshot) break
-    if (!waitForSnapshot) return false
-    waitingForManifest = true
-    await new Promise<void>((resolve) => window.setTimeout(resolve, SNAPSHOT_POLL_DELAY_MS))
-  }
-  const snapshot = response.snapshot
-
-  const totalItems =
-    snapshot.decks.length +
-    snapshot.cards.length +
-    snapshot.reviewLogs.length +
-    snapshot.media.length
-  emitSyncProgress({
-    stage: 'snapshot-download',
-    message: `Received snapshot manifest with ${totalItems} item${totalItems === 1 ? '' : 's'}.`,
-    current: 0,
-    total: totalItems,
-  })
-
-  // Cards and review history do not need to wait for media. Persist them as
-  // soon as the source publishes the manifest while both devices stream blobs.
-  let state = readState()
-  for (const [index, deck] of snapshot.decks.entries()) {
-    emitSyncProgress({
-      stage: 'apply',
-      message: `Applying deck ${index + 1}/${snapshot.decks.length}: ${deck.name}.`,
-      current: index + 1,
-      total: snapshot.decks.length,
-      itemType: 'deck',
-      itemName: deck.name,
-    })
-  }
-  for (const [index, card] of snapshot.cards.entries()) {
-    emitSyncProgress({
-      stage: 'apply',
-      message: `Applying card ${index + 1}/${snapshot.cards.length}.`,
-      current: index + 1,
-      total: snapshot.cards.length,
-      itemType: 'card',
-      itemName: card.card.id,
-    })
-  }
-  if (snapshot.reviewLogs.length > 0) {
-    emitSyncProgress({
-      stage: 'apply',
-      message: `Applying ${snapshot.reviewLogs.length} review history entr${snapshot.reviewLogs.length === 1 ? 'y' : 'ies'}.`,
-      current: snapshot.reviewLogs.length,
-      total: snapshot.reviewLogs.length,
-      itemType: 'review',
-    })
-  }
-  applySnapshotBundle(state, snapshot)
-  writeState(state)
-  await flushState()
-
-  const persistMediaAliases = async (): Promise<void> => {
-    const current = readState()
-    let changed = false
-    for (const media of snapshot.media) {
-      if (current.media.some((item) => item.id === media.id)) continue
-      const existing = current.media.find((item) => item.sha256 === media.sha256)
-      if (!existing) continue
-      current.media.push({
-        ...existing,
-        id: media.id,
-        mimeType: media.mimeType,
-        originalName: media.originalName,
-      })
-      changed = true
-    }
-    if (changed) {
-      writeState(current)
-      await flushState()
-    }
-  }
-  await persistMediaAliases()
-
-  while (true) {
-    state = readState()
-    const downloadedSha256 = new Set(
-      snapshot.media
-        .filter((media) => state.media.some((item) => item.id === media.id && item.sha256 === media.sha256))
-        .map((media) => media.sha256)
-    )
-    const batch = selectAvailableMediaBatch(
-      snapshot.media,
-      downloadedSha256,
-      getAvailableSnapshotMedia(response, snapshot.media)
-    )
-
-    if (batch.length > 0) {
-      emitSyncProgress({
-        stage: 'snapshot-download',
-        message: `Downloading available media batch ${downloadedSha256.size + 1}-${Math.min(downloadedSha256.size + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
-        current: downloadedSha256.size,
-        total: snapshot.media.length,
-        itemType: 'media',
-        itemName: batch[0]?.originalName,
-      })
-      // Each file is durable as it lands, and a file interrupted part-way keeps
-      // its bytes staged, so a process death resumes mid-file rather than
-      // re-downloading the batch.
-      for (const media of batch) {
-        await downloadMediaToState(media)
-      }
-      state = readState()
-      await persistMediaAliases()
-      const downloadedMediaCount = snapshot.media.filter((media) =>
-        readState().media.some((item) => item.id === media.id && item.sha256 === media.sha256)
-      ).length
-      emitSyncProgress({
-        stage: 'snapshot-download',
-        message: `Saved media ${downloadedMediaCount}/${snapshot.media.length}.`,
-        current: downloadedMediaCount,
-        total: snapshot.media.length,
-        itemType: 'media',
-        itemName: batch[batch.length - 1]?.originalName,
-      })
-    }
-
-    const downloadedMediaCount = snapshot.media.filter((media) =>
-      readState().media.some((item) => item.id === media.id && item.sha256 === media.sha256)
-    ).length
-    if (downloadedMediaCount === snapshot.media.length && response.uploadComplete !== false) break
-
-    if (batch.length === 0) {
-      emitSyncProgress({
-        stage: 'snapshot-download',
-        message: `Waiting for the next uploaded media batch. Saved ${downloadedMediaCount}/${snapshot.media.length}.`,
-        current: downloadedMediaCount,
-        total: snapshot.media.length,
-        itemType: 'media',
-      })
-      await new Promise<void>((resolve) => window.setTimeout(resolve, SNAPSHOT_POLL_DELAY_MS))
-    }
-
-    const nextResponse = await syncHostRequest<SyncSnapshotResponse>('/sync/snapshot', { method: 'GET', token })
-    if (!nextResponse.snapshot) {
-      throw new Error('The full snapshot is no longer available. Restart pairing to continue.')
-    }
-    response = nextResponse
-  }
-
-  // Confirm receipt so the host clears the snapshot bundle and its media.
-  emitSyncProgress({ stage: 'ack', message: 'Acknowledging initial snapshot.' })
-  await syncHostRequest('/sync/snapshot/ack', { method: 'POST', token, body: {} })
-  writeSyncSettings({ ...readSyncSettings(), receiveSnapshotPending: false })
-  return true
+  if (settings.libraryQueued || !settings.syncGroupId) return
+  enqueueRecords(buildLibraryRecordsFromState(readState()))
+  writeSyncSettings({ ...readSyncSettings(), libraryQueued: true })
 }
 
 export const installBrowserOnami = async () => {
@@ -2277,7 +2044,7 @@ export const installBrowserOnami = async () => {
             updatedAt: timestamp,
           }
           state.decks.push(deck)
-          enqueueSyncEvent('deck', deck.id, 'deck.upsert', buildDeckSyncPayload(deck))
+          enqueueRecord(deckToRecord(buildDeckSyncPayload(deck).deck))
           return toSummary(state, deck)
         }),
       delete: async (deckId: string) =>
@@ -2287,7 +2054,7 @@ export const installBrowserOnami = async () => {
           state.decks = state.decks.filter((deck) => !deckIds.has(deck.id))
           state.cards = state.cards.filter((card) => !deletedCardIds.has(card.id))
           state.reviewLog = state.reviewLog.filter((log) => !deletedCardIds.has(log.cardId))
-          enqueueSyncEvent('deck', deckId, 'deck.delete', {})
+          enqueueRecord(tombstone('deck', deckId))
         }),
       resetScheduling: async (deckId: string) =>
         mutateState((state) => {
@@ -2307,7 +2074,7 @@ export const installBrowserOnami = async () => {
             card.lastRating = null
             card.lastReviewedAt = null
             card.updatedAt = nowIso()
-            enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
+            enqueueRecord(cardToRecord(buildCardSyncPayload(card)))
           })
         }),
       list: async () => {
@@ -2384,7 +2151,7 @@ export const installBrowserOnami = async () => {
           }
           state.cards.push(card)
           deck.updatedAt = timestamp
-          enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
+          enqueueRecord(cardToRecord(buildCardSyncPayload(card)))
           return toCardSummary(state, card)
         }),
       update: async (input: UpdateCardInput) =>
@@ -2401,14 +2168,14 @@ export const installBrowserOnami = async () => {
           if (input.backHtml !== undefined) card.backHtml = input.backHtml
           if (input.tags !== undefined) card.tags = input.tags
           card.updatedAt = nowIso()
-          enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
+          enqueueRecord(cardToRecord(buildCardSyncPayload(card)))
           return toCardSummary(state, card)
         }),
       delete: async (cardId: string) =>
         mutateState((state) => {
           state.cards = state.cards.filter((card) => card.id !== cardId)
           state.reviewLog = state.reviewLog.filter((log) => log.cardId !== cardId)
-          enqueueSyncEvent('card', cardId, 'card.delete', {})
+          enqueueRecord(tombstone('card', cardId))
         }),
     },
     study: {
@@ -2464,7 +2231,7 @@ export const installBrowserOnami = async () => {
               card.dueAt = testedAt
               if (card.state === 'New') card.state = 'Learning'
               card.updatedAt = testedAt
-              enqueueSyncEvent('card', card.id, 'card.upsert', buildCardSyncPayload(card))
+              enqueueRecord(cardToRecord(buildCardSyncPayload(card)))
             }
 
             session.answered.push({ cardId: input.cardId, rating: input.rating })
@@ -2479,7 +2246,7 @@ export const installBrowserOnami = async () => {
               deck.unitTestScore = unitScore
               deck.unitTestedAt = testedAt
               deck.updatedAt = testedAt
-              enqueueSyncEvent('deck', deck.id, 'deck.upsert', buildDeckSyncPayload(deck))
+              enqueueRecord(deckToRecord(buildDeckSyncPayload(deck).deck))
             }
 
             return {
@@ -2531,21 +2298,10 @@ export const installBrowserOnami = async () => {
             previousDueAt,
             nextDueAt,
           })
-          enqueueSyncEvent(
-            'review',
-            card.id,
-            'review.answer',
-            buildReviewAnswerSyncPayload({
-              card,
-              reviewedAt: card.lastReviewedAt,
-              rating: input.rating,
-              elapsedMs: input.elapsedMs ?? 0,
-              revealMs: input.revealMs ?? 0,
-              answerMs: input.answerMs ?? 0,
-              previousDueAt,
-              nextDueAt,
-            })
-          )
+          // Answering moves the card's scheduling, which is a record whose
+          // rank rises with each review. The review itself is appended to the
+          // log and picked up by the unsent-review push.
+          enqueueRecord(cardToRecord(buildCardSyncPayload(card)))
 
           session.answered.push({ cardId: input.cardId, rating: input.rating })
           const sessionComplete = session.answered.length >= session.cardIds.length
@@ -2601,6 +2357,8 @@ export const installBrowserOnami = async () => {
           deviceToken: sameHost ? current.deviceToken : null,
           deviceTokenExpiresAt: sameHost ? current.deviceTokenExpiresAt : null,
           lastHostCursor: sameHost ? current.lastHostCursor : 0,
+          recordCursor: sameHost ? current.recordCursor : 0,
+          reviewLogCursor: sameHost ? current.reviewLogCursor : 0,
           backedUpEvents: sameHost ? current.backedUpEvents : 0,
           lastBackedUpAt: sameHost ? current.lastBackedUpAt : null,
         }
@@ -2663,13 +2421,12 @@ export const installBrowserOnami = async () => {
           },
         })
         if (result.completed && result.syncGroupId) {
-          const snapshotPlan = getPairingSnapshotPlan(result, device.deviceId)
+          // Pairing now only establishes the sync group. Both devices push
+          // their records and pull each other's, which merges the libraries;
+          // there is no source, target, or direction to arrange.
           writeSyncSettings({
             ...readSyncSettings(),
             syncGroupId: result.syncGroupId,
-            seedSnapshotPending: Boolean(snapshotPlan.uploadTargetDeviceId),
-            seedSnapshotTargetDeviceId: snapshotPlan.uploadTargetDeviceId,
-            receiveSnapshotPending: snapshotPlan.downloadPending,
           })
           const token = await requestSyncDeviceToken()
           writeSyncSettings({
@@ -2708,74 +2465,27 @@ export const installBrowserOnami = async () => {
             const token = await getValidSyncDeviceToken()
             emitSyncProgress({ stage: 'pairing', message: 'Sync device is paired.' })
 
-            // Seed the snapshot if this phone is the source (retry after a failed
-            // confirm-time upload); otherwise hydrate from the source's one-time
-            // full snapshot (decks, cards, review-log history, media) before events.
-            await maybeSeedSnapshot()
-            const hydratedFromSnapshot = await hydrateFromSnapshot(token)
+            ensureLibraryQueued()
 
-            const pushedEvents = await pushPendingSyncEvents(token)
-            let pulledEvents = 0
-            let appliedEvents = 0
-            let cursor = readSyncSettings().lastHostCursor
+            const pushedRecords = await pushPendingRecords(token)
+            const sentReviews = await pushPendingReviewLogs(token)
+            const { pulled, applied } = await pullRecords(token)
+            await pullReviewLogs(token)
+            await uploadMissingMedia()
+            await downloadMissingMedia()
 
-            while (true) {
-              emitSyncProgress({
-                stage: 'pull',
-                message: `Checking host updates after cursor ${cursor}.`,
-                current: pulledEvents,
-                itemType: 'event',
-              })
-              const result = await syncHostRequest<{ events: RemoteSyncEvent[]; nextCursor: number }>(
-                `/sync/events?after=${cursor}&limit=100`,
-                { method: 'GET', token }
-              )
-
-              pulledEvents += result.events.length
-              if (result.events.length > 0) {
-                const state = readState()
-                for (const event of result.events) {
-                  emitSyncProgress({
-                    stage: 'apply',
-                    message: `Applying ${event.eventType} update.`,
-                    current: appliedEvents + 1,
-                    total: pulledEvents,
-                    itemType: event.entityType,
-                    itemName: event.entityId,
-                  })
-                  if (applyRemoteSyncEvent(state, event)) appliedEvents += 1
-                }
-                writeState(state)
-                // Persist applied events before advancing the cursor below;
-                // otherwise a crash would skip them on the next sync.
-                await flushState()
-              }
-
-              cursor = result.nextCursor
-              writeSyncSettings({ ...readSyncSettings(), lastHostCursor: cursor })
-
-              if (result.events.length < 100) break
-            }
-
-            emitSyncProgress({ stage: 'ack', message: `Acknowledging host cursor ${cursor}.`, current: cursor })
-            await syncHostRequest<{ ok: boolean }>('/sync/ack', {
-              method: 'POST',
-              token,
-              body: { lastEventId: cursor },
-            })
-
-            if (appliedEvents > 0 || hydratedFromSnapshot) sessions.clear()
+            if (applied > 0) sessions.clear()
             emitSyncProgress({
               stage: 'complete',
-              message: `Sync complete. Sent ${pushedEvents}, received ${pulledEvents}, applied ${appliedEvents}.`,
+              message: `Sync complete. Sent ${pushedRecords}, received ${pulled}, applied ${applied}.`,
             })
 
             const result = {
-              pushedEvents,
-              pulledEvents,
-              appliedEvents,
-              pendingEvents: readSyncOutbox().length,
-              lastHostCursor: cursor,
+              pushedEvents: pushedRecords + sentReviews,
+              pulledEvents: pulled,
+              appliedEvents: applied,
+              pendingEvents: readRecordOutbox().length,
+              lastHostCursor: readSyncSettings().recordCursor,
               backedUpEvents: readSyncSettings().backedUpEvents,
               lastBackedUpAt: readSyncSettings().lastBackedUpAt,
             }
@@ -2851,9 +2561,8 @@ export const installBrowserOnami = async () => {
       settings.syncGroupId &&
       (
         settings.syncRequested ||
-        settings.seedSnapshotPending ||
-        settings.receiveSnapshotPending ||
-        readSyncOutbox().length > 0
+        !settings.libraryQueued ||
+        readRecordOutbox().length > 0
       )
     ) {
       void api.sync.syncNow().catch(() => {

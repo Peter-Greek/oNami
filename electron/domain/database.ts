@@ -4,6 +4,13 @@ import { randomUUID, createHash } from 'node:crypto'
 import Database from 'better-sqlite3'
 import mime from 'mime-types'
 
+import {
+  buildLibraryRecords,
+  readCardRecord,
+  readDeckRecord,
+  readMediaRecord,
+} from '../../src/shared/sync/recordMapping'
+import type { StoredSyncRecord, SyncRecordEnvelope } from '../../src/shared/sync/records'
 import type {
   AppStats,
   CardSummary,
@@ -25,7 +32,6 @@ import type {
   SyncMediaRecord,
   SyncReviewAnswerPayload,
   SyncReviewLogRecord,
-  SyncSnapshotBundle,
   UpdateCardInput,
 } from '../../src/shared/types'
 
@@ -836,6 +842,277 @@ export class OnamiDatabase {
       .run(cursor, nowIso())
   }
 
+  // ---- Records ----
+  //
+  // The outbox is keyed by what a record describes, so queueing the same card
+  // twice replaces the pending row. The old event outbox appended per edit,
+  // which is why importing a deck queued an event for every card already in the
+  // library and the host's event table grew without bound.
+
+  enqueueRecord(record: SyncRecordEnvelope): void {
+    this.db
+      .prepare(
+        `INSERT INTO record_outbox
+          (record_key, kind, record_id, updated_at, deleted, merge_rank, payload_json, blob_refs_json, queued_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(record_key) DO UPDATE SET
+          updated_at = excluded.updated_at,
+          deleted = excluded.deleted,
+          merge_rank = excluded.merge_rank,
+          payload_json = excluded.payload_json,
+          blob_refs_json = excluded.blob_refs_json,
+          queued_at = excluded.queued_at`
+      )
+      .run(
+        `${record.kind}|${record.recordId}`,
+        record.kind,
+        record.recordId,
+        record.updatedAt,
+        record.deleted ? 1 : 0,
+        record.mergeRank,
+        json(record.payload),
+        json(record.blobRefs ?? []),
+        nowIso()
+      )
+  }
+
+  enqueueRecords(records: SyncRecordEnvelope[]): void {
+    const tx = this.db.transaction(() => {
+      for (const record of records) this.enqueueRecord(record)
+    })
+    tx()
+  }
+
+  listPendingRecords(limit = 500): SyncRecordEnvelope[] {
+    const rows = this.db
+      .prepare('SELECT * FROM record_outbox ORDER BY queued_at, record_key LIMIT ?')
+      .all(limit) as Row[]
+    return rows.map((row) => ({
+      kind: toStringValue(row.kind) as SyncRecordEnvelope['kind'],
+      recordId: toStringValue(row.record_id),
+      updatedAt: toStringValue(row.updated_at),
+      deleted: toNumber(row.deleted) === 1,
+      mergeRank: toNumber(row.merge_rank),
+      payload: JSON.parse(toStringValue(row.payload_json)) as unknown,
+      blobRefs: JSON.parse(toStringValue(row.blob_refs_json)) as string[],
+    }))
+  }
+
+  /**
+   * Clears rows only if nothing re-queued them while the push was in flight.
+   * Matching on the queued content, not just the key, means an edit made during
+   * a slow upload is not silently dropped.
+   */
+  markRecordsPushed(records: SyncRecordEnvelope[]): void {
+    if (records.length === 0) return
+    const statement = this.db.prepare(
+      'DELETE FROM record_outbox WHERE record_key = ? AND updated_at = ? AND merge_rank = ?'
+    )
+    const tx = this.db.transaction(() => {
+      for (const record of records) {
+        statement.run(`${record.kind}|${record.recordId}`, record.updatedAt, record.mergeRank)
+      }
+    })
+    tx()
+  }
+
+  getPendingRecordCount(): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS count FROM record_outbox').get() as Row
+    return toNumber(row.count)
+  }
+
+  getRecordCursor(): number {
+    const row = this.db
+      .prepare("SELECT last_host_event_id FROM sync_cursor WHERE id = 'records'")
+      .get() as Row | undefined
+    return row ? toNumber(row.last_host_event_id) : 0
+  }
+
+  setRecordCursor(cursor: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO sync_cursor (id, last_host_event_id, updated_at)
+         VALUES ('records', ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+          last_host_event_id = MAX(sync_cursor.last_host_event_id, excluded.last_host_event_id),
+          updated_at = excluded.updated_at`
+      )
+      .run(cursor, nowIso())
+  }
+
+  getReviewLogCursor(): number {
+    const row = this.db
+      .prepare("SELECT last_host_event_id FROM sync_cursor WHERE id = 'review-log'")
+      .get() as Row | undefined
+    return row ? toNumber(row.last_host_event_id) : 0
+  }
+
+  setReviewLogCursor(cursor: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO sync_cursor (id, last_host_event_id, updated_at)
+         VALUES ('review-log', ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+          last_host_event_id = MAX(sync_cursor.last_host_event_id, excluded.last_host_event_id),
+          updated_at = excluded.updated_at`
+      )
+      .run(cursor, nowIso())
+  }
+
+  /** Everything this library holds, for a device that has never pushed. */
+  buildLibraryRecords(): SyncRecordEnvelope[] {
+    return buildLibraryRecords({
+      decks: this.listSyncDeckPayloads().map((payload) => payload.deck),
+      cards: this.listSyncCardPayloads(),
+      media: this.listMediaRecords(),
+    })
+  }
+
+  /**
+   * Applies one page of records inside a single transaction, so an interrupted
+   * sync leaves the library consistent and the cursor un-advanced.
+   *
+   * A record whose payload cannot be read is skipped rather than thrown, so one
+   * bad row cannot wedge sync for every device in the group.
+   */
+  applyRecordPage(records: StoredSyncRecord[]): { applied: number; skipped: number } {
+    let applied = 0
+    let skipped = 0
+
+    const tx = this.db.transaction(() => {
+      for (const record of records) {
+        if (record.kind === 'deck') {
+          if (record.deleted) {
+            this.deleteDeckIfPresent(record.recordId)
+          } else {
+            const deck = readDeckRecord(record)
+            if (!deck) {
+              skipped += 1
+              continue
+            }
+            this.applyDeckUpsert({ version: 1, deck })
+          }
+        } else if (record.kind === 'card') {
+          if (record.deleted) {
+            this.deleteCardIfPresent(record.recordId)
+          } else {
+            const payload = readCardRecord(record)
+            if (!payload) {
+              skipped += 1
+              continue
+            }
+            this.applyCardUpsert(payload)
+          }
+        } else if (record.kind === 'media') {
+          const media = readMediaRecord(record)
+          if (!media) {
+            skipped += 1
+            continue
+          }
+          if (record.deleted) this.db.prepare('DELETE FROM media_index WHERE sha256 = ?').run(media.sha256)
+          else this.upsertMediaIndex(media)
+        } else {
+          skipped += 1
+          continue
+        }
+        applied += 1
+      }
+    })
+
+    tx()
+    return { applied, skipped }
+  }
+
+  private upsertMediaIndex(media: SyncMediaRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO media_index (sha256, media_id, mime_type, byte_size, original_name, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(sha256) DO UPDATE SET
+          media_id = excluded.media_id,
+          mime_type = excluded.mime_type,
+          byte_size = excluded.byte_size,
+          original_name = excluded.original_name,
+          updated_at = excluded.updated_at`
+      )
+      .run(media.sha256, media.id, media.mimeType, media.byteSize, media.originalName, nowIso())
+  }
+
+  /**
+   * Media this library is supposed to have but does not. Derived by comparing
+   * what records described against what is actually stored, so it is correct
+   * after any interruption without tracking a separate download queue.
+   */
+  listMissingMedia(): SyncMediaRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT i.sha256, i.media_id, i.mime_type, i.byte_size, i.original_name
+         FROM media_index i
+         WHERE NOT EXISTS (SELECT 1 FROM media m WHERE m.hash = i.sha256)`
+      )
+      .all() as Row[]
+    return rows.map((row) => ({
+      id: toStringValue(row.media_id),
+      sha256: toStringValue(row.sha256),
+      mimeType: toStringValue(row.mime_type),
+      byteSize: toNumber(row.byte_size),
+      originalName: toStringValue(row.original_name),
+    }))
+  }
+
+  /** Reviews not yet sent, matched against what the host has acknowledged. */
+  listUnsentReviewLogs(limit = 500): SyncReviewLogRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT r.id, r.card_id, r.reviewed_at, r.rating, r.elapsed_ms,
+            COALESCE(r.reveal_ms, 0) AS reveal_ms, COALESCE(r.answer_ms, 0) AS answer_ms,
+            r.previous_due_at, r.next_due_at
+         FROM review_log r
+         WHERE NOT EXISTS (SELECT 1 FROM review_log_sent s WHERE s.id = r.id)
+         ORDER BY r.reviewed_at
+         LIMIT ?`
+      )
+      .all(limit) as Row[]
+    return rows.map((row) => ({
+      id: toStringValue(row.id),
+      cardId: toStringValue(row.card_id),
+      reviewedAt: toStringValue(row.reviewed_at),
+      rating: toStringValue(row.rating) as ReviewRating,
+      elapsedMs: toNumber(row.elapsed_ms),
+      revealMs: toNumber(row.reveal_ms),
+      answerMs: toNumber(row.answer_ms),
+      previousDueAt: row.previous_due_at ? toStringValue(row.previous_due_at) : null,
+      nextDueAt: row.next_due_at ? toStringValue(row.next_due_at) : null,
+    }))
+  }
+
+  markReviewLogsSent(ids: string[]): void {
+    if (ids.length === 0) return
+    const statement = this.db.prepare(
+      'INSERT OR IGNORE INTO review_log_sent (id, sent_at) VALUES (?, ?)'
+    )
+    const tx = this.db.transaction(() => {
+      const timestamp = nowIso()
+      for (const id of ids) statement.run(id, timestamp)
+    })
+    tx()
+  }
+
+  applyReviewLogEntries(entries: SyncReviewLogRecord[]): number {
+    let applied = 0
+    const tx = this.db.transaction(() => {
+      for (const entry of entries) {
+        if (!this.hasCard(entry.cardId)) continue
+        this.insertReviewLogRecord(entry)
+        // A review that arrived from elsewhere must not be pushed back out.
+        this.db.prepare('INSERT OR IGNORE INTO review_log_sent (id, sent_at) VALUES (?, ?)').run(entry.id, nowIso())
+        applied += 1
+      }
+    })
+    tx()
+    return applied
+  }
+
   buildDeckSyncPayload(deckId: string): SyncDeckUpsertPayload {
     const row = this.db.prepare('SELECT * FROM decks WHERE id = ?').get(deckId) as Row | undefined
     if (!row) throw new Error('Deck not found.')
@@ -1076,32 +1353,6 @@ export class OnamiDatabase {
       .run(record.id, record.originalName, storedPath, record.mimeType, record.sha256, nowIso())
   }
 
-  buildFullSnapshot(): SyncSnapshotBundle {
-    return {
-      version: 1,
-      decks: this.listSyncDeckPayloads().map((payload) => payload.deck),
-      cards: this.listSyncCardPayloads(),
-      reviewLogs: this.listReviewLogRecords(),
-      media: this.listMediaRecords(),
-    }
-  }
-
-  /** Apply a full-data snapshot (decks, cards, review-log history). Media blobs are stored separately via saveMediaBlob. */
-  applySnapshot(bundle: SyncSnapshotBundle): void {
-    const tx = this.db.transaction(() => {
-      for (const deck of bundle.decks) {
-        this.applyDeckUpsert({ version: 1, deck })
-      }
-      for (const card of bundle.cards) {
-        this.applyCardUpsert(card)
-      }
-      for (const log of bundle.reviewLogs) {
-        if (this.hasCard(log.cardId)) this.insertReviewLogRecord(log)
-      }
-    })
-    tx()
-  }
-
   getStats(deckId?: string | null): AppStats {
     const allDecks = this.listDecks()
     const scopeDeckIds = deckId ? this.getDeckTreeIds(deckId) : allDecks.map((deck) => deck.id)
@@ -1324,6 +1575,41 @@ export class OnamiDatabase {
         updated_at TEXT NOT NULL
       );
 
+      -- Records waiting to be pushed, keyed by what they describe rather than
+      -- appended per edit. Saving the same card twice before a sync replaces
+      -- the queued row instead of queueing a second copy, so the outbox stays
+      -- the size of what actually changed.
+      CREATE TABLE IF NOT EXISTS record_outbox (
+        record_key TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        merge_rank INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL,
+        blob_refs_json TEXT NOT NULL DEFAULT '[]',
+        queued_at TEXT NOT NULL
+      );
+
+      -- Media this library knows about, learned from media records. A file is
+      -- downloaded by reconciling this against what is actually stored, so an
+      -- interrupted download is retried without re-reading the record stream.
+      -- Reviews already sent to the host, so the append-only review stream is
+      -- pushed once each rather than re-sent every sync.
+      CREATE TABLE IF NOT EXISTS review_log_sent (
+        id TEXT PRIMARY KEY,
+        sent_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS media_index (
+        sha256 TEXT PRIMARY KEY,
+        media_id TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        byte_size INTEGER NOT NULL DEFAULT 0,
+        original_name TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_cards_deck ON cards(deck_id);
       CREATE INDEX IF NOT EXISTS idx_notes_source ON notes(source_guid);
       CREATE INDEX IF NOT EXISTS idx_review_state_due ON review_state(due_at, state);
@@ -1331,6 +1617,7 @@ export class OnamiDatabase {
       CREATE INDEX IF NOT EXISTS idx_review_log_reviewed_at ON review_log(reviewed_at);
       CREATE INDEX IF NOT EXISTS idx_sync_outbox_pending ON sync_outbox(pushed_at, sequence);
       CREATE INDEX IF NOT EXISTS idx_sync_inbox_host_event ON sync_inbox(host_event_id);
+      CREATE INDEX IF NOT EXISTS idx_record_outbox_queued ON record_outbox(queued_at);
     `)
 
     this.ensureColumn('cards', 'stats_reset_at', 'TEXT')
