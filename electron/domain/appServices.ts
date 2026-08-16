@@ -14,6 +14,8 @@ import {
   SNAPSHOT_MEDIA_BATCH_SIZE,
 } from '../../src/shared/snapshotTransfer'
 import { getPairingSnapshotPlan } from '../../src/shared/syncPairing'
+import { createBlobClient, type BlobClient } from '../../src/shared/sync/blobClient'
+import { createTransport, type Transport } from '../../src/shared/sync/transport'
 import { OnamiDatabase, type RemoteSyncEvent } from './database'
 import { SchedulerService, selectCardsForMode, type StudySessionRuntime } from './scheduler'
 import type {
@@ -52,7 +54,6 @@ import type {
   SyncHealthResult,
   SyncJoinPairingInput,
   SyncJoinPairingResult,
-  SyncMediaBlob,
   SyncMediaRecord,
   SyncProgressEvent,
   SyncRunResult,
@@ -136,6 +137,8 @@ export class AppServices {
   private readonly sessions = new Map<string, StudySessionRuntime>()
   private autoSyncTimer: NodeJS.Timeout | null = null
   private syncInFlight: Promise<SyncRunResult> | null = null
+  private transportInstance: Transport | null = null
+  private blobClientInstance: BlobClient | null = null
   private readonly transferListeners = new Set<(event: TransferProgressEvent) => void>()
   private readonly globalTransfersInFlight = new Set<string>()
   private readonly globalDecks = createGlobalDecksClient({
@@ -479,10 +482,12 @@ export class AppServices {
       byteSize: item.byteSize,
       originalName: item.originalName,
     }))
-    const mediaBlobs: GlobalDeckMediaBlob[] = mediaRecords.flatMap((item) => {
-      const bytes = this.database.readMediaBytesByHash(item.sha256)
-      return bytes ? [{ sha256: item.sha256, mimeType: item.mimeType, dataBase64: bytes.toString('base64') }] : []
-    })
+    const readBlob = async (sha256: string): Promise<GlobalDeckMediaBlob | null> => {
+      const record = mediaRecords.find((item) => item.sha256 === sha256)
+      const bytes = this.database.readMediaBytesByHash(sha256)
+      if (!record || !bytes) return null
+      return { sha256, mimeType: record.mimeType, dataBase64: bytes.toString('base64') }
+    }
 
     const transfer = resumeRecord ?? this.createTransfer('browse-upload', localDeckId, deck.name)
     if (this.globalTransfersInFlight.has(transfer.id)) {
@@ -495,10 +500,10 @@ export class AppServices {
         title: `Uploading ${deck.name}`,
         message: 'Preparing deck contents.',
         current: 0,
-        total: Math.max(1, mediaBlobs.length + 2),
+        total: Math.max(1, media.length + 2),
       })
       const result = await this.globalDecks.publish(
-        { sourceDeckId: deck.id, name: deck.name, decks, media, mediaBlobs },
+        { sourceDeckId: deck.id, name: deck.name, decks, media, readBlob },
         (progress) => this.updateTransfer(transfer.id, {
           state: 'running',
           message: progress.message,
@@ -511,8 +516,8 @@ export class AppServices {
         state: 'completed',
         title: `Uploaded ${result.name}`,
         message: `Published ${result.cardCount} card${result.cardCount === 1 ? '' : 's'}.`,
-        current: Math.max(1, mediaBlobs.length + 2),
-        total: Math.max(1, mediaBlobs.length + 2),
+        current: Math.max(1, media.length + 2),
+        total: Math.max(1, media.length + 2),
         result,
       })
       return result
@@ -570,7 +575,6 @@ export class AppServices {
             total,
             itemName: media.originalName,
           })
-          const blob = await this.globalDecks.downloadMedia(media.sha256)
           const localId = this.database.saveGlobalMediaBlob(
             {
               id: media.sourceMediaId,
@@ -579,7 +583,7 @@ export class AppServices {
               byteSize: media.byteSize,
               originalName: media.originalName,
             },
-            Buffer.from(blob.dataBase64, 'base64')
+            await this.fetchPublishedMedia(media)
           )
           mediaIdMap.set(media.sourceMediaId, localId)
         } else {
@@ -1156,7 +1160,7 @@ export class AppServices {
         itemType: 'media',
         itemName: batch[0]?.originalName,
       })
-      await Promise.all(batch.map((media) => this.uploadMediaBlob(media, token)))
+      await Promise.all(batch.map((media) => this.uploadMediaBlob(media)))
       onProgress?.({
         stage: 'snapshot-upload',
         message: `Uploaded media ${Math.min(index + batch.length, snapshot.media.length)}/${snapshot.media.length}.`,
@@ -1267,7 +1271,7 @@ export class AppServices {
           itemType: 'media',
           itemName: batch[0]?.originalName,
         })
-        await Promise.all(batch.map((media) => this.downloadMediaBlob(media, token)))
+        await Promise.all(batch.map((media) => this.downloadMediaBlob(media)))
         const downloadedMediaCount = snapshot.media.filter((media) =>
           this.database.hasMediaHash(media.sha256)
         ).length
@@ -1318,23 +1322,101 @@ export class AppServices {
     return true
   }
 
-  private async uploadMediaBlob(media: SyncMediaRecord, token: string): Promise<void> {
+  /**
+   * Uploads one media file, resuming from whatever the host already holds.
+   *
+   * Transfers retry indefinitely: a phone that loses signal mid-file should
+   * continue when it returns, not surface an error the user has to act on.
+   */
+  private async uploadMediaBlob(media: SyncMediaRecord, onProgress?: (sent: number) => void): Promise<void> {
     const data = this.database.readMediaBytesByHash(media.sha256)
     if (!data) throw new Error(`Media ${media.originalName} is missing from local storage.`)
-    await this.syncHostRequest<{ sha256: string }>('/media', {
-      method: 'POST',
-      token,
-      body: { sha256: media.sha256, mimeType: media.mimeType, dataBase64: data.toString('base64') },
+
+    await this.blobs.upload({
+      blob: {
+        sha256: media.sha256,
+        byteSize: data.length,
+        mimeType: media.mimeType,
+        originalName: media.originalName,
+      },
+      read: async (offset, length) => data.subarray(offset, offset + length),
+      onProgress: (progress) => onProgress?.(progress.transferred),
     })
   }
 
-  private async downloadMediaBlob(media: SyncMediaRecord, token: string): Promise<void> {
+  private async downloadMediaBlob(media: SyncMediaRecord, onProgress?: (received: number) => void): Promise<void> {
     if (this.database.hasMediaHash(media.sha256)) return
-    const blob = await this.syncHostRequest<SyncMediaBlob>(`/media/${media.sha256}`, {
-      method: 'GET',
-      token,
+
+    // A partially downloaded file is staged beside the media store so an
+    // interrupted download continues from its byte offset instead of restarting.
+    const partialPath = this.mediaPartialPath(media.sha256)
+    const startOffset = fs.existsSync(partialPath) ? fs.statSync(partialPath).size : 0
+
+    await this.blobs.download({
+      blob: {
+        sha256: media.sha256,
+        byteSize: media.byteSize,
+        mimeType: media.mimeType,
+        originalName: media.originalName,
+      },
+      startOffset,
+      write: async (chunk, offset) => {
+        if (offset === 0) fs.writeFileSync(partialPath, chunk)
+        else fs.appendFileSync(partialPath, chunk)
+      },
+      onProgress: (progress) => onProgress?.(progress.transferred),
     })
-    this.database.saveMediaBlob(media, Buffer.from(blob.dataBase64, 'base64'))
+
+    const data = fs.readFileSync(partialPath)
+    try {
+      this.database.saveMediaBlob(media, data)
+    } finally {
+      fs.rmSync(partialPath, { force: true })
+    }
+  }
+
+  /**
+   * Fetches one published deck's media file.
+   *
+   * Prefers the resumable blob route, which streams raw bytes and continues an
+   * interrupted download from its offset. Decks published before the host
+   * indexed their media have no blob reference yet, so a 404 falls back to the
+   * original base64 route rather than failing the download.
+   */
+  private async fetchPublishedMedia(media: GlobalDeckMedia): Promise<Buffer> {
+    const partialPath = this.mediaPartialPath(media.sha256)
+    const startOffset = fs.existsSync(partialPath) ? fs.statSync(partialPath).size : 0
+
+    try {
+      await this.blobs.download({
+        blob: {
+          sha256: media.sha256,
+          byteSize: media.byteSize,
+          mimeType: media.mimeType,
+          originalName: media.originalName,
+        },
+        startOffset,
+        write: async (chunk, offset) => {
+          if (offset === 0) fs.writeFileSync(partialPath, chunk)
+          else fs.appendFileSync(partialPath, chunk)
+        },
+      })
+      const data = fs.readFileSync(partialPath)
+      fs.rmSync(partialPath, { force: true })
+      return data
+    } catch (error) {
+      fs.rmSync(partialPath, { force: true })
+      const status = (error as { status?: number | null }).status
+      if (status !== 404 && status !== 401) throw error
+      const blob = await this.globalDecks.downloadMedia(media.sha256)
+      return Buffer.from(blob.dataBase64, 'base64')
+    }
+  }
+
+  private mediaPartialPath(sha256: string): string {
+    const partialDir = path.join(os.tmpdir(), 'onami-partial-media')
+    fs.mkdirSync(partialDir, { recursive: true })
+    return path.join(partialDir, `${sha256}.part`)
   }
 
   private rewriteMedia(html: string, mediaIdByName: Map<string, string>): string {
@@ -1530,38 +1612,53 @@ export class AppServices {
     return token.token
   }
 
-  private async syncHostRequest<T>(
+  /**
+   * Talks to the sync host through the shared transport.
+   *
+   * The previous implementation aborted every request after ten seconds,
+   * including media uploads of tens of megabytes, which is why a large transfer
+   * on a slow connection could never finish and always began again. Requests
+   * are now abandoned only when they stop making progress, and retried with
+   * backoff when the failure could succeed later.
+   *
+   * Control-plane calls keep a low attempt ceiling so the user is not left
+   * staring at a pairing screen; transfers pass their own unlimited policy.
+   */
+  private syncHostRequest<T>(
     path: string,
-    options: { method: 'GET' | 'POST'; body?: unknown; token?: string }
+    options: { method: 'GET' | 'POST'; body?: unknown; token?: string; attempts?: number }
   ): Promise<T> {
-    const stored = this.getStoredSyncSettings()
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 10_000)
-
-    try {
-      const response = await fetch(`${stored.hostUrl}${path}`, {
+    return this.transport
+      .request({
         method: options.method,
-        headers: {
-          ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
-          ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
-        },
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
-        signal: controller.signal,
+        path,
+        json: options.body,
+        // Always anonymous at the transport level: these callers already hold a
+        // token when they need one, and letting the transport fetch one here
+        // would make `/devices/token` ask itself for a token to call itself.
+        anonymous: true,
+        headers: options.token ? { authorization: `Bearer ${options.token}` } : {},
+        retry: { maxAttempts: options.attempts ?? 4 },
       })
-      const text = await response.text()
-      const parsed = text ? (JSON.parse(text) as T & { error?: string }) : ({} as T & { error?: string })
-      if (!response.ok) {
-        throw new Error(parsed.error || `Sync host returned HTTP ${response.status}.`)
-      }
-      return parsed
-    } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`Timed out connecting to ${stored.hostUrl}.`)
-      }
-      throw error
-    } finally {
-      clearTimeout(timeout)
+      .then((response) => response.json<T>())
+  }
+
+  /** Lazily built so a host URL change is picked up without a restart. */
+  private get transport(): Transport {
+    if (!this.transportInstance) {
+      this.transportInstance = createTransport({
+        hostUrl: () => this.getStoredSyncSettings().hostUrl,
+        token: () => this.getValidSyncDeviceToken(),
+      })
     }
+    return this.transportInstance
+  }
+
+  private get blobs(): BlobClient {
+    if (!this.blobClientInstance) {
+      this.blobClientInstance = createBlobClient({ transport: this.transport })
+    }
+    return this.blobClientInstance
   }
 
   private async requestSyncDeviceToken(): Promise<{ token: string; expiresAt: string }> {

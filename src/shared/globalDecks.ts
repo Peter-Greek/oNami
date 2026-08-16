@@ -27,7 +27,15 @@ export interface GlobalDeckPublishInput {
   name: string
   decks: GlobalDeckNode[]
   media: GlobalDeckMedia[]
-  mediaBlobs: GlobalDeckMediaBlob[]
+  /**
+   * Reads one file's bytes, and only when it actually needs uploading.
+   *
+   * Publishing used to encode every file to base64 before sending any of them,
+   * so a deck with hundreds of audio clips built hundreds of megabytes of
+   * strings in memory before the first byte left. Resuming a publish re-did all
+   * of that work to then skip most of it.
+   */
+  readBlob: (sha256: string) => Promise<GlobalDeckMediaBlob | null>
 }
 
 export interface GlobalDecksClient {
@@ -258,35 +266,39 @@ export const createGlobalDecksClient = (options: {
 
     publish: async (input, onProgress) => {
       const publisherId = await options.installationId()
-      const total = Math.max(1, input.mediaBlobs.length + 2)
+      const total = Math.max(1, input.media.length + 2)
       onProgress?.({ message: 'Checking which media files need uploading.', current: 0, total })
       const check = await request<{ missingSha256?: unknown }>('/global-decks/media/check', {
         method: 'POST',
         body: { media: input.media },
       })
+      // The host already holds everything it has seen before, from this device
+      // or any other, so an interrupted publish only sends what is still needed.
       const missing = new Set(
         Array.isArray(check.missingSha256)
           ? check.missingSha256.filter((value): value is string => typeof value === 'string')
           : []
       )
-      for (const [index, blob] of input.mediaBlobs.entries()) {
-        const item = input.media.find((media) => media.sha256 === blob.sha256)
+      for (const [index, item] of input.media.entries()) {
+        const needed = missing.has(item.sha256)
         onProgress?.({
-          message: missing.has(blob.sha256)
-            ? `Uploading media ${index + 1}/${input.mediaBlobs.length}.`
-            : `Media already uploaded ${index + 1}/${input.mediaBlobs.length}.`,
+          message: needed
+            ? `Uploading media ${index + 1}/${input.media.length}.`
+            : `Already uploaded ${index + 1}/${input.media.length}.`,
           current: index + 1,
           total,
-          itemName: item?.originalName,
+          itemName: item.originalName,
         })
-        if (missing.has(blob.sha256)) {
-          await request(`/global-decks/media/${blob.sha256}`, {
-            method: 'POST',
-            body: { mimeType: blob.mimeType, dataBase64: blob.dataBase64 },
-          })
-        }
+        if (!needed) continue
+
+        const blob = await input.readBlob(item.sha256)
+        if (!blob) throw new Error(`${item.originalName} is missing from local storage.`)
+        await request(`/global-decks/media/${item.sha256}`, {
+          method: 'POST',
+          body: { mimeType: blob.mimeType, dataBase64: blob.dataBase64 },
+        })
       }
-      onProgress?.({ message: 'Publishing deck contents.', current: input.mediaBlobs.length + 1, total })
+      onProgress?.({ message: 'Publishing deck contents.', current: input.media.length + 1, total })
       const payload = await request<unknown>('/global-decks', {
         method: 'POST',
         body: {

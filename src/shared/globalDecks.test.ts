@@ -164,7 +164,7 @@ describe('createGlobalDecksClient', () => {
         cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }],
       }],
       media: [],
-      mediaBlobs: [],
+      readBlob: async () => null,
     })
 
     const body = JSON.parse(String(fetchMock.mock.calls[1][1]?.body))
@@ -195,7 +195,7 @@ describe('createGlobalDecksClient', () => {
       sourceDeckId: 'local-1', name: 'Deck',
       decks: [{ sourceDeckId: 'local-1', parentSourceDeckId: null, name: 'Deck', cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }] }],
       media: [{ sourceMediaId: 'm1', sha256, mimeType: 'image/png', byteSize: 1, originalName: 'x.png' }],
-      mediaBlobs: [{ sha256, mimeType: 'image/png', dataBase64: 'eA==' }],
+      readBlob: async () => ({ sha256, mimeType: 'image/png', dataBase64: 'eA==' }),
     })
     const urls = fetchMock.mock.calls.map((call) => String(call[0]))
     expect(urls[0].endsWith('/global-decks/media/check')).toBe(true)
@@ -218,11 +218,53 @@ describe('createGlobalDecksClient', () => {
       sourceDeckId: 'local-1', name: 'Deck',
       decks: [{ sourceDeckId: 'local-1', parentSourceDeckId: null, name: 'Deck', cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }] }],
       media: [{ sourceMediaId: 'm1', sha256, mimeType: 'image/png', byteSize: 1, originalName: 'x.png' }],
-      mediaBlobs: [{ sha256, mimeType: 'image/png', dataBase64: 'eA==' }],
+      readBlob: async () => ({ sha256, mimeType: 'image/png', dataBase64: 'eA==' }),
     }, progress)
 
     expect(progress.mock.calls.map(([event]) => event.current)).toEqual([0, 1, 2, 3])
     expect(progress.mock.calls.at(-1)?.[0]).toMatchObject({ message: 'Deck published.', current: 3, total: 3 })
+  })
+
+  it('never reads a file the host already has, so a resumed publish is cheap', async () => {
+    const uploaded = 'c'.repeat(64)
+    const alreadyThere = 'd'.repeat(64)
+    vi.stubGlobal('fetch', vi.fn<FetchFn>(async (input) => {
+      const url = String(input)
+      // The host kept everything from the interrupted attempt except one file.
+      if (url.endsWith('/global-decks/media/check')) return jsonResponse({ missingSha256: [uploaded] })
+      if (url.includes('/global-decks/media/')) return jsonResponse({ sha256: uploaded })
+      return jsonResponse({ id: 'deck-1', name: 'Deck', cardCount: 1, publishedAt: '2026-01-01T00:00:00.000Z' })
+    }))
+    const readBlob = vi.fn(async (sha256: string) => ({ sha256, mimeType: 'audio/mpeg', dataBase64: 'eA==' }))
+    const client = createGlobalDecksClient({ installationId: () => 'install-1' })
+
+    await client.publish({
+      sourceDeckId: 'local-1', name: 'Deck',
+      decks: [{ sourceDeckId: 'local-1', parentSourceDeckId: null, name: 'Deck', cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }] }],
+      media: [
+        { sourceMediaId: 'm1', sha256: alreadyThere, mimeType: 'audio/mpeg', byteSize: 1, originalName: 'kept.mp3' },
+        { sourceMediaId: 'm2', sha256: uploaded, mimeType: 'audio/mpeg', byteSize: 1, originalName: 'missing.mp3' },
+      ],
+      readBlob,
+    })
+
+    expect(readBlob).toHaveBeenCalledTimes(1)
+    expect(readBlob).toHaveBeenCalledWith(uploaded)
+  })
+
+  it('names the file when it has gone missing locally', async () => {
+    const sha256 = 'e'.repeat(64)
+    vi.stubGlobal('fetch', vi.fn<FetchFn>(async () => jsonResponse({ missingSha256: [sha256] })))
+    const client = createGlobalDecksClient({ installationId: () => 'install-1' })
+
+    await expect(
+      client.publish({
+        sourceDeckId: 'local-1', name: 'Deck',
+        decks: [{ sourceDeckId: 'local-1', parentSourceDeckId: null, name: 'Deck', cards: [{ frontHtml: 'q', backHtml: 'a', tags: [], noteType: 'basic' }] }],
+        media: [{ sourceMediaId: 'm1', sha256, mimeType: 'audio/mpeg', byteSize: 1, originalName: 'gone.mp3' }],
+        readBlob: async () => null,
+      })
+    ).rejects.toThrow('gone.mp3 is missing from local storage.')
   })
 
   it('surfaces the host error message', async () => {

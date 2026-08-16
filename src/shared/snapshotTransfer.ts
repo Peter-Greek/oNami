@@ -1,6 +1,12 @@
 import type { SyncMediaRecord, SyncSnapshotResponse } from './types'
 
-export const SNAPSHOT_MEDIA_BATCH_SIZE = 3
+/**
+ * Files moved at once. This was three while every transfer was fragile — one
+ * failure anywhere restarted the run, so small batches limited the damage.
+ * Transfers now resume from a byte offset, so the batch is sized for
+ * throughput instead of for damage control.
+ */
+export const SNAPSHOT_MEDIA_BATCH_SIZE = 6
 
 export const selectAvailableMediaBatch = (
   media: SyncMediaRecord[],

@@ -7,6 +7,8 @@ import {
   SNAPSHOT_MEDIA_BATCH_SIZE,
 } from './shared/snapshotTransfer'
 import { getPairingSnapshotPlan } from './shared/syncPairing'
+import { createBlobClient } from './shared/sync/blobClient'
+import { createTransport } from './shared/sync/transport'
 import { shouldNotifyNativeTransfer } from './shared/transferNotifications'
 
 import type {
@@ -49,7 +51,6 @@ import type {
   SyncHealthResult,
   SyncJoinPairingInput,
   SyncJoinPairingResult,
-  SyncMediaBlob,
   SyncMediaRecord,
   SyncProgressEvent,
   SyncReviewAnswerPayload,
@@ -621,22 +622,35 @@ const releaseSyncWakeLock = async () => {
   }
 }
 
+/**
+ * Every call to the sync host goes through the shared transport, so the phone
+ * gets the same behaviour as the desktop: a request is abandoned only when it
+ * stops making progress, and a failure that could succeed later is retried with
+ * backoff instead of failing the whole sync. This build previously had no
+ * timeout and no retries at all, so one dropped packet ended a transfer.
+ */
+const syncTransport = createTransport({
+  hostUrl: () => readSyncSettings().hostUrl,
+  token: () => getValidSyncDeviceToken(),
+})
+
+const syncBlobs = createBlobClient({ transport: syncTransport })
+
 const syncHostRequest = async <T,>(
   path: string,
-  options: { method: 'GET' | 'POST'; body?: unknown; token?: string }
+  options: { method: 'GET' | 'POST'; body?: unknown; token?: string; attempts?: number }
 ): Promise<T> => {
-  const settings = readSyncSettings()
-  const response = await fetch(`${settings.hostUrl}${path}`, {
+  const response = await syncTransport.request({
     method: options.method,
-    headers: {
-      ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
-      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
-    },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    path,
+    json: options.body,
+    // Anonymous at the transport level: callers already hold a token when one
+    // is needed, and auto-fetching here would make `/devices/token` recurse.
+    anonymous: true,
+    headers: options.token ? { authorization: `Bearer ${options.token}` } : {},
+    retry: { maxAttempts: options.attempts ?? 4 },
   })
-  const body = (await response.json()) as T & { error?: string }
-  if (!response.ok) throw new Error(body.error || `Sync host returned HTTP ${response.status}.`)
-  return body
+  return response.json<T>()
 }
 
 const ensureSyncDevice = async (): Promise<BrowserSyncSettings & {
@@ -784,12 +798,14 @@ const buildGlobalDeckPublishInput = (localDeckId: string) => {
     byteSize: base64ByteLength(item.dataBase64),
     originalName: item.originalName,
   }))
-  const mediaBlobs: GlobalDeckMediaBlob[] = selectedMedia.map((item) => ({
-    sha256: item.sha256,
-    mimeType: item.mimeType,
-    dataBase64: item.dataBase64,
-  }))
-  return { sourceDeckId: deck.id, name: deck.name, decks, media, mediaBlobs }
+  // Read lazily: the host already holds most files after an interrupted
+  // publish, and building base64 for all of them again just to skip them is
+  // what made a resumed upload as expensive as the first attempt.
+  const readBlob = async (sha256: string): Promise<GlobalDeckMediaBlob | null> => {
+    const item = selectedMedia.find((candidate) => candidate.sha256 === sha256)
+    return item ? { sha256, mimeType: item.mimeType, dataBase64: item.dataBase64 } : null
+  }
+  return { sourceDeckId: deck.id, name: deck.name, decks, media, readBlob }
 }
 
 const runBrowseUploadTransfer = async (record: BrowserTransferRecord): Promise<void> => {
@@ -799,7 +815,7 @@ const runBrowseUploadTransfer = async (record: BrowserTransferRecord): Promise<v
     title: `Uploading ${input.name}`,
     message: 'Preparing deck contents.',
     current: 0,
-    total: Math.max(1, input.mediaBlobs.length + 2),
+    total: Math.max(1, input.media.length + 2),
   })
   const published = await globalDecksClient.publish(input, (progress) => {
     emitTransferProgress(record.id, {
@@ -814,8 +830,8 @@ const runBrowseUploadTransfer = async (record: BrowserTransferRecord): Promise<v
     state: 'completed',
     title: `Uploaded ${published.name}`,
     message: `Published ${published.cardCount} card${published.cardCount === 1 ? '' : 's'}.`,
-    current: Math.max(1, input.mediaBlobs.length + 2),
-    total: Math.max(1, input.mediaBlobs.length + 2),
+    current: Math.max(1, input.media.length + 2),
+    total: Math.max(1, input.media.length + 2),
     result: published,
   })
 }
@@ -862,18 +878,7 @@ const runBrowseDownloadTransfer = async (initial: BrowserTransferRecord): Promis
       itemName: media.originalName,
       mediaIds,
     })
-    const blob = await globalDecksClient.downloadMedia(media.sha256)
-    mutateState((state) => {
-      if (state.media.some((item) => item.sha256 === media.sha256)) return
-      state.media.push({
-        id: localId,
-        sha256: media.sha256,
-        mimeType: media.mimeType,
-        originalName: media.originalName,
-        dataBase64: blob.dataBase64,
-      })
-    })
-    await flushState()
+    await downloadPublishedMedia(media, localId)
     completed += 1
     emitTransferProgress(record.id, {
       state: 'running',
@@ -1066,7 +1071,10 @@ const normalizeState = (parsed: Partial<StoredState> | null | undefined): Stored
 const IDB_NAME = 'onami'
 const IDB_STATE_STORE = 'state'
 const IDB_MEDIA_STORE = 'media'
+/** Bytes of a media file that is still downloading, so it survives a restart. */
+const IDB_PARTIAL_STORE = 'blobParts'
 const IDB_STATE_KEY = 'state'
+const IDB_VERSION = 2
 
 let cachedState: StoredState = clone(defaultState)
 const persistedMediaIds = new Set<string>()
@@ -1076,11 +1084,12 @@ let idbPromise: Promise<IDBDatabase> | null = null
 const openStateDb = (): Promise<IDBDatabase> => {
   if (idbPromise) return idbPromise
   idbPromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open(IDB_NAME, 1)
+    const request = indexedDB.open(IDB_NAME, IDB_VERSION)
     request.onupgradeneeded = () => {
       const db = request.result
       if (!db.objectStoreNames.contains(IDB_STATE_STORE)) db.createObjectStore(IDB_STATE_STORE)
       if (!db.objectStoreNames.contains(IDB_MEDIA_STORE)) db.createObjectStore(IDB_MEDIA_STORE)
+      if (!db.objectStoreNames.contains(IDB_PARTIAL_STORE)) db.createObjectStore(IDB_PARTIAL_STORE)
     }
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(request.error ?? new Error('Failed to open IndexedDB.'))
@@ -1099,6 +1108,124 @@ const idbPut = (storeName: string, key: string, value: unknown): Promise<void> =
         tx.onabort = () => reject(tx.error)
       })
   )
+
+const idbGet = <T,>(storeName: string, key: string): Promise<T | undefined> =>
+  openStateDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const request = db.transaction(storeName, 'readonly').objectStore(storeName).get(key)
+        request.onsuccess = () => resolve(request.result as T | undefined)
+        request.onerror = () => reject(request.error)
+      })
+  )
+
+const idbDelete = (storeName: string, key: string): Promise<void> =>
+  openStateDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite')
+        tx.objectStore(storeName).delete(key)
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+      })
+  )
+
+const bytesFromBase64 = (base64: string): Uint8Array => {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+  return bytes
+}
+
+const base64FromBytes = (bytes: Uint8Array): string => {
+  // Chunked so a large file cannot blow the argument limit of String.fromCharCode.
+  let binary = ''
+  const step = 0x8000
+  for (let index = 0; index < bytes.length; index += step) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + step))
+  }
+  return btoa(binary)
+}
+
+/**
+ * Downloads one media file into the local store, continuing from any bytes a
+ * previous attempt already saved. Media is kept as base64 because the renderer
+ * builds `data:` URLs from it; only the transfer itself is binary.
+ */
+const downloadMediaToState = async (media: SyncMediaRecord, localId = media.id): Promise<void> => {
+  const staged = (await idbGet<Uint8Array>(IDB_PARTIAL_STORE, media.sha256)) ?? new Uint8Array()
+
+  await syncBlobs.download({
+    blob: {
+      sha256: media.sha256,
+      byteSize: media.byteSize,
+      mimeType: media.mimeType,
+      originalName: media.originalName,
+    },
+    startOffset: staged.length,
+    write: async (chunk, offset) => {
+      const base = offset === 0 ? new Uint8Array() : staged
+      const merged = new Uint8Array(base.length + chunk.length)
+      merged.set(base)
+      merged.set(chunk, base.length)
+      await idbPut(IDB_PARTIAL_STORE, media.sha256, merged)
+    },
+  })
+
+  const complete = await idbGet<Uint8Array>(IDB_PARTIAL_STORE, media.sha256)
+  if (!complete) throw new Error(`${media.originalName} could not be saved.`)
+
+  mutateState((state) => {
+    if (state.media.some((item) => item.id === localId)) return
+    state.media.push({
+      id: localId,
+      sha256: media.sha256,
+      mimeType: media.mimeType,
+      originalName: media.originalName,
+      dataBase64: base64FromBytes(complete),
+    })
+  })
+  await flushState()
+  await idbDelete(IDB_PARTIAL_STORE, media.sha256)
+}
+
+/**
+ * Fetches a published deck's media file, preferring the resumable blob route.
+ * Decks published before the host indexed their media have no blob reference
+ * yet, so a 404 or 401 falls back to the original base64 route.
+ */
+const downloadPublishedMedia = async (media: GlobalDeckMedia, localId: string): Promise<void> => {
+  try {
+    await downloadMediaToState(
+      {
+        id: localId,
+        sha256: media.sha256,
+        mimeType: media.mimeType,
+        byteSize: media.byteSize,
+        originalName: media.originalName,
+      },
+      localId
+    )
+    return
+  } catch (error) {
+    const status = (error as { status?: number | null }).status
+    if (status !== 404 && status !== 401) throw error
+    await idbDelete(IDB_PARTIAL_STORE, media.sha256).catch(() => undefined)
+  }
+
+  const blob = await globalDecksClient.downloadMedia(media.sha256)
+  mutateState((state) => {
+    if (state.media.some((item) => item.sha256 === media.sha256)) return
+    state.media.push({
+      id: localId,
+      sha256: media.sha256,
+      mimeType: media.mimeType,
+      originalName: media.originalName,
+      dataBase64: blob.dataBase64,
+    })
+  })
+  await flushState()
+}
 
 const idbGetStateRecord = (): Promise<Partial<StoredState> | undefined> =>
   openStateDb().then(
@@ -1906,10 +2033,15 @@ const uploadFullSnapshot = async (): Promise<void> => {
       batch.map((metadata) => {
         const media = mediaByHash.get(metadata.sha256)
         if (!media) throw new Error(`Media ${metadata.originalName} is missing from local storage.`)
-        return syncHostRequest('/media', {
-          method: 'POST',
-          token,
-          body: { sha256: media.sha256, mimeType: media.mimeType, dataBase64: media.dataBase64 },
+        const bytes = bytesFromBase64(media.dataBase64)
+        return syncBlobs.upload({
+          blob: {
+            sha256: media.sha256,
+            byteSize: bytes.length,
+            mimeType: media.mimeType,
+            originalName: media.originalName,
+          },
+          read: async (offset, length) => bytes.subarray(offset, offset + length),
         })
       })
     )
@@ -2060,27 +2192,13 @@ const hydrateFromSnapshot = async (token: string): Promise<boolean> => {
         itemType: 'media',
         itemName: batch[0]?.originalName,
       })
-      const downloads = await Promise.all(
-        batch.map(async (media) => ({
-          media,
-          blob: await syncHostRequest<SyncMediaBlob>(`/media/${media.sha256}`, { method: 'GET', token }),
-        }))
-      )
-      state = readState()
-      for (const { media, blob } of downloads) {
-        if (state.media.some((item) => item.id === media.id)) continue
-        state.media.push({
-          id: media.id,
-          sha256: media.sha256,
-          mimeType: media.mimeType,
-          originalName: media.originalName,
-          dataBase64: blob.dataBase64,
-        })
+      // Each file is durable as it lands, and a file interrupted part-way keeps
+      // its bytes staged, so a process death resumes mid-file rather than
+      // re-downloading the batch.
+      for (const media of batch) {
+        await downloadMediaToState(media)
       }
-      writeState(state)
-      // Each completed batch is durable before requesting the next one, so a
-      // process death resumes from the last saved batch without re-downloading.
-      await flushState()
+      state = readState()
       await persistMediaAliases()
       const downloadedMediaCount = snapshot.media.filter((media) =>
         readState().media.some((item) => item.id === media.id && item.sha256 === media.sha256)
