@@ -1007,9 +1007,23 @@ const IDB_MEDIA_STORE = 'media'
 /** Bytes of a media file that is still downloading, so it survives a restart. */
 const IDB_PARTIAL_STORE = 'blobParts'
 const IDB_STATE_KEY = 'state'
+/**
+ * The record outbox shares the state store. It holds full card HTML, so a first
+ * push of a whole library is megabytes — far past the localStorage quota it used
+ * to live in, which failed the sync with "exceeded the quota" and left the
+ * device permanently unable to back itself up.
+ */
+const IDB_OUTBOX_KEY = 'recordOutbox'
+/** One entry per media file, and one id per review ever sent — both unbounded. */
+const IDB_MEDIA_INDEX_KEY = 'mediaIndex'
+const IDB_REVIEW_SENT_KEY = 'sentReviewIds'
 const IDB_VERSION = 2
 
 let cachedState: StoredState = clone(defaultState)
+let cachedRecordOutbox: SyncRecordEnvelope[] = []
+let recordOutboxPersist: Promise<void> = Promise.resolve()
+let cachedMediaIndex: SyncMediaRecord[] = []
+let cachedSentReviewIds = new Set<string>()
 const persistedMediaIds = new Set<string>()
 let persistChain: Promise<void> = Promise.resolve()
 let idbPromise: Promise<IDBDatabase> | null = null
@@ -1212,9 +1226,87 @@ const requestPersistentStorage = async (): Promise<void> => {
   }
 }
 
+const parseRecordOutbox = (value: unknown): SyncRecordEnvelope[] => {
+  if (!Array.isArray(value)) return []
+  return value.filter((record): record is SyncRecordEnvelope => validateRecordEnvelope(record) === null)
+}
+
+const parseMediaIndex = (value: unknown): SyncMediaRecord[] =>
+  Array.isArray(value)
+    ? (value as SyncMediaRecord[]).filter((item) => typeof item?.sha256 === 'string')
+    : []
+
+const parseSentReviewIds = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : []
+
+/**
+ * Hydrates the outbox, moving anything the old localStorage store still holds.
+ * A device that failed mid-migration keeps whichever copy has more queued, so a
+ * partial write never silently drops changes that were never pushed.
+ */
+const loadRecordOutbox = async (): Promise<void> => {
+  try {
+    const stored = parseRecordOutbox(await idbGet<unknown>(IDB_STATE_STORE, IDB_OUTBOX_KEY))
+    const legacyRaw = localStorage.getItem(RECORD_OUTBOX_KEY)
+    if (legacyRaw === null) {
+      cachedRecordOutbox = stored
+      return
+    }
+
+    const legacy = parseRecordOutbox(JSON.parse(legacyRaw) as unknown)
+    const byKey = new Map(stored.map((record) => [`${record.kind}|${record.recordId}`, record]))
+    for (const record of legacy) byKey.set(`${record.kind}|${record.recordId}`, record)
+    cachedRecordOutbox = [...byKey.values()]
+    await idbPut(IDB_STATE_STORE, IDB_OUTBOX_KEY, cachedRecordOutbox)
+    localStorage.removeItem(RECORD_OUTBOX_KEY)
+  } catch (error) {
+    console.error('Failed to load the oNami sync outbox from IndexedDB.', error)
+    cachedRecordOutbox = []
+  }
+}
+
+/**
+ * Moves the media index and the sent-review ids off localStorage. Both only
+ * ever grow, so they belong beside the outbox rather than in a 5MB bucket.
+ * Merging rather than replacing keeps a half-migrated device correct: a media
+ * file already downloaded is not re-fetched, and a review already pushed is not
+ * pushed twice.
+ */
+const loadSyncIndexes = async (): Promise<void> => {
+  try {
+    const storedMedia = await idbGet<SyncMediaRecord[]>(IDB_STATE_STORE, IDB_MEDIA_INDEX_KEY)
+    const legacyMediaRaw = localStorage.getItem(MEDIA_INDEX_KEY)
+    const byHash = new Map((storedMedia ?? []).map((item) => [item.sha256, item]))
+    if (legacyMediaRaw !== null) {
+      for (const item of parseMediaIndex(JSON.parse(legacyMediaRaw) as unknown)) byHash.set(item.sha256, item)
+    }
+    cachedMediaIndex = [...byHash.values()]
+
+    const storedSent = await idbGet<string[]>(IDB_STATE_STORE, IDB_REVIEW_SENT_KEY)
+    const legacySentRaw = localStorage.getItem(REVIEW_SENT_KEY)
+    cachedSentReviewIds = new Set(storedSent ?? [])
+    if (legacySentRaw !== null) {
+      for (const id of parseSentReviewIds(JSON.parse(legacySentRaw) as unknown)) cachedSentReviewIds.add(id)
+    }
+
+    if (legacyMediaRaw !== null) {
+      await idbPut(IDB_STATE_STORE, IDB_MEDIA_INDEX_KEY, cachedMediaIndex)
+      localStorage.removeItem(MEDIA_INDEX_KEY)
+    }
+    if (legacySentRaw !== null) {
+      await idbPut(IDB_STATE_STORE, IDB_REVIEW_SENT_KEY, [...cachedSentReviewIds])
+      localStorage.removeItem(REVIEW_SENT_KEY)
+    }
+  } catch (error) {
+    console.error('Failed to load oNami sync indexes from IndexedDB.', error)
+  }
+}
+
 const loadPersistedState = async (): Promise<void> => {
   try {
     await requestPersistentStorage()
+    await loadRecordOutbox()
+    await loadSyncIndexes()
     const record = await idbGetStateRecord()
     if (record) {
       const state = normalizeState(record)
@@ -1655,19 +1747,27 @@ const buildCardSyncPayload = (card: StoredCard): SyncCardUpsertPayload => ({
   },
 })
 
-const readRecordOutbox = (): SyncRecordEnvelope[] => {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(RECORD_OUTBOX_KEY) || '[]') as unknown
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((record): record is SyncRecordEnvelope => validateRecordEnvelope(record) === null)
-  } catch {
-    return []
-  }
+const readRecordOutbox = (): SyncRecordEnvelope[] => cachedRecordOutbox
+
+/**
+ * Mirrors the outbox to IndexedDB on the shared persist chain, so `flushState()`
+ * is one durability barrier covering both the library and what is queued about
+ * it. Callers stay synchronous, as they were when this was localStorage.
+ */
+const writeRecordOutbox = (records: SyncRecordEnvelope[]): void => {
+  cachedRecordOutbox = records
+  const snapshot = records
+  // Kept as its own promise as well as on the chain: `flushState` deliberately
+  // swallows persist errors, but a caller about to record that the queue is
+  // safely stored has to be able to see the write fail.
+  recordOutboxPersist = persistChain.then(() => idbPut(IDB_STATE_STORE, IDB_OUTBOX_KEY, snapshot))
+  persistChain = recordOutboxPersist.catch((error) => {
+    console.error('Failed to persist the oNami sync outbox to IndexedDB.', error)
+  })
 }
 
-const writeRecordOutbox = (records: SyncRecordEnvelope[]): void => {
-  localStorage.setItem(RECORD_OUTBOX_KEY, JSON.stringify(records))
-}
+/** Resolves once the queued outbox is durably stored; rejects if it was not. */
+const flushRecordOutbox = (): Promise<void> => recordOutboxPersist
 
 const enqueueRecord = (record: SyncRecordEnvelope): void => {
   const settings = readSyncSettings()
@@ -1779,17 +1879,16 @@ const applyRecordPage = (state: StoredState, records: StoredSyncRecord[]): { app
  * against what is actually stored to decide what to download, so an interrupted
  * download is retried without re-reading the record stream.
  */
-const readMediaIndex = (): SyncMediaRecord[] => {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(MEDIA_INDEX_KEY) || '[]') as unknown
-    return Array.isArray(parsed) ? (parsed as SyncMediaRecord[]).filter((item) => typeof item?.sha256 === 'string') : []
-  } catch {
-    return []
-  }
-}
+const readMediaIndex = (): SyncMediaRecord[] => cachedMediaIndex
 
 const writeMediaIndex = (media: SyncMediaRecord[]): void => {
-  localStorage.setItem(MEDIA_INDEX_KEY, JSON.stringify(media))
+  cachedMediaIndex = media
+  const snapshot = media
+  persistChain = persistChain
+    .then(() => idbPut(IDB_STATE_STORE, IDB_MEDIA_INDEX_KEY, snapshot))
+    .catch((error) => {
+      console.error('Failed to persist the oNami media index to IndexedDB.', error)
+    })
 }
 
 const listMissingMedia = (): SyncMediaRecord[] => {
@@ -1798,19 +1897,16 @@ const listMissingMedia = (): SyncMediaRecord[] => {
 }
 
 /** Reviews already sent, so the append-only stream is pushed once each. */
-const readSentReviewIds = (): Set<string> => {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(REVIEW_SENT_KEY) || '[]') as unknown
-    return new Set(Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [])
-  } catch {
-    return new Set()
-  }
-}
+const readSentReviewIds = (): Set<string> => cachedSentReviewIds
 
 const markReviewsSent = (ids: string[]): void => {
-  const sent = readSentReviewIds()
-  for (const id of ids) sent.add(id)
-  localStorage.setItem(REVIEW_SENT_KEY, JSON.stringify([...sent]))
+  for (const id of ids) cachedSentReviewIds.add(id)
+  const snapshot = [...cachedSentReviewIds]
+  persistChain = persistChain
+    .then(() => idbPut(IDB_STATE_STORE, IDB_REVIEW_SENT_KEY, snapshot))
+    .catch((error) => {
+      console.error('Failed to persist sent review ids to IndexedDB.', error)
+    })
 }
 
 const listUnsentReviewLogs = (limit = 500): SyncReviewLogRecord[] => {
@@ -2003,11 +2099,18 @@ const downloadMissingMedia = async (): Promise<void> => {
 /**
  * Queues the whole library the first time this phone syncs. After that only
  * actual edits are queued.
+ *
+ * The flag is only set once the queue is durably written. Queueing used to
+ * throw outright when it overflowed its storage quota, which at least meant the
+ * flag stayed unset and the next sync tried again; now that the write is
+ * asynchronous, waiting for it is what keeps a failed queue from being recorded
+ * as a completed one and never retried.
  */
-const ensureLibraryQueued = (): void => {
+const ensureLibraryQueued = async (): Promise<void> => {
   const settings = readSyncSettings()
   if (settings.libraryQueued || !settings.syncGroupId) return
   enqueueRecords(buildLibraryRecordsFromState(readState()))
+  await flushRecordOutbox()
   writeSyncSettings({ ...readSyncSettings(), libraryQueued: true })
 }
 
@@ -2476,7 +2579,7 @@ export const installBrowserOnami = async () => {
             const token = await getValidSyncDeviceToken()
             emitSyncProgress({ stage: 'pairing', message: 'Sync device is paired.' })
 
-            ensureLibraryQueued()
+            await ensureLibraryQueued()
 
             const pushedRecords = await pushPendingRecords(token)
             const sentReviews = await pushPendingReviewLogs(token)
