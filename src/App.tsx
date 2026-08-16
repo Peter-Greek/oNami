@@ -47,6 +47,7 @@ import type {
   AiSettings,
   AppSettings,
   AppStats,
+  AppUpdateStatus,
   CardSummary,
   DeckDetail,
   DeckSummary,
@@ -116,6 +117,12 @@ const formatSyncTimestamp = (value: string | null): string | null => {
     hour: 'numeric',
     minute: '2-digit',
   }).format(date)
+}
+
+const formatBytes = (bytes: number): string => {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MB`
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`
 }
 
 const viewTitle: Record<View, string> = {
@@ -1778,6 +1785,9 @@ function SettingsView({
   const [syncMessage, setSyncMessage] = useState('')
   const [syncProgress, setSyncProgress] = useState<SyncProgressEvent[]>([])
   const [androidUpdate, setAndroidUpdate] = useState<AndroidUpdateState | null>(null)
+  const [desktopUpdate, setDesktopUpdate] = useState<AppUpdateStatus | null>(null)
+  const [desktopUpdateChecking, setDesktopUpdateChecking] = useState(false)
+  const [desktopUpdateProgress, setDesktopUpdateProgress] = useState<TransferProgressEvent | null>(null)
   const BackupIcon =
     syncStatus?.backupState === 'backed-up'
       ? CloudCheck
@@ -1835,6 +1845,29 @@ function SettingsView({
     }
   }, [])
 
+  const checkForDesktopUpdate = useCallback(async () => {
+    setDesktopUpdateChecking(true)
+    try {
+      setDesktopUpdate(await window.onami.updates.check())
+    } catch (error) {
+      setDesktopUpdate((current) =>
+        current ? { ...current, error: error instanceof Error ? error.message : String(error) } : current
+      )
+    } finally {
+      setDesktopUpdateChecking(false)
+    }
+  }, [])
+
+  const downloadDesktopUpdate = useCallback(async () => {
+    try {
+      setDesktopUpdate(await window.onami.updates.download())
+    } catch (error) {
+      setDesktopUpdate((current) =>
+        current ? { ...current, error: error instanceof Error ? error.message : String(error) } : current
+      )
+    }
+  }, [])
+
   useEffect(() => {
     window.onami.ai.getSettings().then((next) => {
       setAiSettings(next)
@@ -1842,7 +1875,21 @@ function SettingsView({
     })
     window.onami.sync.getStatus().then(applySyncStatus)
     void checkForAndroidUpdate()
-  }, [applySyncStatus, checkForAndroidUpdate])
+    // The stored status renders immediately; the host is asked right after, so
+    // an already-downloaded installer is offered even while the check is out.
+    window.onami.updates.getStatus().then(setDesktopUpdate).catch(() => undefined)
+    void checkForDesktopUpdate()
+  }, [applySyncStatus, checkForAndroidUpdate, checkForDesktopUpdate])
+
+  useEffect(() => {
+    return window.onami.transfers.onProgress((event) => {
+      if (event.kind !== 'app-update') return
+      setDesktopUpdateProgress(event)
+      if (event.state === 'completed') {
+        window.onami.updates.getStatus().then(setDesktopUpdate).catch(() => undefined)
+      }
+    })
+  }, [])
 
   useEffect(() => {
     setAudioVolume(appSettings.audioVolume)
@@ -1982,8 +2029,80 @@ function SettingsView({
       )
     }, 'Syncing content with host...')
 
+  const desktopUpdateDownloading =
+    desktopUpdateProgress?.state === 'queued' || desktopUpdateProgress?.state === 'running'
+
   return (
     <section className="view-stack">
+      {desktopUpdate && desktopUpdate.state !== 'unsupported' && (
+        <div
+          className={`app-update-card ${
+            desktopUpdate.error ? 'error' : desktopUpdate.state === 'current' ? 'current' : 'available'
+          }`}
+        >
+          <div className="app-update-copy">
+            {desktopUpdateChecking || desktopUpdateDownloading ? (
+              <RefreshCw className="spin" size={20} />
+            ) : desktopUpdate.error ? (
+              <CircleAlert size={20} />
+            ) : desktopUpdate.state === 'ready' ? (
+              <RotateCcw size={20} />
+            ) : desktopUpdate.state === 'available' ? (
+              <Download size={20} />
+            ) : (
+              <CheckCircle2 size={20} />
+            )}
+            <div>
+              <strong>
+                {desktopUpdateDownloading
+                  ? 'Downloading oNami update...'
+                  : desktopUpdateChecking
+                    ? 'Checking for updates...'
+                    : desktopUpdate.error
+                      ? 'Could not check for updates'
+                      : desktopUpdate.state === 'ready'
+                        ? 'Update ready to install'
+                        : desktopUpdate.state === 'available'
+                          ? 'oNami update available'
+                          : 'oNami is up to date'}
+              </strong>
+              <span>
+                {desktopUpdate.error
+                  ? desktopUpdate.error
+                  : desktopUpdate.release
+                    ? `${desktopUpdate.release.versionName} (${formatBytes(desktopUpdate.release.sizeBytes)}). You have ${desktopUpdate.installedVersionName}.`
+                    : `Installed version ${desktopUpdate.installedVersionName}`}
+              </span>
+            </div>
+          </div>
+          {desktopUpdateDownloading && (
+            <progress
+              max={Math.max(1, desktopUpdateProgress?.total ?? 1)}
+              value={
+                desktopUpdateProgress?.total
+                  ? Math.min(desktopUpdateProgress.current ?? 0, desktopUpdateProgress.total)
+                  : undefined
+              }
+            />
+          )}
+          {desktopUpdate.state === 'ready' && !desktopUpdateDownloading ? (
+            <button className="update-action" onClick={() => void window.onami.updates.install()}>
+              <RotateCcw size={18} />
+              Restart and install
+            </button>
+          ) : desktopUpdate.state === 'available' && !desktopUpdateDownloading ? (
+            <button className="update-action" onClick={() => void downloadDesktopUpdate()}>
+              <Download size={18} />
+              Download update
+            </button>
+          ) : desktopUpdate.error && !desktopUpdateChecking ? (
+            <button className="secondary-action" onClick={() => void checkForDesktopUpdate()}>
+              <RefreshCw size={18} />
+              Try again
+            </button>
+          ) : null}
+        </div>
+      )}
       {androidUpdate && (
         <div className={`app-update-card ${androidUpdate.status}`}>
           <div className="app-update-copy">

@@ -17,6 +17,8 @@
     "android:sync-assets": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"New-Item -ItemType Directory -Force android/app/src/main/assets/public | Out-Null; Copy-Item -Recurse -Force dist/* android/app/src/main/assets/public\"",
     "android:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1",
     "android:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1 -InstallDependencies -Publish",
+    "windows:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1",
+    "windows:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Publish",
     "host": "node host/server.js",
     "host:pm2": "pm2 start host/ecosystem.config.cjs --only onami-host --update-env",
     "rebuild:electron": "electron-rebuild -f -w better-sqlite3",

@@ -51,6 +51,44 @@ Every build receives a timestamp-based Android version code. Android builds
 made on this server share its persistent debug signing key, so later remote
 builds can update earlier remote builds in place.
 
+## Windows installer download
+
+The desktop app updates itself from this host, so the host has to hold a bundle
+build for it. Build and atomically publish the Windows installer from the
+repository root:
+
+```powershell
+npm run windows:publish
+```
+
+That runs the normal `build:win` pipeline, copies the NSIS installer to
+`release/windows/onami-latest-setup.exe`, and writes `windows.json` beside it.
+The installer is copied under a temporary name and moved into place, so a client
+polling mid-publish never downloads a half-written file.
+
+The host serves the last successful build at:
+
+```text
+http://147.135.31.128:41729/downloads/onami-latest-setup.exe
+http://147.135.31.128:41729/downloads/onami-<versionCode>-setup.exe
+```
+
+Build metadata, including version, commit, size, and SHA-256, is available at:
+
+```text
+http://147.135.31.128:41729/downloads/windows.json
+```
+
+Both routes are unauthenticated — a device has to be able to update before it
+pairs. Installer responses honour `Range`, so an interrupted download resumes.
+A versioned URL for a build that has since been replaced answers `410` with the
+current download URL rather than quietly serving different bytes.
+
+Like Android, every build receives a timestamp-based version code. The desktop
+build stamps that code into the Electron bundle (`tsup.config.ts`), which is how
+an installed app knows which build it is. A build made without the publish
+script reports version code `0` and is never offered an update.
+
 ## PM2 on the Server
 
 First run setup once:
@@ -128,6 +166,8 @@ ONAMI_MAX_BLOB_BYTES=67108864
 ONAMI_MAX_BLOB_CHUNK_BYTES=16777216
 ONAMI_BLOB_SWEEP_ENABLED=0
 ONAMI_MEDIA_DIR=./media-store
+ONAMI_ANDROID_RELEASE_DIR=../release/android
+ONAMI_WINDOWS_RELEASE_DIR=../release/windows
 ```
 
 `ONAMI_MAX_BLOB_BYTES` caps a single full-data snapshot or media upload; `ONAMI_MEDIA_DIR` is where content-addressed media blobs are written on disk. See the blob store section for the chunk and sweep settings.
@@ -136,6 +176,12 @@ ONAMI_MEDIA_DIR=./media-store
 
 ```text
 GET  /health
+GET  /downloads/android.json
+GET  /downloads/onami-latest.apk
+GET  /downloads/onami-<versionCode>.apk
+GET  /downloads/windows.json
+GET  /downloads/onami-latest-setup.exe
+GET  /downloads/onami-<versionCode>-setup.exe
 GET  /global-decks?search=<text>&sort=hearts&installationId=<id>
 GET  /global-decks/:id?installationId=<id>
 POST /global-decks

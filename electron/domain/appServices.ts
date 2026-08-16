@@ -3,10 +3,24 @@ import os from 'node:os'
 import path from 'node:path'
 import { generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import OpenAI from 'openai'
-import { safeStorage } from 'electron'
+import { app, safeStorage } from 'electron'
 import { z } from 'zod'
 
 import { ApkgImporter } from './apkgImporter'
+import {
+  downloadInstaller,
+  installedVersionCode,
+  installedVersionName,
+  installerFileName,
+  isVerifiedInstaller,
+  UPDATE_METADATA_TIMEOUT_MS,
+} from './appUpdater'
+import {
+  desktopUpdateMetadataUrl,
+  isDesktopUpdateAvailable,
+  parseDesktopUpdateMetadata,
+  type DesktopUpdateMetadata,
+} from '../../src/shared/desktopUpdates'
 import { createGlobalDecksClient, GLOBAL_DECKS_MAX_PUBLISH_CARDS } from '../../src/shared/globalDecks'
 import { createBlobClient, MEDIA_BATCH_SIZE, type BlobClient } from '../../src/shared/sync/blobClient'
 import {
@@ -28,6 +42,7 @@ import type {
   AnswerInput,
   AnswerResult,
   AppStats,
+  AppUpdateStatus,
   CreateCardInput,
   CreateDeckInput,
   DeckDetail,
@@ -98,8 +113,18 @@ interface StoredTransferRecord extends TransferProgressEvent {
   result?: DeckSummary | GlobalDeckSummary | SyncRunResult
 }
 
+/**
+ * What the last update check found, so the app can offer a downloaded installer
+ * again after a restart instead of fetching the same 90MB twice.
+ */
+interface StoredUpdateState {
+  release: DesktopUpdateMetadata | null
+  checkedAt: string | null
+}
+
 const AI_SETTINGS_KEY = 'ai.settings'
 const APP_SETTINGS_KEY = 'app.settings'
+const APP_UPDATE_SETTINGS_KEY = 'app.update.v1'
 const SYNC_SETTINGS_KEY = 'sync.settings'
 const GLOBAL_DECKS_SETTINGS_KEY = 'globalDecks.settings'
 const TRANSFERS_SETTINGS_KEY = 'transfers.records.v1'
@@ -205,7 +230,9 @@ export class AppServices {
       ? `Uploading ${targetName}`
       : kind === 'browse-download'
         ? `Downloading ${targetName}`
-        : 'Syncing oNami'
+        : kind === 'app-update'
+          ? `Downloading oNami ${targetName}`
+          : 'Syncing oNami'
     const record: StoredTransferRecord = {
       id: `${kind}-${randomUUID()}`,
       kind,
@@ -250,6 +277,7 @@ export class AppServices {
           message: 'Transfer restored after interruption.',
         })
         if (record.kind === 'browse-upload') await this.publishGlobalDeck(record.targetId, record)
+        else if (record.kind === 'app-update') await this.downloadUpdate(record)
         else await this.addGlobalDeckToLibrary(record.targetId, record)
       } catch {
         // Each operation records its own paused state for the next launch.
@@ -829,6 +857,175 @@ export class AppServices {
       themeMode: input.themeMode === undefined ? current.themeMode : normalizeThemeMode(input.themeMode),
     })
     return this.getAppSettings()
+  }
+
+  /**
+   * The update the app already knows about, without asking the host. Called on
+   * every settings visit, so it must stay cheap and offline.
+   */
+  getUpdateStatus(): AppUpdateStatus {
+    const stored = this.getStoredUpdateState()
+    const installedCode = installedVersionCode()
+    const base: AppUpdateStatus = {
+      state: 'current',
+      installedVersionCode: installedCode,
+      installedVersionName: installedVersionName(app.getVersion()),
+      release: stored.release,
+      downloadedBytes: 0,
+      checkedAt: stored.checkedAt,
+      error: null,
+    }
+    if (!this.supportsSelfUpdate()) return { ...base, state: 'unsupported', release: null }
+    if (!stored.release || !isDesktopUpdateAvailable(installedCode, stored.release.versionCode)) {
+      return { ...base, release: null }
+    }
+
+    const installerPath = path.join(this.getUpdatesDir(), installerFileName(stored.release.versionCode))
+    const partPath = `${installerPath}.part`
+    const ready = fs.existsSync(installerPath) && fs.statSync(installerPath).size === stored.release.sizeBytes
+    return {
+      ...base,
+      state: ready ? 'ready' : 'available',
+      downloadedBytes: ready
+        ? stored.release.sizeBytes
+        : fs.existsSync(partPath)
+          ? fs.statSync(partPath).size
+          : 0,
+    }
+  }
+
+  /** Asks the host what it has published for Windows and records the answer. */
+  async checkForUpdate(): Promise<AppUpdateStatus> {
+    if (!this.supportsSelfUpdate()) return this.getUpdateStatus()
+
+    const hostUrl = this.getStoredSyncSettings().hostUrl
+    const metadataUrl = `${desktopUpdateMetadataUrl(hostUrl)}?t=${Date.now()}`
+    try {
+      const response = await fetch(metadataUrl, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(UPDATE_METADATA_TIMEOUT_MS),
+      })
+      if (!response.ok) throw new Error(`The update server returned ${response.status}.`)
+      const release = parseDesktopUpdateMetadata(await response.json(), hostUrl)
+      this.saveStoredUpdateState({ release, checkedAt: new Date().toISOString() })
+      return this.getUpdateStatus()
+    } catch (error) {
+      return {
+        ...this.getUpdateStatus(),
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
+
+  /**
+   * Downloads the published installer as a background transfer, so it survives
+   * a closed window, resumes after a restart, and reports progress the same way
+   * deck downloads and syncs do.
+   */
+  async downloadUpdate(resumeRecord?: StoredTransferRecord): Promise<AppUpdateStatus> {
+    const status = this.getUpdateStatus()
+    const release = status.release
+    if (!release || status.state === 'unsupported') {
+      // A resumed download whose build is no longer on offer — the app was
+      // updated some other way — is finished, not retried on every launch.
+      if (resumeRecord) {
+        this.updateTransfer(resumeRecord.id, {
+          state: 'completed',
+          message: 'This update is no longer needed.',
+        })
+        return status
+      }
+      throw new Error('There is no update to download. Check for updates first.')
+    }
+    if (status.state === 'ready') {
+      if (resumeRecord) {
+        this.updateTransfer(resumeRecord.id, {
+          state: 'completed',
+          message: `oNami ${release.versionName} is ready to install.`,
+        })
+      }
+      return status
+    }
+
+    const transfer = resumeRecord ?? this.createTransfer('app-update', String(release.versionCode), release.versionName)
+    if (this.globalTransfersInFlight.has(transfer.id)) {
+      throw new Error('That update download is already running.')
+    }
+    this.globalTransfersInFlight.add(transfer.id)
+    try {
+      this.updateTransfer(transfer.id, {
+        state: 'running',
+        title: `Downloading oNami ${release.versionName}`,
+        message: 'Fetching the installer from the sync host.',
+        total: release.sizeBytes,
+        itemName: release.versionName,
+      })
+
+      let lastReported = 0
+      await downloadInstaller({
+        release,
+        targetDir: this.getUpdatesDir(),
+        onProgress: (downloadedBytes, totalBytes) => {
+          // One record write per megabyte: enough to move a progress bar,
+          // few enough that a large installer does not thrash the settings row.
+          if (downloadedBytes !== totalBytes && downloadedBytes - lastReported < 1024 * 1024) return
+          lastReported = downloadedBytes
+          this.updateTransfer(transfer.id, {
+            state: 'running',
+            message: `Downloaded ${Math.round((downloadedBytes / totalBytes) * 100)}% of the installer.`,
+            current: downloadedBytes,
+            total: totalBytes,
+          })
+        },
+      })
+
+      this.updateTransfer(transfer.id, {
+        state: 'completed',
+        message: `oNami ${release.versionName} is ready to install.`,
+        current: release.sizeBytes,
+        total: release.sizeBytes,
+      })
+      return this.getUpdateStatus()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // Paused, not failed: the bytes already on disk are kept and the next
+      // attempt resumes from them.
+      this.updateTransfer(transfer.id, { state: 'paused', message: `Update download interrupted: ${message}` })
+      throw error
+    } finally {
+      this.globalTransfersInFlight.delete(transfer.id)
+    }
+  }
+
+  /**
+   * Path of a fully downloaded, checksum-verified installer, or null. The hash
+   * is re-checked here because this is the file the app is about to execute.
+   */
+  async getVerifiedInstallerPath(): Promise<string | null> {
+    const release = this.getUpdateStatus().release
+    if (!release) return null
+    const installerPath = path.join(this.getUpdatesDir(), installerFileName(release.versionCode))
+    return (await isVerifiedInstaller(installerPath, release)) ? installerPath : null
+  }
+
+  /** Self-update replaces a packaged Windows install; nothing else qualifies. */
+  private supportsSelfUpdate(): boolean {
+    return process.platform === 'win32' && app.isPackaged && installedVersionCode() > 0
+  }
+
+  private getUpdatesDir(): string {
+    return path.join(app.getPath('userData'), 'updates')
+  }
+
+  private getStoredUpdateState(): StoredUpdateState {
+    return this.database.getSettingsValue<StoredUpdateState>(APP_UPDATE_SETTINGS_KEY, {
+      release: null,
+      checkedAt: null,
+    })
+  }
+
+  private saveStoredUpdateState(state: StoredUpdateState): void {
+    this.database.setSettingsValue(APP_UPDATE_SETTINGS_KEY, state)
   }
 
   getSyncStatus(): SyncStatus {

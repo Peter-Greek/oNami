@@ -21,7 +21,7 @@ import {
   resolveRecordConflict,
   validateRecordEnvelope,
 } from '../src/shared/sync/records.js'
-import { parseByteRange, resolveAndroidDownload } from './downloads.js'
+import { parseByteRange, resolveAndroidDownload, resolveWindowsDownload } from './downloads.js'
 import { loadEnvFile } from './env.js'
 import { sweepBlobs } from './gc.js'
 import { selectPairingSnapshotDirection } from './pairing.js'
@@ -65,6 +65,7 @@ const config = {
   logRequests: process.env.ONAMI_LOG_REQUESTS !== '0',
   mediaDir: process.env.ONAMI_MEDIA_DIR ?? path.join(__dirname, 'media-store'),
   androidReleaseDir: process.env.ONAMI_ANDROID_RELEASE_DIR ?? path.join(__dirname, '..', 'release', 'android'),
+  windowsReleaseDir: process.env.ONAMI_WINDOWS_RELEASE_DIR ?? path.join(__dirname, '..', 'release', 'windows'),
 }
 
 if (!process.env.DATABASE_URL) {
@@ -532,7 +533,7 @@ const sendBlobBytes = (request, response, filePath, mimeType, sha256) => {
 
 const sendDownload = (request, response, filePath, contentType, downloadName, etag = null) => {
   if (!fs.existsSync(filePath)) {
-    return send(response, 404, { error: 'The Android build is not available yet.' })
+    return send(response, 404, { error: 'That build is not available yet.' })
   }
 
   const stat = fs.statSync(filePath)
@@ -615,6 +616,35 @@ const route = async (request, response, context) => {
       path.join(config.androidReleaseDir, 'android.json'),
       'application/json; charset=utf-8',
       'oNami-android.json',
+    )
+  }
+
+  const windowsDownload = resolveWindowsDownload(url.pathname, config.windowsReleaseDir)
+  if ((request.method === 'GET' || request.method === 'HEAD') && windowsDownload) {
+    if (windowsDownload.stale) {
+      return send(response, 410, {
+        error: 'That Windows build has been replaced.',
+        currentDownloadUrl: windowsDownload.currentVersion
+          ? `/downloads/onami-${windowsDownload.currentVersion}-setup.exe?v=${windowsDownload.currentVersion}`
+          : '/downloads/onami-latest-setup.exe',
+      })
+    }
+    return sendDownload(
+      request,
+      response,
+      windowsDownload.filePath,
+      'application/vnd.microsoft.portable-executable',
+      windowsDownload.downloadName,
+      windowsDownload.etag,
+    )
+  }
+  if (request.method === 'GET' && url.pathname === '/downloads/windows.json') {
+    return sendDownload(
+      request,
+      response,
+      path.join(config.windowsReleaseDir, 'windows.json'),
+      'application/json; charset=utf-8',
+      'oNami-windows.json',
     )
   }
 

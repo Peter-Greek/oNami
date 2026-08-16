@@ -24,6 +24,7 @@ import type {
   AppStats,
   AnswerInput,
   AnswerResult,
+  AppUpdateStatus,
   CardSummary,
   CreateCardInput,
   CreateDeckInput,
@@ -2010,6 +2011,16 @@ const ensureLibraryQueued = (): void => {
   writeSyncSettings({ ...readSyncSettings(), libraryQueued: true })
 }
 
+const browserUpdateStatus = (): AppUpdateStatus => ({
+  state: 'unsupported',
+  installedVersionCode: 0,
+  installedVersionName: 'browser',
+  release: null,
+  downloadedBytes: 0,
+  checkedAt: null,
+  error: null,
+})
+
 export const installBrowserOnami = async () => {
   if (window.onami) return
   document.documentElement.classList.add('browser-shell')
@@ -2531,6 +2542,18 @@ export const installBrowserOnami = async () => {
     },
     stats: {
       get: async (filter?: StatsFilterInput) => getStats(readState(), filter),
+    },
+    // The browser and Android builds are replaced by their own stores and by
+    // the APK download card, never by a Windows installer.
+    updates: {
+      getStatus: async () => browserUpdateStatus(),
+      check: async () => browserUpdateStatus(),
+      download: async () => {
+        throw new Error('This build cannot install its own updates.')
+      },
+      install: async () => {
+        throw new Error('This build cannot install its own updates.')
+      },
     },
     appWindow: {
       minimize: async () => undefined,

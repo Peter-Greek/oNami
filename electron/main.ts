@@ -2,6 +2,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import fs from 'node:fs'
 import os from 'node:os'
+import { spawn } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, Menu, net, Notification, protocol, type OpenDialogOptions } from 'electron'
 
 import type {
@@ -237,6 +238,20 @@ const registerIpc = (): void => {
     })
   )
   ipcMain.handle('transfers:get-status', () => getServices().getTransferStatus())
+
+  ipcMain.handle('updates:get-status', () => getServices().getUpdateStatus())
+  ipcMain.handle('updates:check', () => getServices().checkForUpdate())
+  ipcMain.handle('updates:download', () => getServices().downloadUpdate())
+  ipcMain.handle('updates:install', async () => {
+    const installerPath = await getServices().getVerifiedInstallerPath()
+    if (!installerPath) throw new Error('The update installer is not downloaded yet.')
+
+    // Detached, because the installer has to outlive the app it replaces.
+    log(`Launching update installer ${installerPath}`)
+    spawn(installerPath, [], { detached: true, stdio: 'ignore' }).unref()
+    quitAfterTransfers = false
+    app.quit()
+  })
 
   ipcMain.handle('window:minimize', (event) => {
     BrowserWindow.fromWebContents(event.sender)?.minimize()

@@ -529,7 +529,7 @@ export interface SyncRunOptions {
   background?: boolean
 }
 
-export type TransferKind = 'browse-upload' | 'browse-download' | 'sync'
+export type TransferKind = 'browse-upload' | 'browse-download' | 'sync' | 'app-update'
 
 export type TransferState = 'queued' | 'running' | 'paused' | 'completed' | 'error'
 
@@ -549,6 +549,33 @@ export interface TransferProgressEvent {
 export interface TransferStatus {
   active: TransferProgressEvent | null
   recent: TransferProgressEvent[]
+}
+
+export interface AppUpdateRelease {
+  versionCode: number
+  versionName: string
+  sha256: string
+  sizeBytes: number
+  downloadUrl: string
+}
+
+export type AppUpdateState =
+  /** Not a packaged Windows build, so there is nothing the host can replace. */
+  | 'unsupported'
+  | 'current'
+  | 'available'
+  /** The installer is downloaded and verified, waiting for the user to restart. */
+  | 'ready'
+
+export interface AppUpdateStatus {
+  state: AppUpdateState
+  installedVersionCode: number
+  installedVersionName: string
+  release: AppUpdateRelease | null
+  /** How far the installer download has got, in bytes, when one is in flight. */
+  downloadedBytes: number
+  checkedAt: string | null
+  error: string | null
 }
 
 export interface OnamiApi {
@@ -601,6 +628,16 @@ export interface OnamiApi {
   transfers: {
     getStatus(): Promise<TransferStatus>
     onProgress(listener: (event: TransferProgressEvent) => void): () => void
+  }
+  updates: {
+    /** Last known state without touching the network. */
+    getStatus(): Promise<AppUpdateStatus>
+    /** Asks the host what it has published for this platform. */
+    check(): Promise<AppUpdateStatus>
+    /** Downloads and verifies the installer, resuming a partial download. */
+    download(): Promise<AppUpdateStatus>
+    /** Runs the verified installer and quits so it can replace the app. */
+    install(): Promise<void>
   }
   stats: {
     get(filter?: StatsFilterInput): Promise<AppStats>

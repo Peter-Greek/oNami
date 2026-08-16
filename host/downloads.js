@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 const VERSIONED_APK_PATH = /^\/downloads\/onami-(\d+)\.apk$/
+const VERSIONED_SETUP_PATH = /^\/downloads\/onami-(\d+)-setup\.exe$/i
 
 export const parseByteRange = (rangeHeader, size) => {
   if (!rangeHeader) return null
@@ -34,8 +35,8 @@ export const parseByteRange = (rangeHeader, size) => {
   return { start, end }
 }
 
-const readReleaseMetadata = (releaseDir) => {
-  const metadataPath = path.join(releaseDir, 'android.json')
+export const readReleaseMetadata = (releaseDir, metadataFile) => {
+  const metadataPath = path.join(releaseDir, metadataFile)
   if (!fs.existsSync(metadataPath)) return null
 
   try {
@@ -46,22 +47,56 @@ const readReleaseMetadata = (releaseDir) => {
   }
 }
 
-export const resolveAndroidDownload = (pathname, releaseDir) => {
-  const versionMatch = VERSIONED_APK_PATH.exec(pathname)
-  if (pathname !== '/downloads/onami-latest.apk' && !versionMatch) return null
+/**
+ * Both platforms publish one `*-latest` file plus a metadata sidecar, and both
+ * answer versioned URLs so a client that cached an old link learns the build it
+ * asked for is gone instead of silently receiving a different one.
+ */
+const resolveVersionedDownload = ({
+  pathname,
+  releaseDir,
+  metadataFile,
+  latestPathname,
+  versionedPattern,
+  storedFileName,
+  downloadName,
+}) => {
+  const versionMatch = versionedPattern.exec(pathname)
+  if (pathname !== latestPathname && !versionMatch) return null
 
-  const metadata = readReleaseMetadata(releaseDir)
+  const metadata = readReleaseMetadata(releaseDir, metadataFile)
   const currentVersion = metadata?.versionCode == null ? null : String(metadata.versionCode)
   if (versionMatch && versionMatch[1] !== currentVersion) {
     return { stale: true, currentVersion }
   }
 
-  const downloadVersion = currentVersion ?? 'latest'
   return {
     stale: false,
     currentVersion,
-    filePath: path.join(releaseDir, 'onami-latest.apk'),
-    downloadName: `oNami-${downloadVersion}.apk`,
+    filePath: path.join(releaseDir, storedFileName),
+    downloadName: downloadName(currentVersion ?? 'latest'),
     etag: typeof metadata?.sha256 === 'string' ? `"sha256-${metadata.sha256}"` : null,
   }
 }
+
+export const resolveAndroidDownload = (pathname, releaseDir) =>
+  resolveVersionedDownload({
+    pathname,
+    releaseDir,
+    metadataFile: 'android.json',
+    latestPathname: '/downloads/onami-latest.apk',
+    versionedPattern: VERSIONED_APK_PATH,
+    storedFileName: 'onami-latest.apk',
+    downloadName: (version) => `oNami-${version}.apk`,
+  })
+
+export const resolveWindowsDownload = (pathname, releaseDir) =>
+  resolveVersionedDownload({
+    pathname: pathname.toLowerCase(),
+    releaseDir,
+    metadataFile: 'windows.json',
+    latestPathname: '/downloads/onami-latest-setup.exe',
+    versionedPattern: VERSIONED_SETUP_PATH,
+    storedFileName: 'onami-latest-setup.exe',
+    downloadName: (version) => `oNami-${version}-Setup.exe`,
+  })

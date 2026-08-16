@@ -13,6 +13,7 @@ oNami is a desktop flashcard app (Electron + React + TypeScript) for importing A
 - `npm run lint` — ESLint over the repo.
 - `npm test` — Vitest (`vitest run`). Tests live next to sources as `*.test.ts` (currently `electron/domain/*.test.ts`). Run a single file: `npx vitest run electron/domain/scheduler.test.ts`. Watch a single test by name: `npx vitest -t "name"`.
 - `npm run build:win` / `build:mac` / `dist` — package with electron-builder into `release/`.
+- `npm run windows:publish` — `build:win`, then publish the installer plus `windows.json` metadata into `release/windows/` for the host to serve as an in-app update.
 
 ### Native module gotcha (better-sqlite3)
 
@@ -52,6 +53,7 @@ When adding or changing a feature that crosses the boundary, update **all four**
 - **Media serving**: imported media is served through a custom `onami-media://<mediaId>` protocol registered in `main.ts`. On import, `AppServices.rewriteMedia` rewrites `[sound:...]` and `src=` references (including Anki cloze/audio) to point at this protocol. Renderer HTML is sanitized with DOMPurify before display.
 - **AI generation is optional**: `generateCards` calls OpenAI with a JSON-object response and validates it with a Zod schema (`aiDraftSchema`). The API key is encrypted at rest with Electron `safeStorage` and stored in the `settings` table; it never reaches the renderer (only `hasApiKey` is exposed).
 - **Frameless window**: the window is frameless/transparent; window controls (minimize/maximize/close) are custom and driven over `window:*` IPC channels.
+- **Self-update (Windows)**: the packaged app updates itself from the configured sync host. `scripts/build-windows.ps1 -Publish` stamps a timestamp `versionCode` into the Electron bundle (via `tsup.config.ts` `env`) and publishes the installer plus `release/windows/windows.json`; the host serves both under `/downloads/`. `AppServices.checkForUpdate` / `downloadUpdate` compare version codes, download the installer as an `app-update` transfer (resumable, checksum-verified against the metadata), and `updates:install` spawns it detached before quitting. Unpackaged and non-Windows builds report version code `0` and the updater reports `unsupported`.
 
 ## Conventions
 

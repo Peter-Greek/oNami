@@ -111,6 +111,42 @@ Required event envelope:
 }
 ```
 
+## Client Distribution
+
+The host also holds the bundle builds its clients update from. This is
+deliberately separate from sync: it is static, unauthenticated, and read-only,
+because a device has to be able to update itself before it pairs and after its
+device token has expired.
+
+```text
+GET /downloads/windows.json
+GET /downloads/onami-latest-setup.exe
+GET /downloads/onami-<versionCode>-setup.exe
+GET /downloads/android.json
+GET /downloads/onami-latest.apk
+GET /downloads/onami-<versionCode>.apk
+```
+
+Each platform publishes one file plus a metadata sidecar naming its
+`versionCode`, `versionName`, `sizeBytes`, `sha256`, and `downloadUrl`. Version
+codes are build timestamps, so "newer" is a single integer comparison on both
+platforms and neither client has to parse a version string.
+
+Three rules make this safe to poll:
+
+- **Publishing is atomic.** The build is written under a temporary name and
+  moved into place, so a client that polls mid-publish never gets half a file.
+- **A replaced version answers `410`, not different bytes.** A versioned URL
+  names one exact build. Once it is gone the host says so and points at the
+  current download rather than serving something else under the old name.
+- **The client verifies, the host does not have to be trusted for integrity.**
+  The download is checked against the published SHA-256 before it is run, and
+  the download link must resolve to the same origin the metadata came from.
+
+Installer downloads honour `Range`, so an interrupted update resumes from its
+byte offset instead of restarting — the same property the blob store has, and it
+matters more here because an installer is far larger than a media file.
+
 ## Media Handling
 
 Media should not be embedded in normal sync events. Use `media.put` events for metadata and upload the blob separately. Store blobs by SHA-256 hash or generated media id. Clients should download media lazily when a deck/card references it.

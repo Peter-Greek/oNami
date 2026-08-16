@@ -4,15 +4,15 @@ import path from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { parseByteRange, resolveAndroidDownload } from './downloads.js'
+import { parseByteRange, resolveAndroidDownload, resolveWindowsDownload } from './downloads.js'
 
 const temporaryDirectories = []
 
-const createReleaseDirectory = (versionCode = 1234) => {
+const createReleaseDirectory = (versionCode = 1234, metadataFile = 'android.json') => {
   const releaseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'onami-downloads-'))
   temporaryDirectories.push(releaseDir)
   fs.writeFileSync(
-    path.join(releaseDir, 'android.json'),
+    path.join(releaseDir, metadataFile),
     `\uFEFF${JSON.stringify({ versionCode, sha256: 'a'.repeat(64) })}`,
   )
   return releaseDir
@@ -55,5 +55,37 @@ describe('resolveAndroidDownload', () => {
       stale: true,
       currentVersion: '1234',
     })
+  })
+})
+
+describe('resolveWindowsDownload', () => {
+  it('serves the published installer under a version-specific download name', () => {
+    const releaseDir = createReleaseDirectory(1234, 'windows.json')
+    expect(resolveWindowsDownload('/downloads/onami-latest-setup.exe', releaseDir)).toMatchObject({
+      stale: false,
+      currentVersion: '1234',
+      filePath: path.join(releaseDir, 'onami-latest-setup.exe'),
+      downloadName: 'oNami-1234-Setup.exe',
+      etag: `"sha256-${'a'.repeat(64)}"`,
+    })
+  })
+
+  it('accepts only the currently published versioned route', () => {
+    const releaseDir = createReleaseDirectory(1234, 'windows.json')
+    expect(resolveWindowsDownload('/downloads/onami-1234-setup.exe', releaseDir)?.stale).toBe(false)
+    expect(resolveWindowsDownload('/downloads/onami-999-setup.exe', releaseDir)).toEqual({
+      stale: true,
+      currentVersion: '1234',
+    })
+  })
+
+  it('matches the installer route regardless of case', () => {
+    const releaseDir = createReleaseDirectory(1234, 'windows.json')
+    expect(resolveWindowsDownload('/downloads/oNami-1234-Setup.exe', releaseDir)?.stale).toBe(false)
+  })
+
+  it('ignores routes belonging to the Android build', () => {
+    const releaseDir = createReleaseDirectory(1234, 'windows.json')
+    expect(resolveWindowsDownload('/downloads/onami-latest.apk', releaseDir)).toBeNull()
   })
 })
