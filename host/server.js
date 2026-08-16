@@ -7,7 +7,17 @@ import { fileURLToPath } from 'node:url'
 
 import { PrismaClient } from '@prisma/client'
 
+import {
+  BLOB_GRACE,
+  isBlobCollectable,
+  normalizeSha256,
+  parseContentRange,
+  planBlobCheck,
+  resolveBlobPatch,
+} from './blobs.js'
 import { parseByteRange, resolveAndroidDownload } from './downloads.js'
+import { loadEnvFile } from './env.js'
+import { sweepBlobs } from './gc.js'
 import { selectPairingSnapshotDirection } from './pairing.js'
 import {
   canDeviceReceiveSnapshot,
@@ -24,19 +34,6 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-const loadEnvFile = (filePath) => {
-  if (!fs.existsSync(filePath)) return
-  for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/)) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/)
-    if (!match) continue
-    const [, key, rawValue] = match
-    if (process.env[key] !== undefined) continue
-    process.env[key] = rawValue.trim().replace(/^"(.*)"$/, '$1')
-  }
-}
-
 loadEnvFile(path.join(__dirname, '.env'))
 
 const config = {
@@ -49,6 +46,14 @@ const config = {
   maxGlobalDeckJsonBytes: Number(process.env.ONAMI_MAX_GLOBAL_DECK_JSON_BYTES ?? 8 * 1024 * 1024),
   // Full-data snapshots and single media blobs are much larger than incremental events.
   maxBlobBytes: Number(process.env.ONAMI_MAX_BLOB_BYTES ?? 64 * 1024 * 1024),
+  // One resumable upload chunk. Large enough to be efficient, small enough that
+  // a dropped connection costs little work.
+  maxChunkBytes: Number(process.env.ONAMI_MAX_BLOB_CHUNK_BYTES ?? 16 * 1024 * 1024),
+  blobSweepIntervalMs: Number(process.env.ONAMI_BLOB_SWEEP_INTERVAL_MS ?? 60 * 60 * 1000),
+  // Off by default so the first reclaim on an existing host is a deliberate,
+  // reviewed run of gc.js rather than a surprise at startup.
+  blobSweepEnabled: process.env.ONAMI_BLOB_SWEEP_ENABLED === '1',
+  logRequests: process.env.ONAMI_LOG_REQUESTS !== '0',
   mediaDir: process.env.ONAMI_MEDIA_DIR ?? path.join(__dirname, 'media-store'),
   androidReleaseDir: process.env.ONAMI_ANDROID_RELEASE_DIR ?? path.join(__dirname, '..', 'release', 'android'),
 }
@@ -61,15 +66,126 @@ if (!process.env.DATABASE_URL) {
 fs.mkdirSync(config.mediaDir, { recursive: true })
 
 const sanitizeSha256 = (value) => {
-  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/i.test(value)) {
-    throw httpError(400, 'sha256 must be a 64-character hex string.')
-  }
-  return value.toLowerCase()
+  const normalized = normalizeSha256(value)
+  if (!normalized) throw httpError(400, 'sha256 must be a 64-character hex string.')
+  return normalized
 }
 
 const mediaBlobPath = (sha256) => path.join(config.mediaDir, sanitizeSha256(sha256))
 
+/** Where a resumable upload accumulates before its hash is verified. */
+const blobPartPath = (sha256) => `${mediaBlobPath(sha256)}.part`
+
 const prisma = new PrismaClient()
+
+const hashFile = (filePath) =>
+  new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = fs.createReadStream(filePath)
+    stream.on('error', reject)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
+
+/**
+ * Streams a request body onto the end of a file. On any failure the file is
+ * truncated back to where it started, so a half-written chunk never becomes a
+ * phantom offset the client would then skip past.
+ */
+const appendRequestBody = async (request, filePath, expectedLength) => {
+  const startSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0
+  let written = 0
+
+  try {
+    await new Promise((resolve, reject) => {
+      const target = fs.createWriteStream(filePath, { flags: 'a' })
+      request.on('data', (chunk) => {
+        written += chunk.length
+        if (written > expectedLength) {
+          request.destroy()
+          reject(httpError(400, 'The request body is longer than its Content-Range declares.'))
+        }
+      })
+      pipeline(request, target, (error) => (error ? reject(error) : resolve()))
+    })
+  } catch (error) {
+    fs.truncateSync(filePath, startSize)
+    throw error
+  }
+
+  if (written !== expectedLength) {
+    fs.truncateSync(filePath, startSize)
+    throw httpError(400, 'The request body is shorter than its Content-Range declares.')
+  }
+
+  return written
+}
+
+/**
+ * Serializes work per blob hash. The host runs as a single PM2 fork, so an
+ * in-process lock is enough to stop two concurrent chunks for the same file
+ * from interleaving their appends.
+ */
+const blobLocks = new Map()
+
+const withBlobLock = async (sha256, run) => {
+  const previous = blobLocks.get(sha256) ?? Promise.resolve()
+  const current = previous.then(run, run)
+  blobLocks.set(
+    sha256,
+    current.then(
+      () => {
+        if (blobLocks.get(sha256) === current) blobLocks.delete(sha256)
+      },
+      () => {
+        if (blobLocks.get(sha256) === current) blobLocks.delete(sha256)
+      }
+    )
+  )
+  return current
+}
+
+/**
+ * Reconciles a `blobs` row against what is actually on disk. Files written by
+ * the legacy `POST /media` route have no row at all, so disk presence — not the
+ * database — decides whether a blob is complete.
+ */
+const reconcileBlobState = (sha256, row) => {
+  const finalPath = mediaBlobPath(sha256)
+  if (fs.existsSync(finalPath)) {
+    const byteSize = fs.statSync(finalPath).size
+    return {
+      sha256,
+      byteSize: row?.byteSize ?? byteSize,
+      receivedBytes: byteSize,
+      mimeType: row?.mimeType ?? 'application/octet-stream',
+      complete: true,
+    }
+  }
+
+  const partPath = blobPartPath(sha256)
+  const receivedBytes = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0
+  if (!row && receivedBytes === 0) return null
+
+  return {
+    sha256,
+    byteSize: row?.byteSize ?? 0,
+    receivedBytes,
+    mimeType: row?.mimeType ?? 'application/octet-stream',
+    complete: false,
+  }
+}
+
+const loadBlobState = async (sha256) =>
+  reconcileBlobState(sha256, await prisma.blob.findUnique({ where: { sha256 } }))
+
+/** Records that something still needs this blob. Idempotent. */
+const addBlobRef = (sha256, scopeKind, scopeId) =>
+  prisma.blobRef.upsert({
+    where: { sha256_scopeKind_scopeId: { sha256, scopeKind, scopeId } },
+    update: {},
+    create: { sha256, scopeKind, scopeId },
+  })
 
 const now = () => new Date()
 const nowIso = () => new Date().toISOString()
@@ -79,11 +195,13 @@ const tokenHash = (token) => sha256(`token:${token}`)
 const codeHash = (code) => sha256(`pairing:${normalizePairingCode(code)}`)
 
 const shouldLogRoute = (pathname) =>
-  pathname.startsWith('/sync/') ||
-  pathname.startsWith('/pairing/') ||
-  pathname.startsWith('/devices/') ||
-  pathname.startsWith('/media') ||
-  pathname.startsWith('/global-decks')
+  config.logRequests &&
+  (pathname.startsWith('/sync/') ||
+    pathname.startsWith('/pairing/') ||
+    pathname.startsWith('/devices/') ||
+    pathname.startsWith('/media') ||
+    pathname.startsWith('/blob') ||
+    pathname.startsWith('/global-decks'))
 
 const createRequestContext = (request) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
@@ -346,14 +464,58 @@ const readJson = async (request, maxBytes = config.maxJsonBytes) => {
   }
 }
 
+const corsHeaders = {
+  'access-control-allow-origin': config.corsOrigin,
+  'access-control-allow-methods': 'GET,HEAD,POST,PATCH,OPTIONS',
+  'access-control-allow-headers': 'content-type,authorization,content-range,upload-offset',
+  // The Android build runs in a WebView, so resumable uploads only work if the
+  // page is allowed to read the offset headers back off the response.
+  'access-control-expose-headers': 'upload-offset,upload-complete,content-range,accept-ranges',
+}
+
 const send = (response, status, body) => {
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': config.corsOrigin,
-    'access-control-allow-methods': 'GET,POST,OPTIONS',
-    'access-control-allow-headers': 'content-type,authorization',
+    ...corsHeaders,
   })
   response.end(JSON.stringify(body))
+}
+
+/** Streams stored blob bytes, honouring `Range` so downloads resume too. */
+const sendBlobBytes = (request, response, filePath, mimeType, sha256) => {
+  const stat = fs.statSync(filePath)
+  const range = parseByteRange(request.headers.range, stat.size)
+  const baseHeaders = {
+    'content-type': mimeType || 'application/octet-stream',
+    'accept-ranges': 'bytes',
+    // Content-addressed bytes can never change, so they are safe to cache hard.
+    'cache-control': 'public, max-age=31536000, immutable',
+    etag: `"sha256-${sha256}"`,
+    'x-content-type-options': 'nosniff',
+    ...corsHeaders,
+  }
+
+  if (range?.invalid) {
+    response.writeHead(416, { ...baseHeaders, 'content-range': `bytes */${stat.size}`, 'content-length': 0 })
+    return response.end()
+  }
+
+  const start = range?.start ?? 0
+  const end = range?.end ?? stat.size - 1
+  response.writeHead(range ? 206 : 200, {
+    ...baseHeaders,
+    'content-length': Math.max(end - start + 1, 0),
+    ...(range ? { 'content-range': `bytes ${start}-${end}/${stat.size}` } : {}),
+  })
+  if (request.method === 'HEAD') return response.end()
+
+  return new Promise((resolve) => {
+    const stream = fs.createReadStream(filePath, range ? { start, end } : undefined)
+    pipeline(stream, response, (error) => {
+      if (error && !response.destroyed) response.destroy(error)
+      resolve()
+    })
+  })
 }
 
 const sendDownload = (request, response, filePath, contentType, downloadName, etag = null) => {
@@ -596,6 +758,25 @@ const route = async (request, response, context) => {
         },
       })
     })
+
+    // Re-point this deck's blob references at exactly the media it publishes
+    // now, so media dropped by a re-publish becomes collectable.
+    await prisma.blobRef.deleteMany({ where: { scopeKind: 'published-deck', scopeId: deck.id } })
+    for (const media of input.media) {
+      await prisma.blob.upsert({
+        where: { sha256: media.sha256 },
+        create: {
+          sha256: media.sha256,
+          byteSize: media.byteSize,
+          receivedBytes: media.byteSize,
+          mimeType: media.mimeType,
+          complete: true,
+        },
+        update: {},
+      })
+      await addBlobRef(media.sha256, 'published-deck', deck.id)
+    }
+
     return send(response, 200, { deck: globalDeckResponse(deck, true) })
   }
 
@@ -878,6 +1059,156 @@ const route = async (request, response, context) => {
     return send(response, 200, { ok: true })
   }
 
+  // ---- Content-addressed blob store ----
+  //
+  // Replaces the base64 `/media` and `/global-decks/media` routes. Uploads
+  // resume from a byte offset, downloads honour Range, and storage is reclaimed
+  // by reference counting instead of a client acknowledgement.
+
+  if (request.method === 'POST' && url.pathname === '/blobs/check') {
+    const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
+    const body = await readJson(request)
+    if (!Array.isArray(body.sha256)) throw httpError(400, 'sha256 must be an array of hashes.')
+    if (body.sha256.length > 5000) throw httpError(400, 'Too many hashes in one check.')
+
+    const hashes = [...new Set(body.sha256.map((value) => sanitizeSha256(value)))]
+    const rows = await prisma.blob.findMany({ where: { sha256: { in: hashes } } })
+    const rowsByHash = new Map(rows.map((row) => [row.sha256, row]))
+    const stored = hashes
+      .map((sha256) => reconcileBlobState(sha256, rowsByHash.get(sha256) ?? null))
+      .filter((state) => state !== null)
+
+    const plan = planBlobCheck(hashes, stored)
+    logRequest(context, 'info', 'blobs.check', {
+      requested: hashes.length,
+      present: plan.present.length,
+      partial: plan.partial.length,
+      missing: plan.missing.length,
+    })
+    return send(response, 200, plan)
+  }
+
+  const blobMatch = url.pathname.match(/^\/blob\/([a-f0-9]{64})$/i)
+
+  if (request.method === 'HEAD' && blobMatch) {
+    await authenticate(request)
+    const sha256 = sanitizeSha256(blobMatch[1])
+    const stored = await loadBlobState(sha256)
+    if (!stored) {
+      response.writeHead(404, { 'upload-offset': '0', 'content-length': 0, ...corsHeaders })
+      return response.end()
+    }
+    response.writeHead(200, {
+      'upload-offset': String(stored.receivedBytes),
+      'upload-complete': stored.complete ? '?1' : '?0',
+      'content-length': 0,
+      ...corsHeaders,
+    })
+    return response.end()
+  }
+
+  if (request.method === 'PATCH' && blobMatch) {
+    const device = await authenticate(request)
+    addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
+    const sha256 = sanitizeSha256(blobMatch[1])
+    const range = parseContentRange(request.headers['content-range'], config)
+    if (range.invalid) throw httpError(400, range.message)
+
+    const result = await withBlobLock(sha256, async () => {
+      const stored = await loadBlobState(sha256)
+      const decision = resolveBlobPatch({ stored, range })
+
+      if (decision.outcome === 'already-complete') {
+        // A retry after a lost response. Drain the body and answer success so
+        // the client can move on rather than re-uploading the whole file.
+        request.resume()
+        await addBlobRef(sha256, 'sync-group', device.syncGroupId)
+        return { status: 200, sha256, offset: decision.offset, complete: true, reused: true }
+      }
+
+      if (decision.outcome !== 'append') {
+        request.resume()
+        return {
+          status: 409,
+          sha256,
+          offset: decision.offset,
+          complete: false,
+          error: decision.message,
+        }
+      }
+
+      await prisma.blob.upsert({
+        where: { sha256 },
+        create: {
+          sha256,
+          byteSize: range.total,
+          receivedBytes: range.start,
+          mimeType: optionalString(request.headers, 'content-type') ?? 'application/octet-stream',
+        },
+        update: {},
+      })
+
+      const partPath = blobPartPath(sha256)
+      await appendRequestBody(request, partPath, range.length)
+      const receivedBytes = fs.statSync(partPath).size
+
+      if (!decision.completes) {
+        await prisma.blob.update({ where: { sha256 }, data: { receivedBytes } })
+        return { status: 200, sha256, offset: receivedBytes, complete: false }
+      }
+
+      const actualHash = await hashFile(partPath)
+      if (actualHash !== sha256) {
+        // The assembled bytes are not what was promised. Drop everything so the
+        // client restarts this one blob rather than serving corrupt content.
+        fs.rmSync(partPath, { force: true })
+        await prisma.blob.delete({ where: { sha256 } }).catch(() => undefined)
+        throw httpError(400, 'The uploaded bytes do not match the requested sha256.')
+      }
+
+      fs.renameSync(partPath, mediaBlobPath(sha256))
+      await prisma.blob.update({
+        where: { sha256 },
+        data: { receivedBytes, byteSize: receivedBytes, complete: true },
+      })
+      await addBlobRef(sha256, 'sync-group', device.syncGroupId)
+      return { status: 200, sha256, offset: receivedBytes, complete: true }
+    })
+
+    logRequest(context, 'info', 'blob.patch', {
+      sha256: sha256.slice(0, 12),
+      status: result.status,
+      offset: result.offset,
+      complete: result.complete,
+      chunkBytes: range.length,
+    })
+    const { status, ...payload } = result
+    return send(response, status, payload)
+  }
+
+  if (request.method === 'GET' && blobMatch) {
+    const sha256 = sanitizeSha256(blobMatch[1])
+    const stored = await loadBlobState(sha256)
+    if (!stored?.complete) throw httpError(404, 'Blob not found.')
+
+    // Published deck media is public; anything else needs a paired device. A
+    // hash is unguessable, but sync media should not become fetchable just
+    // because someone learned its digest.
+    const publiclyReadable = await prisma.blobRef.findFirst({
+      where: { sha256, scopeKind: 'published-deck' },
+      select: { sha256: true },
+    })
+    if (!publiclyReadable) await authenticate(request)
+
+    logRequest(context, 'info', 'blob.get', {
+      sha256: sha256.slice(0, 12),
+      byteSize: stored.byteSize,
+      ranged: Boolean(request.headers.range),
+    })
+    return sendBlobBytes(request, response, mediaBlobPath(sha256), stored.mimeType, sha256)
+  }
+
   if (request.method === 'POST' && url.pathname === '/media') {
     const device = await authenticate(request)
     addLogFields(context, { deviceId: device.id, syncGroupId: device.syncGroupId })
@@ -903,6 +1234,14 @@ const route = async (request, response, context) => {
       },
       update: { byteSize: data.length, mimeType, storageKey: sha256 },
     })
+    // Mirror into the blob store so this upload is reference-counted like any
+    // other, and is reclaimed if its sync group goes away.
+    await prisma.blob.upsert({
+      where: { sha256 },
+      create: { sha256, byteSize: data.length, receivedBytes: data.length, mimeType, complete: true },
+      update: { byteSize: data.length, receivedBytes: data.length, mimeType, complete: true },
+    })
+    await addBlobRef(sha256, 'sync-group', device.syncGroupId)
 
     logRequest(context, 'info', 'media.upload', {
       sha256: sha256.slice(0, 12),
@@ -1098,7 +1437,7 @@ const route = async (request, response, context) => {
   return send(response, 404, { error: 'Not found.' })
 }
 
-const server = http.createServer((request, response) => {
+export const server = http.createServer((request, response) => {
   const context = createRequestContext(request)
   response.setHeader('x-request-id', context.requestId)
   route(request, response, context).catch((error) => {
@@ -1114,7 +1453,26 @@ const server = http.createServer((request, response) => {
   })
 })
 
+// Storage reclaim is opt-in so the first run on an existing host is a reviewed
+// `node host/gc.js` rather than a surprise at startup.
+let blobSweepTimer = null
+if (config.blobSweepEnabled) {
+  const runSweep = async () => {
+    try {
+      const summary = await sweepBlobs({ prisma, mediaDir: config.mediaDir, apply: true })
+      if (summary.deleted > 0) {
+        console.log(JSON.stringify({ time: nowIso(), level: 'info', event: 'blobs.sweep', ...summary }))
+      }
+    } catch (error) {
+      console.error(JSON.stringify({ time: nowIso(), level: 'error', event: 'blobs.sweep', error: error.message }))
+    }
+  }
+  blobSweepTimer = setInterval(runSweep, config.blobSweepIntervalMs)
+  blobSweepTimer.unref?.()
+}
+
 const shutdown = async () => {
+  if (blobSweepTimer) clearInterval(blobSweepTimer)
   server.close(async () => {
     await prisma.$disconnect()
     process.exit(0)

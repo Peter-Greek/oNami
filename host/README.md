@@ -125,10 +125,12 @@ ONAMI_DEVICE_TOKEN_TTL_MS=604800000
 ONAMI_MAX_JSON_BYTES=1048576
 ONAMI_MAX_GLOBAL_DECK_JSON_BYTES=8388608
 ONAMI_MAX_BLOB_BYTES=67108864
+ONAMI_MAX_BLOB_CHUNK_BYTES=16777216
+ONAMI_BLOB_SWEEP_ENABLED=0
 ONAMI_MEDIA_DIR=./media-store
 ```
 
-`ONAMI_MAX_BLOB_BYTES` caps a single full-data snapshot or media upload; `ONAMI_MEDIA_DIR` is where content-addressed media blobs are written on disk.
+`ONAMI_MAX_BLOB_BYTES` caps a single full-data snapshot or media upload; `ONAMI_MEDIA_DIR` is where content-addressed media blobs are written on disk. See the blob store section for the chunk and sweep settings.
 
 ## API Shape
 
@@ -141,6 +143,10 @@ POST /global-decks/:id/heart
 POST /global-decks/media/check
 POST /global-decks/media/:sha256
 GET  /global-decks/media/:sha256
+POST /blobs/check
+HEAD /blob/:sha256
+PATCH /blob/:sha256
+GET  /blob/:sha256
 POST /devices/bootstrap
 POST /pairing/start
 POST /pairing/join
@@ -192,6 +198,66 @@ The host verifies the signature against the paired device's stored public key.
    modes follow the selected platform direction.
 6. Each device requests a device token.
 7. Devices push local outbox events, pull remote events, and ack the cursor.
+
+## Blob Store
+
+All binary content — device sync media and published deck media alike — belongs
+in one content-addressed store. A blob is named by the SHA-256 of its bytes, so
+the same audio file is stored once no matter how many sync groups or decks use
+it.
+
+Uploads are resumable, which is the point:
+
+```text
+POST  /blobs/check              { "sha256": [...] }
+                                -> { present, partial: [{sha256, offset}], missing }
+HEAD  /blob/:sha256             -> Upload-Offset, Upload-Complete
+PATCH /blob/:sha256             raw bytes, Content-Range: bytes <start>-<end>/<total>
+                                -> { sha256, offset, complete }
+GET   /blob/:sha256             raw bytes, Accept-Ranges: bytes, honours Range
+```
+
+A client that is interrupted asks `HEAD` where the host stopped and continues
+from that byte. It never restarts a file. A `PATCH` at the wrong offset answers
+`409` carrying the correct offset, so a confused client corrects itself in one
+round trip. A `PATCH` for a blob that is already complete answers `200` so a
+retry after a lost response costs nothing. The host verifies the assembled bytes
+hash to the requested name before publishing them; a mismatch discards the
+upload.
+
+`PATCH`, `HEAD`, and `POST /blobs/check` require a device token. `GET` is public
+only for blobs referenced by a published deck; sync media still requires a token.
+
+`ONAMI_MAX_BLOB_CHUNK_BYTES` caps one chunk (default 16 MiB) and
+`ONAMI_MAX_BLOB_BYTES` caps a whole blob.
+
+### Storage reclaim
+
+A blob lives as long as something references it, tracked in `blob_refs` with a
+scope of `sync-group` or `published-deck`. Nothing depends on a client
+acknowledging anything, which is what previously stranded media whenever a
+transfer crashed before its ack.
+
+Report what could be reclaimed, changing nothing:
+
+```powershell
+node host/gc.js
+```
+
+Reclaim it:
+
+```powershell
+node host/gc.js --apply
+```
+
+Both runs first backfill `blobs` and `blob_refs` from what is already on disk:
+published deck media is referenced, and sync media is referenced only where a
+pending snapshot still needs it. A complete blob is deleted 24 hours after it
+loses its last reference; an upload nobody resumes is abandoned after 7 days.
+
+Set `ONAMI_BLOB_SWEEP_ENABLED=1` to also run the sweep hourly inside the server.
+It is off by default so the first reclaim on an existing host is a deliberate,
+reviewed `gc.js` run.
 
 ## Full Snapshot Handoff
 

@@ -127,6 +127,43 @@ model SyncSnapshot {
   @@map("sync_snapshots")
 }
 
+/// Content-addressed blob store, shared by device sync and the published deck
+/// library. One row per distinct sha256 regardless of how many sync groups or
+/// decks reference it, so the same audio file is never stored twice.
+///
+/// `receivedBytes` tracks a resumable upload in progress and `complete` flips
+/// once the assembled bytes hash to the row's id. The file on disk is the
+/// authority for the resume offset; this column mirrors it for reporting.
+model Blob {
+  sha256        String   @id
+  byteSize      Int      @map("byte_size")
+  receivedBytes Int      @default(0) @map("received_bytes")
+  mimeType      String   @map("mime_type")
+  complete      Boolean  @default(false)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  refs BlobRef[]
+
+  @@index([complete, updatedAt])
+  @@map("blobs")
+}
+
+/// One reason a blob must be kept alive. Collection is driven entirely by these
+/// rows, so no client acknowledgement is ever required to reclaim storage.
+model BlobRef {
+  sha256    String
+  scopeKind String   @map("scope_kind")
+  scopeId   String   @map("scope_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  blob Blob @relation(fields: [sha256], references: [sha256], onDelete: Cascade)
+
+  @@id([sha256, scopeKind, scopeId])
+  @@index([scopeKind, scopeId])
+  @@map("blob_refs")
+}
+
 model DeviceToken {
   id        String   @id @default(uuid()) @db.Uuid
   deviceId  String   @map("device_id") @db.Uuid
