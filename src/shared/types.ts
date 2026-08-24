@@ -605,6 +605,13 @@ export interface OnamiApi {
   study: {
     startSession(deckId: string, mode: StudyMode, settings: StudySessionSettings): Promise<StudySession>
     answer(input: AnswerInput): Promise<AnswerResult>
+    /**
+     * Releases a session the user finished, exited, or navigated away from.
+     * Automatic syncing is held back while a session is open, so this is also
+     * what lets the answers queued during the session go out. Unknown ids are
+     * ignored: answering the last card already closes the session.
+     */
+    endSession(sessionId: string): Promise<void>
   }
   ai: {
     getSettings(): Promise<AiSettings>

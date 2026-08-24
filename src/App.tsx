@@ -898,6 +898,20 @@ function StudyView({
   const [publishNote, setPublishNote] = useState('')
   const cardStartedAtRef = useRef(performance.now())
   const cardRevealedAtRef = useRef<number | null>(null)
+  const sessionIdRef = useRef<string | null>(null)
+
+  /**
+   * Tells the main process the user has stopped answering. Automatic syncing
+   * is held for the length of a session, so an abandoned session has to be
+   * released or what it queued would sit there unsent. Answering the last card
+   * releases it already, which makes the call for that session a no-op.
+   */
+  const releaseSession = useCallback(() => {
+    const sessionId = sessionIdRef.current
+    sessionIdRef.current = null
+    if (!sessionId) return
+    void window.onami.study.endSession(sessionId).catch(() => undefined)
+  }, [])
 
   const current = session?.cards[index]
 
@@ -920,17 +934,28 @@ function StudyView({
   }, [])
 
   useEffect(() => {
+    releaseSession()
     setSession(null)
     setIndex(0)
     setShowBack(false)
     setRecommendation('')
     resetCardTimer()
-  }, [mode, resetCardTimer, selectedDeckId])
+  }, [mode, releaseSession, resetCardTimer, selectedDeckId])
 
   useEffect(() => {
+    sessionIdRef.current = session?.id ?? null
     onSessionActiveChange(Boolean(session))
-    return () => onSessionActiveChange(false)
   }, [session, onSessionActiveChange])
+
+  // Leaving the Study tab unmounts the view mid-session; that abandons the
+  // session just as much as the Exit button does.
+  useEffect(
+    () => () => {
+      onSessionActiveChange(false)
+      releaseSession()
+    },
+    [onSessionActiveChange, releaseSession]
+  )
 
   useEffect(() => {
     if (!session || !current) return
@@ -1001,6 +1026,7 @@ function StudyView({
       })
       if (result.recommendation) setRecommendation(result.recommendation)
       if (index + 1 >= session.cards.length) {
+        releaseSession()
         setSession(null)
         setIndex(0)
         setShowBack(false)
@@ -1013,6 +1039,7 @@ function StudyView({
     })
 
   const exitSession = () => {
+    releaseSession()
     setSession(null)
     setIndex(0)
     setShowBack(false)

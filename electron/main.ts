@@ -204,6 +204,9 @@ const registerIpc = (): void => {
       getServices().startSession(deckId, mode, settings)
   )
   ipcMain.handle('study:answer', (_event, input: AnswerInput) => getServices().answer(input))
+  ipcMain.handle('study:end-session', (_event, sessionId: string) =>
+    getServices().endSession(sessionId)
+  )
 
   ipcMain.handle('ai:get-settings', () => getServices().getAiSettings())
   ipcMain.handle('ai:save-settings', (_event, input: SaveAiSettingsInput) =>

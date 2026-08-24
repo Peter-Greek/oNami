@@ -164,6 +164,7 @@ export class AppServices {
   private readonly scheduler: SchedulerService
   private readonly sessions = new Map<string, StudySessionRuntime>()
   private autoSyncTimer: NodeJS.Timeout | null = null
+  private autoSyncDeferred = false
   private syncInFlight: Promise<SyncRunResult> | null = null
   private transportInstance: Transport | null = null
   private blobClientInstance: BlobClient | null = null
@@ -302,10 +303,12 @@ export class AppServices {
 
   resetDeckScheduling(deckId: string): void {
     this.database.resetDeckScheduling(deckId)
+    // Sessions go first: they are built on the scheduling that just went away,
+    // and dropping them lets the card records below sync straight out.
+    this.sessions.clear()
     for (const card of this.database.listCards(deckId)) {
       this.queueCardUpsert(card.id)
     }
-    this.sessions.clear()
   }
 
   listDecks(): DeckSummary[] {
@@ -744,6 +747,13 @@ export class AppServices {
     const selected = selectCardsForMode(deck.cards, mode, settings)
     const id = randomUUID()
     const unitTestThreshold = settings.unitTestThreshold ?? 0.8
+    // An auto-sync queued just before the session started would land on the
+    // first card; hold it with everything the session itself queues.
+    if (this.autoSyncTimer) {
+      clearTimeout(this.autoSyncTimer)
+      this.autoSyncTimer = null
+      this.autoSyncDeferred = true
+    }
     this.sessions.set(id, {
       id,
       mode,
@@ -769,7 +779,10 @@ export class AppServices {
 
     if (session.mode === 'unit-test') {
       if (input.rating === 'hard') this.queueCardUpsert(input.cardId)
-      if (result.sessionComplete) this.queueDeckUpsert(session.deckId)
+      if (result.sessionComplete) {
+        this.queueDeckUpsert(session.deckId)
+        this.endSession(session.id)
+      }
       return result
     }
 
@@ -777,7 +790,18 @@ export class AppServices {
     // scheduling, which is a record whose rank rises with each review, and it
     // appends to the review log, which is picked up by the unsent-review push.
     this.queueCardUpsert(input.cardId)
+    if (result.sessionComplete) this.endSession(session.id)
     return result
+  }
+
+  /**
+   * Ends a session the user finished, exited, or navigated away from, and
+   * releases the sync hold it was holding. Answering the last card already
+   * calls this, so the renderer's own call for that session is a no-op.
+   */
+  endSession(sessionId: string): void {
+    if (!this.sessions.delete(sessionId)) return
+    if (this.sessions.size === 0) this.runDeferredAutoSync()
   }
 
   getAiSettings(): AiSettings {
@@ -1303,7 +1327,6 @@ export class AppServices {
     await this.uploadMissingMedia(onProgress)
     await this.downloadMissingMedia(onProgress)
 
-    if (applied > 0) this.sessions.clear()
     onProgress?.({
       stage: 'complete',
       message: `Sync complete. Sent ${pushed}, received ${pulled}, applied ${applied}.`,
@@ -1624,6 +1647,18 @@ export class AppServices {
   private scheduleAutoSync(): void {
     const stored = this.getStoredSyncSettings()
     if (!stored.syncGroupId) return
+    // Syncing mid-session interrupts the card the user is on: the transfer
+    // banner shifts the layout out from under them, and applying pulled
+    // records drops the in-memory sessions, so the next answer fails with
+    // "Study session not found". What the session queues waits for its end.
+    if (this.sessions.size > 0) {
+      this.autoSyncDeferred = true
+      if (this.autoSyncTimer) {
+        clearTimeout(this.autoSyncTimer)
+        this.autoSyncTimer = null
+      }
+      return
+    }
     if (this.autoSyncTimer) return
 
     this.autoSyncTimer = setTimeout(() => {
@@ -1633,6 +1668,13 @@ export class AppServices {
       })
     }, 500)
     this.autoSyncTimer.unref?.()
+  }
+
+  /** Runs the sync a study session held back, once the last one has ended. */
+  private runDeferredAutoSync(): void {
+    if (!this.autoSyncDeferred) return
+    this.autoSyncDeferred = false
+    this.scheduleAutoSync()
   }
 
   private getSyncBackupState(input: {

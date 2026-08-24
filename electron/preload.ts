@@ -27,6 +27,7 @@ const api: OnamiApi = {
     startSession: (deckId, mode, settings) =>
       ipcRenderer.invoke('study:start-session', deckId, mode, settings),
     answer: (input) => ipcRenderer.invoke('study:answer', input),
+    endSession: (sessionId) => ipcRenderer.invoke('study:end-session', sessionId),
   },
   ai: {
     getSettings: () => ipcRenderer.invoke('ai:get-settings'),

@@ -205,6 +205,8 @@ const syncProgressListeners = new Set<(event: SyncProgressEvent) => void>()
 const transferProgressListeners = new Set<(event: TransferProgressEvent) => void>()
 let browserWakeLock: { release?: () => Promise<void> } | null = null
 let browserAutoSyncTimer: number | null = null
+let browserAutoSyncDeferred = false
+let browserOpenStudySessions = 0
 let browserSyncInFlight: Promise<SyncRunResult> | null = null
 let browserAutoSyncRunner: ((options?: SyncRunOptions) => Promise<SyncRunResult>) | null = null
 let browserTransferRunner: (() => Promise<void>) | null = null
@@ -487,14 +489,48 @@ const emitSyncProgress = (event: SyncProgressEvent) => {
   }
 }
 
+const cancelBrowserAutoSync = () => {
+  if (browserAutoSyncTimer === null) return
+  window.clearTimeout(browserAutoSyncTimer)
+  browserAutoSyncTimer = null
+}
+
 const scheduleBrowserAutoSync = () => {
-  if (!readSyncSettings().syncGroupId || browserAutoSyncTimer !== null) return
+  if (!readSyncSettings().syncGroupId) return
+  // Syncing mid-session interrupts the card the user is on: the transfer
+  // banner shifts the layout out from under their thumb, and the run ends by
+  // dropping the in-memory sessions, so the next answer fails with "Study
+  // session not found". What a session queues goes out once it ends.
+  if (browserOpenStudySessions > 0) {
+    browserAutoSyncDeferred = true
+    cancelBrowserAutoSync()
+    return
+  }
+  if (browserAutoSyncTimer !== null) return
   browserAutoSyncTimer = window.setTimeout(() => {
     browserAutoSyncTimer = null
     void browserAutoSyncRunner?.().catch(() => {
       // Background sync is best-effort. Manual sync still reports failures.
     })
   }, AUTO_SYNC_DELAY_MS)
+}
+
+/** Holds automatic syncing for as long as the user is answering cards. */
+const beginBrowserStudySession = () => {
+  // An auto-sync queued just before the session started would land on the
+  // first card; hold it with everything the session itself queues.
+  if (browserAutoSyncTimer !== null) browserAutoSyncDeferred = true
+  cancelBrowserAutoSync()
+  browserOpenStudySessions += 1
+}
+
+/** Releases that hold, and runs the sync the session held back. */
+const endBrowserStudySession = () => {
+  if (browserOpenStudySessions === 0) return
+  browserOpenStudySessions -= 1
+  if (browserOpenStudySessions > 0 || !browserAutoSyncDeferred) return
+  browserAutoSyncDeferred = false
+  scheduleBrowserAutoSync()
 }
 
 const syncStatusFromSettings = (settings: BrowserSyncSettings) => {
@@ -2140,6 +2176,16 @@ export const installBrowserOnami = async () => {
   })
   const sessions = new Map<string, RuntimeSession>()
 
+  /**
+   * Drops a session the user finished, exited, or navigated away from, and
+   * releases the sync hold it held. Answering the last card already closes the
+   * session, so the renderer's own call for that session is a no-op.
+   */
+  const closeStudySession = (sessionId: string): void => {
+    if (!sessions.delete(sessionId)) return
+    endBrowserStudySession()
+  }
+
   const api: OnamiApi = {
     decks: {
       create: async (input: CreateDeckInput) =>
@@ -2305,6 +2351,7 @@ export const installBrowserOnami = async () => {
         if (selected.length === 0) throw new Error('No cards match this study mode right now.')
         const id = makeId('session')
         const unitTestThreshold = settings.unitTestThreshold ?? 0.8
+        beginBrowserStudySession()
         sessions.set(id, {
           id,
           mode,
@@ -2361,6 +2408,7 @@ export const installBrowserOnami = async () => {
               deck.unitTestedAt = testedAt
               deck.updatedAt = testedAt
               enqueueRecord(deckToRecord(buildDeckSyncPayload(deck).deck))
+              closeStudySession(session.id)
             }
 
             return {
@@ -2419,6 +2467,7 @@ export const installBrowserOnami = async () => {
 
           session.answered.push({ cardId: input.cardId, rating: input.rating })
           const sessionComplete = session.answered.length >= session.cardIds.length
+          if (sessionComplete) closeStudySession(session.id)
 
           return {
             cardId: card.id,
@@ -2431,6 +2480,9 @@ export const installBrowserOnami = async () => {
             recommendation: null,
           }
         }),
+      endSession: async (sessionId: string) => {
+        closeStudySession(sessionId)
+      },
     },
     ai: {
       getSettings: async () => readState().aiSettings,
@@ -2588,7 +2640,6 @@ export const installBrowserOnami = async () => {
             await uploadMissingMedia()
             await downloadMissingMedia()
 
-            if (applied > 0) sessions.clear()
             emitSyncProgress({
               stage: 'complete',
               message: `Sync complete. Sent ${pushedRecords}, received ${pulled}, applied ${applied}.`,
